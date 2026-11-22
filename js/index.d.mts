@@ -184,8 +184,29 @@ export type RegisteredFamily = { name: string; faces: RegisteredFace[]; weight?:
 export type OutputFormat = "png" | "jpeg" | "webp" | "ico" | "raw";
 export type AnimationOutputFormat = "webp" | "apng" | "gif";
 
+/**
+ * Resource limits for untrusted inputs. Each value can only lower the engine's built-in cap (a larger one is
+ * clamped to it); a call's `limits` can only lower the `Renderer`'s. An image source over a limit is skipped
+ * like an undecodable one (`renderPdf` fails instead); a canvas or node tree over one fails the call with
+ * `bm-render: canvas exceeds limits.maxCanvasPixels` / `node tree exceeds limits.maxNodeDepth`.
+ */
+export type Limits = {
+  /** width*height of one decoded raster image source, also every frame of an animated one (cap 25,165,824) */
+  maxImagePixels?: number;
+  /** encoded byte size of one image source, raster or SVG (no built-in cap) */
+  maxImageBytes?: number;
+  /** frames of one animated GIF / WebP / APNG source (cap 10,000) */
+  maxAnimationFrames?: number;
+  /** width*height of the output canvas, every frame of renderAnimation included (cap 40,000,000; not PDF) */
+  maxCanvasPixels?: number;
+  /** nesting levels of the node tree or HTML (cap 512) */
+  maxNodeDepth?: number;
+};
+
 export type CommonOptions = {
   devicePixelRatio?: number;
+  /** resource limits of this call (over the `Renderer`'s; see `Limits`) */
+  limits?: Limits;
   images?: ImagesInput;
   /** stylesheets / rule objects (`css` feature: standard / full) */
   css?: CssInput[] | string;
@@ -323,6 +344,8 @@ export declare const features: Readonly<Features>;
 export declare const backend: "wasm" | "native";
 
 export type RendererOptions = {
+  /** default resource limits of every call (a call's own `limits` can only lower them) */
+  limits?: Limits;
   /** accepted, ignored (fixed 96 MiB decoded-image budget) */
   cacheMaxBytes?: number;
   /** accepted, ignored (fixed 8 MiB glyph budget) */

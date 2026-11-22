@@ -2291,6 +2291,11 @@ pub const Emitter = struct {
     fn imageRef(e: *Emitter, pmx: ?*const raster.Pixmap, src: []const u8) Error!?w.Ref {
         // (`keep`: an embedded JPEG / PNG stream refers to these bytes until the file is written)
         const bytes = if (src.len > 0) eimg.sourceBytes(e.f.r, e.keep, src) else null;
+        // (a source over the `limits` option fails the document, like one that cannot be decoded)
+        if (src.len > 0) if (e.f.r.sourceOverLimit(src, bytes)) |fld| {
+            e.fail("image exceeds limits.", render.Limits.name(fld));
+            return null;
+        };
         return switch (eimg.draw(e.cx, bytes, if (bytes) |b| e.f.r.contentHash(b) else 0, pmx, e.pixelFilter(), src)) {
             .ref => |r| r,
             .none => null,

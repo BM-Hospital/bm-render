@@ -84,7 +84,8 @@ pub fn decodeFrame(alloc: std.mem.Allocator, bytes: []const u8, index: u32, limi
 /// Sequential compositor for GIF / animated WebP / APNG. `canvas` holds the current frame
 /// after each successful `next()` (valid until the next call / `deinit`).
 pub const Animator = struct {
-    /// Maximum frames per animation; `next()` fails with ImageTooLarge past it.
+    /// Maximum frames per animation (or `Limits.max_frames` when lower); `next()` fails with
+    /// ImageTooLarge past it.
     pub const max_frames: u32 = 10000;
     /// Total work budget per animation, in multiples of `Limits.max_pixels`.
     pub const max_work_factor: u64 = 16;
@@ -153,7 +154,7 @@ pub const Animator = struct {
     /// Composites the next frame; returns its delay in ms, or null after the last frame.
     pub fn next(a: *Animator) Error!?u32 {
         _ = a.scratch.reset(.retain_capacity);
-        if (a.index >= max_frames) return error.ImageTooLarge;
+        if (a.index >= @min(max_frames, a.limits.max_frames)) return error.ImageTooLarge;
         a.applyDispose();
         const delay: ?u32 = switch (a.kind) {
             .gif => try a.nextGif(),
@@ -618,4 +619,23 @@ test "animator: total work budget" {
     } else |e| e;
     try testing.expectEqual(error.ImageTooLarge, err);
     try testing.expect(n > 5 and n < 100);
+}
+
+test "animator: Limits.max_frames lowers the frame cap" {
+    const a = testing.allocator;
+    // 1x1 GIF with 20 tiny frames, walked under a 7-frame limit.
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    try file.appendSlice(a, "GIF89a\x01\x00\x01\x00\x00\x00\x00");
+    for (0..20) |_| try file.appendSlice(a, &.{ 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0x05, 0 });
+    try file.append(a, 0x3b);
+    var an = try Animator.init(a, file.items, .{ .max_frames = 7 });
+    defer an.deinit();
+    var n: u32 = 0;
+    const err = while (an.next()) |r| {
+        if (r == null) break error.TestUnexpectedResult;
+        n += 1;
+    } else |e| e;
+    try testing.expectEqual(error.ImageTooLarge, err);
+    try testing.expectEqual(@as(u32, 7), n);
 }

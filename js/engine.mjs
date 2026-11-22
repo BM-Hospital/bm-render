@@ -101,6 +101,39 @@ function throwIfAborted(signal) {
   if (signal && signal.aborted) throw signal.reason ?? new Error("bm-render: aborted");
 }
 
+/** `limits` names the engine reads (src/render.zig `Limits`). */
+const LIMIT_NAMES = ["maxImagePixels", "maxImageBytes", "maxAnimationFrames", "maxCanvasPixels", "maxNodeDepth"];
+
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Validates the `Renderer` constructor's `limits` (the call's own are checked by the engine). */
+function checkLimits(limits) {
+  if (limits == null) return null;
+  if (!isPlainObject(limits)) throw new TypeError("bm-render: limits must be an object");
+  for (const [k, v] of Object.entries(limits)) {
+    if (!LIMIT_NAMES.includes(k)) throw new TypeError(`bm-render: unknown limit: limits.${k}`);
+    if (v != null && !(typeof v === "number" && v >= 1)) throw new TypeError(`bm-render: limit must be a number >= 1: limits.${k}`);
+  }
+  return { ...limits };
+}
+
+/**
+ * A call's `limits` over the renderer's: each can only lower the other (the smaller number wins), and the
+ * engine clamps both to its built-in caps. Returns undefined when neither sets any.
+ */
+function mergeLimits(base, call) {
+  if (call == null) return base ?? undefined;
+  if (base == null || !isPlainObject(call)) return call;
+  const out = { ...base };
+  for (const [k, v] of Object.entries(call)) {
+    if (v == null) continue;
+    out[k] = typeof v === "number" && typeof out[k] === "number" ? Math.min(out[k], v) : v;
+  }
+  return out;
+}
+
 function imageList(images) {
   return Array.isArray(images) ? images : images && images.sources ? images.sources : [];
 }
@@ -389,6 +422,8 @@ export function createBinding(defaultWasm, external) {
     #atts = [];
     /** `workers` option on the wasm backend: the async API runs on these (js/worker-pool.mjs) */
     #pool = null;
+    /** `limits` of every call (the constructor option), or null */
+    #limits = null;
 
     constructor(options = {}) {
       if (!backend.ready()) throw new Error("bm-render: call init()/initSync() before creating a Renderer");
@@ -396,10 +431,22 @@ export function createBinding(defaultWasm, external) {
       if (workers != null && workers !== false && (!Number.isInteger(workers) || workers < 0)) {
         throw new TypeError("bm-render: workers must be a non-negative integer");
       }
+      const limits = checkLimits(options?.limits);
       this.#h = backend.create();
       if (!this.#h) throw new Error("bm-render: out of memory");
+      this.#limits = limits;
       // (native: the async API already runs on the libuv thread pool, so `workers` is ignored)
       if (workers > 0 && !backend.runAsync) this.#pool = new WorkerPool(workers, () => ({ module: wasmModule, url: wasmSourceUrl }));
+    }
+
+    /** `rest` (call options without the JS-only entries) with the effective `limits`. */
+    #withLimits(rest) {
+      const limits = mergeLimits(this.#limits, rest.limits);
+      if (limits === undefined) {
+        const { limits: _l, ...o } = rest;
+        return o;
+      }
+      return { ...rest, limits };
     }
 
     #handle() {
@@ -544,7 +591,8 @@ export function createBinding(defaultWasm, external) {
       if (which === "svg") requireFeature("renderSvg");
       const [json, kind] = this.#prepareSource(node, options);
       // `images` were attached above; `fonts`/`signal` are JS-side takumi options.
-      const { images: _i, fonts: _f, signal: _s, ...rest } = options;
+      const { images: _i, fonts: _f, signal: _s, ...given } = options;
+      const rest = this.#withLimits(given);
       // (native async: the byte size of a raw frame whose size is given, so its buffer can be made up front)
       const { width: w, height: h } = rest;
       const rawBytes = which === "render" && rest.format === "raw" && Number.isInteger(w) && Number.isInteger(h) && w > 0 && h > 0 && w * h <= 40e6 ? w * h * 4 : 0;
@@ -665,7 +713,7 @@ export function createBinding(defaultWasm, external) {
     /** renderPdf / measurePdf options as JSON text; attachment bytes and band images become attachments of the call. */
     #pdfOptionsText(options) {
       const { images: _i, fonts: _f, signal: _s, attachments, ...rest } = options;
-      const o = { ...rest };
+      const o = this.#withLimits(rest);
       if (attachments != null) {
         if (!Array.isArray(attachments)) throw new TypeError("bm-render: attachments takes an array");
         o.attachments = attachments.map((a) => {
@@ -779,7 +827,7 @@ export function createBinding(defaultWasm, external) {
       this.#handle();
       this.#atts = [];
       const { images, fonts: _f, signal: _s, scenes: _sc, ...rest } = options;
-      const text = this.#stringify({ ...rest, scenes: scenes || [] });
+      const text = this.#stringify({ ...this.#withLimits(rest), scenes: scenes || [] });
       this.#putImages(images, text, true);
       return { op: "animation", kind: 0, text, opts: null, atts: this.#atts, signal: options.signal };
     }

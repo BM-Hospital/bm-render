@@ -182,12 +182,25 @@ fn parseOptions(r: *Renderer, opts_json: []const u8) Error!opt.PdfOptions {
     const blobs = try a.alloc(opt.Blob, r.images.items.len);
     for (r.images.items, 0..) |e, i| blobs[i] = .{ .id = e.src, .data = e.data };
     var diag: opt.Diag = .{};
-    var o = opt.parse(a, opts_json, blobs, &diag) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Invalid => {
-            r.setErr(diag.message(), "");
-            return error.Invalid;
-        },
+    r.limits = .{};
+    var o = blk: {
+        if (opts_json.len == 0) break :blk opt.PdfOptions{};
+        const v = json.parse(a, opts_json) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                r.setErr("invalid options JSON", "");
+                return error.Invalid;
+            },
+        };
+        // (`limits`: bm-render's own option, src/render.zig `Limits`)
+        if (v == .object) try r.parseLimits(v.get("limits"));
+        break :blk opt.fromValue(a, v, blobs, &diag) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => {
+                r.setErr(diag.message(), "");
+                return error.Invalid;
+            },
+        };
     };
     // takumi-pdf-js `decode_images`: every `images` entry is decoded before layout, and one in no image format
     // fails the render (bm-render decodes when an image is drawn: only bytes that are no image at all are

@@ -23,6 +23,7 @@ import init, {
   type Features,
   type Prepared,
   type WasmExports,
+  type Limits,
 } from "bm-render";
 import * as core from "bm-render/core";
 import { init as initStandard, profile as standardProfile } from "bm-render/standard";
@@ -64,7 +65,9 @@ async function main(): Promise<void> {
   const u: URL = wasmUrl();
   void p; void s; void u;
 
-  const r = new Renderer({ cacheMaxBytes: 1 << 20 });
+  const r = new Renderer({ cacheMaxBytes: 1 << 20, limits: { maxImagePixels: 4e6, maxNodeDepth: 64 } });
+  const limits: Limits = { maxImageBytes: 1 << 20, maxAnimationFrames: 100, maxCanvasPixels: 1e6 };
+  r.renderSync(node, { limits });
   new Renderer({ workers: 2 }).free();
   const fams: RegisteredFamily[] = r.registerFont(bytes);
   const fams2: RegisteredFamily[] = r.registerFont({ name: "Inter", data: bytes, weight: 400, style: "normal" });
@@ -117,7 +120,8 @@ async function main(): Promise<void> {
   // PDF output (bm-render/pdf)
   await pdf.init(pdfWasm);
   const pp: "pdf" = pdf.profile;
-  const pr = new PdfRenderer();
+  const pr = new PdfRenderer({ limits: { maxImageBytes: 1 << 20 } });
+  pr.renderSync("<p>x</p>", { viewport: { width: 100 }, limits: { maxNodeDepth: 32 } });
   new PdfRenderer({ workers: 1 }).free();
   const popts: PdfRenderOptions = { size: "a4", landscape: true, margin: { top: "auto", bottom: 30 }, header: node, footer: "<p>x</p>",
     pages: { first: { header: false } }, pageRanges: [1, { from: 3 }], metadata: { title: "t", creationDate: "2026-01-01" },

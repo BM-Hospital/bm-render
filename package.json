@@ -209,6 +209,7 @@
     "test": "node scripts/build.mjs --test",
     "test:js": "node scripts/js-abort-test.mjs",
     "test:workers": "node scripts/worker-test.mjs",
+    "test:limits": "node scripts/limits-test.mjs",
     "test:pdf": "node scripts/pdf-test.mjs",
     "test:pdf:chunks": "node scripts/pdf-chunks-check.mjs",
     "test:pdf:takumi": "node scripts/pdf-compare.mjs",

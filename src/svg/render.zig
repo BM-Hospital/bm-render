@@ -58,6 +58,8 @@ pub const RenderOptions = struct {
     text: ?TextHook = null,
     /// Nesting allowed for `<image href="data:image/svg+xml,...">` (0 disables nested SVG).
     max_nested_svg: u8 = 2,
+    /// width*height of a decoded `<image>` (never above the built-in 16 Mi pixels).
+    max_image_pixels: u64 = 16 << 20,
 };
 
 const MAX_RENDER_DEPTH = 96;
@@ -1322,7 +1324,7 @@ pub fn Renderer(comptime F: Features) type {
         if (std.mem.startsWith(u8, meta, "image/svg") or xml.looksLikeSvg(bytes)) {
             return r.drawNestedSvg(c, n, bytes, x, y);
         }
-        const img = codec.decode(r.a, bytes, .{ .max_pixels = 16 << 20 }) catch return;
+        const img = codec.decode(r.a, bytes, .{ .max_pixels = @min(16 << 20, r.opts.max_image_pixels) }) catch return;
         var pm: Pixmap = .{ .width = img.width, .height = img.height, .data = img.data };
         premultiply(pm.data);
         const iw: f32 = @floatFromInt(img.width);

@@ -104,11 +104,13 @@ việc render đều đồng bộ và chặn luồng đang gọi; bản async ch
 ### Hàm khởi tạo
 
 ```ts
-new Renderer(options?: { cacheMaxBytes?: number; fontCacheMaxBytes?: number })
+new Renderer(options?: { limits?: Limits; cacheMaxBytes?: number; fontCacheMaxBytes?: number })
 ```
 
-Ném `bm-render: call init()/initSync() before creating a Renderer` nếu chưa khởi tạo. Cả hai tùy chọn
-đều được nhận nhưng bỏ qua (ngân sách cố định: 96 MiB ảnh đã giải mã, 8 MiB mask glyph).
+Ném `bm-render: call init()/initSync() before creating a Renderer` nếu chưa khởi tạo. `limits` đặt
+[giới hạn tài nguyên](#giới-hạn-tài-nguyên-cho-đầu-vào-không-tin-cậy) mặc định cho mọi lần gọi trên
+renderer này. `cacheMaxBytes` và `fontCacheMaxBytes` được nhận nhưng bỏ qua (ngân sách cố định: 96 MiB
+ảnh đã giải mã, 8 MiB mask glyph).
 
 ### `registerFont`
 
@@ -351,6 +353,7 @@ Trang [Hỗ trợ CSS](css-support.md) liệt kê mọi thuộc tính và giá t
 | `lang` | string | | Ngôn ngữ gốc cho `:lang()` và hệ ngôn ngữ OpenType. |
 | `fonts` | `FontLoader[] \| Promise<FontLoader[]>` | | Chỉ với API async: được đăng ký trước khi render; nếu không có `fontFamilies`, chúng trở thành chồng font gốc. |
 | `signal` | `AbortSignal` | | Được kiểm tra trước khi render (ném `signal.reason`). Bản thân việc render không thể ngắt giữa chừng. |
+| `limits` | `Limits` | các mức trần có sẵn | Hạ giới hạn tài nguyên cho lần gọi này; xem [Giới hạn tài nguyên](#giới-hạn-tài-nguyên-cho-đầu-vào-không-tin-cậy). Cũng dùng được với `renderAnimation`, `measure`, `renderSvg` và `renderPdf`. |
 | `lossless` | boolean | | Nhận nhưng bỏ qua: WebP luôn là lossless. |
 | `drawDebugBorder`, `dithering` | | | Nhận nhưng bỏ qua. |
 
@@ -387,6 +390,44 @@ an toàn cho cả ba profile.
 | Ảnh đã giải mã | cache ảnh của mỗi renderer bị xoá khi vượt 96 MiB; một ảnh đã giải mã tối đa 24 megapixel (ảnh lớn hơn không được vẽ) |
 | Cache mask glyph | 8 MiB mỗi renderer |
 | Shadow stack của wasm | 1 MiB (build tùy biến: `-Dstack-kib=`) |
+
+### Giới hạn tài nguyên cho đầu vào không tin cậy
+
+Server render HTML, cây node hoặc ảnh do người dùng gửi lên có thể hạ một số giới hạn ở trên, để một
+request không thể bắt engine giải mã một ảnh khổng lồ hay dàn một canvas khổng lồ. Truyền `limits` cho
+hàm khởi tạo `Renderer` (mặc định của mọi lần gọi) và/hoặc cho từng lần gọi:
+
+```ts
+const r = new Renderer({ limits: { maxImagePixels: 4_000_000, maxImageBytes: 5 << 20, maxNodeDepth: 64 } });
+await r.render(userHtml, { width: 1200, height: 630, limits: { maxCanvasPixels: 1200 * 630 } });
+```
+
+| Giới hạn | Áp dụng cho | Mức trần có sẵn (mặc định) | Khi vượt |
+|:--|:--|:--|:--|
+| `maxImagePixels` | rộng × cao của một nguồn ảnh raster (đã mã hoá hoặc RGBA thô), từng khung của ảnh động, và các `<image>` bên trong ảnh SVG | 25.165.824 (24 megapixel; 16 Mi bên trong SVG) | ảnh bị bỏ qua |
+| `maxImageBytes` | số byte đã mã hoá của một nguồn ảnh: byte PNG / JPEG / WebP / GIF, `data:` URI sau khi giải mã, mã SVG | không có | ảnh bị bỏ qua |
+| `maxAnimationFrames` | số khung của một nguồn GIF / WebP / APNG động | 10.000 | ảnh bị bỏ qua |
+| `maxCanvasPixels` | rộng × cao của canvas đầu ra, kể cả từng khung của `renderAnimation` (không áp dụng cho trang PDF) | 40.000.000 | ném `canvas exceeds limits.maxCanvasPixels` |
+| `maxNodeDepth` | số cấp lồng của cây node hoặc tài liệu HTML | 512 | ném `node tree exceeds limits.maxNodeDepth` |
+
+Quy tắc:
+
+- Giới hạn chỉ có thể **hạ xuống**. Giá trị lớn hơn mức trần có sẵn bị kẹp về mức trần; `limits` của
+  một lần gọi không thể nâng giới hạn của renderer (với mỗi giới hạn, giá trị nhỏ hơn thắng; các giới
+  hạn khác được gộp lại).
+- Giá trị phải là số ≥ 1 (phần lẻ bị làm tròn xuống). Tên lạ, giá trị không phải số ≥ 1, hoặc `limits`
+  không phải object sẽ ném lỗi (`unknown limit: limits.maxPixels`,
+  `limit must be a number >= 1: limits.maxNodeDepth`, `limits must be an object`); hàm khởi tạo ném
+  các lỗi này dưới dạng `TypeError`.
+- Ảnh vượt giới hạn được xử lý như ảnh không giải mã được: không vẽ gì, kích thước gốc 0 × 0, và lần
+  render vẫn thành công. Kích thước và số khung được đọc từ header của file, trước khi giải mã bất kỳ
+  pixel nào. Ảnh đã được giải mã ở một lần gọi trước với giới hạn lỏng hơn vẫn bị từ chối.
+  `renderPdf` / `measurePdf` thì báo lỗi, với `image exceeds limits.maxImagePixels` (hoặc tên giới hạn
+  tương ứng), giống như với ảnh không giải mã được.
+- Giới hạn gắn với từng lần gọi và từng renderer: các lần render đồng thời trên các renderer khác nhau
+  (thread pool của native addon, worker thread) không bao giờ thấy giới hạn của nhau.
+- Tùy chọn này không giới hạn file font và kích thước stylesheet: hãy tự đăng ký font và giới hạn kích
+  thước nguồn trước khi gọi renderer.
 
 ## Bộ nhớ, instance và luồng
 
