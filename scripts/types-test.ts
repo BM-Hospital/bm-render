@@ -65,6 +65,7 @@ async function main(): Promise<void> {
   void p; void s; void u;
 
   const r = new Renderer({ cacheMaxBytes: 1 << 20 });
+  new Renderer({ workers: 2 }).free();
   const fams: RegisteredFamily[] = r.registerFont(bytes);
   const fams2: RegisteredFamily[] = r.registerFont({ name: "Inter", data: bytes, weight: 400, style: "normal" });
   const lazy: FontDetails = { name: "Lazy", data: () => Promise.resolve(bytes) };
@@ -117,6 +118,7 @@ async function main(): Promise<void> {
   await pdf.init(pdfWasm);
   const pp: "pdf" = pdf.profile;
   const pr = new PdfRenderer();
+  new PdfRenderer({ workers: 1 }).free();
   const popts: PdfRenderOptions = { size: "a4", landscape: true, margin: { top: "auto", bottom: 30 }, header: node, footer: "<p>x</p>",
     pages: { first: { header: false } }, pageRanges: [1, { from: 3 }], metadata: { title: "t", creationDate: "2026-01-01" },
     attachments: [{ name: "a.xml", data: bytes, mimeType: "application/xml" }], tagged: "ua1", uncoveredText: "blank", css: ".a{}", cssVariables: { a: "b" } };

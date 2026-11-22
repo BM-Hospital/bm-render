@@ -110,7 +110,10 @@ More numbers: [Performance](./performance.md) and [Benchmark](../benchmark.md).
 ## Worker threads pool
 
 The engine is single-threaded and a render blocks its thread. For throughput, or to keep an HTTP server's
-event loop free, run one bm-render instance per worker. A minimal pool without dependencies:
+event loop free, run one bm-render instance per worker. On the wasm backend, `new Renderer({ workers: 4 })` does
+this for you: its async methods run on a built-in pool, fonts included
+([details](../native-vs-wasm.md#wasm-off-the-main-thread-workers)). A hand-written pool, without dependencies, gives
+you full control:
 
 ```js
 // render-worker.js

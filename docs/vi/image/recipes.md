@@ -111,7 +111,10 @@ Nếu buộc phải tạo renderer sống ngắn, hãy gọi `free()` (hoặc `u
 ## Pool worker threads
 
 Engine chạy đơn luồng và một lần render chặn luồng của nó. Để tăng throughput, hoặc để giữ event loop của
-HTTP server rảnh, hãy chạy một instance bm-render cho mỗi worker. Một pool tối giản không cần dependency:
+HTTP server rảnh, hãy chạy một instance bm-render cho mỗi worker. Với backend wasm, `new Renderer({ workers: 4 })`
+làm việc này giúp bạn: các hàm async của nó chạy trên một pool dựng sẵn, kể cả font
+([chi tiết](../native-vs-wasm.md#wasm-ngoai-main-thread-workers)). Một pool tự viết, không cần dependency, cho bạn
+toàn quyền kiểm soát:
 
 ```js
 // render-worker.js

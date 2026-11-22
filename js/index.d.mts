@@ -327,6 +327,15 @@ export type RendererOptions = {
   cacheMaxBytes?: number;
   /** accepted, ignored (fixed 8 MiB glyph budget) */
   fontCacheMaxBytes?: number;
+  /**
+   * wasm backend: run the async methods (`render`, `renderAsDataUrl`, `renderSvg`, `measure`, `renderPdf`,
+   * `measurePdf`, `renderAnimation`) on up to this many workers (Web Workers; `worker_threads` on Node.js),
+   * started on first use, so they do not block the event loop. Same bytes as in-thread; fonts registered on
+   * the renderer reach every worker; `signal` drops a queued call and rejects a running one at once (its result
+   * is discarded). The `*Sync` methods and `registerFont` stay on the calling thread. `free()` terminates the
+   * workers. 0 / omitted: in-thread (the default). Ignored by the native backend, which already renders off-thread.
+   */
+  workers?: number;
 };
 
 export declare class Renderer {
@@ -374,7 +383,7 @@ export declare class Renderer {
   memoryBytes(): number;
   /** same as memoryBytes(); 0 before init */
   static memoryBytes(): number;
-  /** Releases the renderer's fonts and caches; later calls on it throw. */
+  /** Releases the renderer's fonts and caches (and terminates its `workers`, rejecting pending calls); later calls on it throw. */
   free(): void;
   /** `using r = new Renderer()` calls free() (falls back to Symbol.for("nodejs.dispose") on old runtimes) */
   [Symbol.dispose](): void;
