@@ -194,7 +194,7 @@
     "THIRD-PARTY-NOTICES.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "build": "node scripts/build.mjs",

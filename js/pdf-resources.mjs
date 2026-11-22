@@ -64,7 +64,7 @@ async function download(url, config, signal) {
   return data.buffer;
 }
 
-/** A signal aborted by the first of `signals` to abort (AbortSignal.any is missing before Node 18.17). */
+/** A signal aborted by the first of `signals` to abort (AbortSignal.any is missing before Node 20.3). */
 function anySignal(signals) {
   const list = signals.filter(Boolean);
   if (list.length <= 1) return list[0];

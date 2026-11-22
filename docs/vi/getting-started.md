@@ -72,7 +72,7 @@ installed)`.
 "Kiểm tra cấu trúc" nghĩa là script build đã kiểm tra từng binary mà không chạy nó (định dạng, CPU, các
 symbol export và import, phiên bản symbol của glibc, không import thư viện toán). Cho tới khi một nền tảng
 được chạy thật, hãy dựa vào cơ chế fallback: nếu addon của nó không nạp được, `bm-render` dùng WebAssembly.
-Các bản build x64 cần CPU x86-64-v2 (SSE4.2, từ 2009 trở đi); CPU cũ hơn dùng WebAssembly. Cần Node.js 18
+Các bản build x64 cần CPU x86-64-v2 (SSE4.2, từ 2009 trở đi); CPU cũ hơn dùng WebAssembly. Cần Node.js 20
 trở lên.
 
 ### Package manager, Docker, serverless
