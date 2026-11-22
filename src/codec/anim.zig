@@ -84,6 +84,11 @@ pub fn decodeFrame(alloc: std.mem.Allocator, bytes: []const u8, index: u32, limi
 /// Sequential compositor for GIF / animated WebP / APNG. `canvas` holds the current frame
 /// after each successful `next()` (valid until the next call / `deinit`).
 pub const Animator = struct {
+    /// Maximum frames per animation; `next()` fails with ImageTooLarge past it.
+    pub const max_frames: u32 = 10000;
+    /// Total work budget per animation, in multiples of `Limits.max_pixels`.
+    pub const max_work_factor: u64 = 16;
+
     arena_state: std.heap.ArenaAllocator,
     /// Per-frame temporaries (decoded frame, LZW buffers); reset at every `next()`.
     scratch: std.heap.ArenaAllocator,
@@ -96,6 +101,8 @@ pub const Animator = struct {
     /// Copy of the canvas for "restore previous" disposal (GIF 3 / APNG 2).
     saved: []u8 = &.{},
     index: u32 = 0,
+    /// Pixels decoded / composited so far (see `charge`).
+    work: u64 = 0,
     // pending disposal of the previous frame
     prev_dispose: u8 = 0, // 0 none, 1 clear rect, 2 restore saved
     prev_rect: [4]u32 = .{ 0, 0, 0, 0 },
@@ -146,6 +153,7 @@ pub const Animator = struct {
     /// Composites the next frame; returns its delay in ms, or null after the last frame.
     pub fn next(a: *Animator) Error!?u32 {
         _ = a.scratch.reset(.retain_capacity);
+        if (a.index >= max_frames) return error.ImageTooLarge;
         a.applyDispose();
         const delay: ?u32 = switch (a.kind) {
             .gif => try a.nextGif(),
@@ -155,6 +163,13 @@ pub const Animator = struct {
         };
         if (delay != null) a.index += 1;
         return delay;
+    }
+
+    /// Accounts `px` pixels of per-frame work (frame decode + canvas copies); fails with
+    /// ImageTooLarge once the animation exceeds `max_work_factor * max_pixels` in total.
+    fn charge(a: *Animator, px: u64) Error!void {
+        a.work +|= px;
+        if (a.work > a.limits.max_pixels *| max_work_factor) return error.ImageTooLarge;
     }
 
     fn applyDispose(a: *Animator) void {
@@ -189,6 +204,7 @@ pub const Animator = struct {
             const sz = a.gif_state.canvasSize(fd);
             try a.setCanvas(sz[0], sz[1]);
         }
+        try a.charge(clippedArea(fd.x, fd.y, fd.w, fd.h, a.w, a.h) + if (fd.disposal == 3) 2 * @as(u64, a.w) * a.h else 0);
         if (fd.disposal == 3) try a.save();
         try gif.drawFrame(a.scratch.allocator(), a.bytes, fd, a.canvas, a.w, a.h, a.limits);
         a.prev_rect = .{ fd.x, fd.y, fd.w, fd.h };
@@ -206,6 +222,7 @@ pub const Animator = struct {
         var dispose = fr.dispose_op;
         if (dispose > 2) return error.InvalidData;
         if (a.index == 0 and dispose == 2) dispose = 1;
+        try a.charge(@as(u64, fr.w) * fr.h + if (dispose == 2) 2 * @as(u64, a.w) * a.h else 0);
         if (dispose == 2) try a.save();
         const img = try png.decodeApngFrame(a.scratch.allocator(), a.bytes, fr, a.limits);
         a.composite(img, fr.x, fr.y, fr.blend_op == 1);
@@ -225,9 +242,11 @@ pub const Animator = struct {
             const fh = rd24(b[9..12]) + 1;
             const duration = rd24(b[12..15]);
             const blend = b[15] & 2 == 0;
+            // Reject a frame that does not fit the canvas before decoding it.
+            if (x > a.w or y > a.h or fw > a.w - x or fh > a.h - y) return error.InvalidData;
+            try a.charge(@as(u64, fw) * fh);
             const img = try webp_dec.decodeImageChunks(a.scratch.allocator(), b[16..], a.limits, .{});
             if (img.width != fw or img.height != fh) return error.InvalidData;
-            if (x > a.w or y > a.h or fw > a.w - x or fh > a.h - y) return error.InvalidData;
             // libwebp: the first frame is never blended (canvas starts transparent).
             a.composite(img, x, y, blend and a.index > 0);
             a.prev_rect = .{ x, y, fw, fh };
@@ -254,6 +273,12 @@ pub const Animator = struct {
         }
     }
 };
+
+/// Area of the rect (x, y, w, h) clipped to a `cw`x`ch` canvas.
+fn clippedArea(x: u32, y: u32, w: u32, h: u32, cw: u32, ch: u32) u64 {
+    if (x >= cw or y >= ch) return 0;
+    return @as(u64, @min(w, cw - x)) * @min(h, ch - y);
+}
 
 /// libwebp's BlendPixelNonPremult (straight-alpha "over"); alpha 255 copies, alpha 0 keeps.
 pub fn blendPixel(dst: *[4]u8, src: [4]u8) void {
@@ -527,4 +552,70 @@ test "fuzz apng frame access" {
             if (r == null) break;
         }
     }
+}
+
+test "animated webp: frame larger than the canvas is rejected before decoding" {
+    const a = testing.allocator;
+    const enc = @import("anim_enc.zig");
+    const W = 23;
+    const H = 17;
+    var px: [2][W * H * 4]u8 = undefined;
+    var frames: [2]enc.AnimFrame = undefined;
+    for (&px, 0..) |*p, f| {
+        for (p, 0..) |*v, k| v.* = @truncate(k * (f + 1));
+        frames[f] = .{ .rgba = p, .delay_ms = 40 };
+    }
+    const file = try enc.encodeWebpAnim(a, &frames, W, H, .{ .frame_diff = false });
+    defer a.free(file);
+    // Shrink the VP8X canvas to 4x4: every 23x17 ANMF frame now overflows it.
+    const v = std.mem.indexOf(u8, file, "VP8X").? + 8;
+    file[v + 4 ..][0..6].* = .{ 3, 0, 0, 3, 0, 0 };
+    var fa = std.testing.FailingAllocator.init(a, .{});
+    var an = try Animator.init(fa.allocator(), file, .{});
+    defer an.deinit();
+    // Any allocation from here on (i.e. a frame decode) would fail with OutOfMemory.
+    fa.fail_index = fa.alloc_index;
+    try testing.expectError(error.InvalidData, an.next());
+}
+
+test "animator: frame count cap" {
+    const a = testing.allocator;
+    // 1x1 GIF with max_frames + 5 tiny frames (LZW data = EOI only).
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    try file.appendSlice(a, "GIF89a\x01\x00\x01\x00\x00\x00\x00");
+    for (0..Animator.max_frames + 5) |_| try file.appendSlice(a, &.{ 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0x05, 0 });
+    try file.append(a, 0x3b);
+    var an = try Animator.init(a, file.items, .{});
+    defer an.deinit();
+    var n: u32 = 0;
+    const err = while (an.next()) |r| {
+        if (r == null) break error.TestUnexpectedResult;
+        n += 1;
+    } else |e| e;
+    try testing.expectEqual(error.ImageTooLarge, err);
+    try testing.expectEqual(Animator.max_frames, n);
+}
+
+test "animator: total work budget" {
+    const a = testing.allocator;
+    // 64x64 GIF, 100 full-canvas frames with disposal 3 (save + restore): 100 * 3 * 4096 px
+    // exceeds 16 * max_pixels when max_pixels = 8192.
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    try file.appendSlice(a, "GIF89a\x40\x00\x40\x00\x00\x00\x00");
+    for (0..100) |_| {
+        try file.appendSlice(a, "\x21\xf9\x04\x0c\x00\x00\x00\x00");
+        try file.appendSlice(a, &.{ 0x2c, 0, 0, 0, 0, 64, 0, 64, 0, 0, 2, 1, 0x05, 0 });
+    }
+    try file.append(a, 0x3b);
+    var an = try Animator.init(a, file.items, .{ .max_pixels = 8192 });
+    defer an.deinit();
+    var n: u32 = 0;
+    const err = while (an.next()) |r| {
+        if (r == null) break error.TestUnexpectedResult;
+        n += 1;
+    } else |e| e;
+    try testing.expectEqual(error.ImageTooLarge, err);
+    try testing.expect(n > 5 and n < 100);
 }

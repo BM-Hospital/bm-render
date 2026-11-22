@@ -149,6 +149,9 @@ const Bits = struct {
     }
 };
 
+/// Maximum SOS segments per image (a progressive JPEG needs ~10; libjpeg-turbo tools cap at 1000).
+const max_scans: u32 = 1000;
+
 const Decoder = struct {
     alloc: std.mem.Allocator,
     data: []const u8,
@@ -311,6 +314,8 @@ const Decoder = struct {
 
     fn decodeScan(d: *Decoder, seg: []const u8, scan_data_start: usize) Error!usize {
         if (!d.frame) return error.InvalidData;
+        // Each scan walks every MCU of the image; cap them like libjpeg-turbo's scan limit.
+        if (d.scans >= max_scans) return error.InvalidData;
         if (seg.len < 1) return error.InvalidData;
         const ns = seg[0];
         if (ns == 0 or ns > d.ncomp or seg.len < 4 + 2 * @as(usize, ns)) return error.InvalidData;
@@ -1134,4 +1139,25 @@ test "jpeg: fuzz (mutations + truncations) without crash or leak" {
         if (decode(testing.allocator, buf[0..len], .{ .max_pixels = 1 << 20 })) |img| img.deinit(testing.allocator) else |_| {}
     }
     try testing.expect(ok > 0);
+}
+
+test "jpeg: too many scans are rejected" {
+    const a = testing.allocator;
+    const src = vectors[0].jpg;
+    // Repeat the first scan (SOS header + entropy data up to the next marker) past the cap.
+    const sos = std.mem.indexOf(u8, src, "\xFF\xDA").?;
+    var end = sos + 2 + std.mem.readInt(u16, src[sos + 2 ..][0..2], .big);
+    while (end + 1 < src.len and !(src[end] == 0xFF and src[end + 1] != 0 and (src[end + 1] < 0xD0 or src[end + 1] > 0xD7))) end += 1;
+    const scan = src[sos..end];
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    try file.appendSlice(a, src[0..sos]);
+    for (0..max_scans + 1) |_| try file.appendSlice(a, scan);
+    try file.appendSlice(a, "\xFF\xD9");
+    try testing.expectError(error.InvalidData, decode(a, file.items, .{}));
+    // At the cap it still decodes.
+    file.shrinkRetainingCapacity(sos + max_scans * scan.len);
+    try file.appendSlice(a, "\xFF\xD9");
+    const img = try decode(a, file.items, .{});
+    img.deinit(a);
 }
