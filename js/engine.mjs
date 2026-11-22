@@ -79,7 +79,10 @@ const PREPARED = Symbol.for("bm-render.prepared");
 /** Handle returned by `prepare` / `prepareAnimation` (opaque, like takumi's `Prepared`). */
 export class Prepared {
   constructor(kind, source, options) {
-    this[PREPARED] = { kind, source, options };
+    // `signal` belongs to the prepare call only: kept, an abort (or an AbortSignal.timeout firing)
+    // after preparing would reject every later render of the handle.
+    const { signal: _s, ...rest } = options ?? {};
+    this[PREPARED] = { kind, source, options: rest };
   }
 }
 

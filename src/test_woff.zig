@@ -7,4 +7,5 @@ pub const ttf = @import("font/ttf.zig");
 test {
     _ = @import("woff/tests.zig");
     _ = @import("woff/sfnt.zig");
+    _ = @import("woff/brotli.zig");
 }

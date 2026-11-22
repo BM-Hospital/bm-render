@@ -158,7 +158,18 @@ pub fn frameCount(bytes: []const u8) u32 {
 
 /// LZW-decodes frame `fd` and paints it onto the straight-RGBA canvas (`cw`x`c_h`), skipping
 /// transparent-index pixels (they keep the canvas value) and clipping to the canvas.
+/// Only the visible intersection of the frame and the canvas is buffered, so memory and
+/// work are bounded by the canvas size plus the compressed data, not the frame header.
 pub fn drawFrame(alloc: std.mem.Allocator, bytes: []const u8, fd: FrameDesc, out: []u8, cw: u32, c_h: u32, limits: Limits) Error!void {
+    const fw = fd.w;
+    const fh = fd.h;
+    const npx = @as(u64, fw) * fh;
+    if (npx > limits.max_pixels) return error.ImageTooLarge;
+    // Visible part of the frame: columns [0, vw), frame rows y in [0, vh).
+    const vw: u32 = if (fd.x < cw) @min(fw, cw - fd.x) else 0;
+    const vh: u32 = if (fd.y < c_h) @min(fh, c_h - fd.y) else 0;
+    if (vw == 0 or vh == 0) return;
+
     // Gather the LZW data sub-blocks.
     var r = Reader{ .b = bytes, .pos = fd.data_pos };
     var total: usize = 0;
@@ -178,57 +189,96 @@ pub fn drawFrame(alloc: std.mem.Allocator, bytes: []const u8, fd: FrameDesc, out
         o += n;
         q += 1 + n;
     }
-    const fw = fd.w;
-    const fh = fd.h;
-    const npx = @as(usize, fw) * fh;
-    if (npx > limits.max_pixels) return error.ImageTooLarge;
-    const idx = try alloc.alloc(u8, npx);
+    const idx = try alloc.alloc(u8, @as(usize, vw) * vh);
     defer alloc.free(idx);
+    // Pixels the LZW stream does not reach keep the fill index (as if decoded to it).
     @memset(idx, if (fd.transparent) |t| t else 0);
-    lzwDecode(lzw, @intCast(fd.min_size), idx);
+    var sink = Sink{ .idx = idx, .vw = vw, .vh = vh, .fw = fw, .fh = fh, .interlaced = fd.interlaced };
+    lzwDecode(lzw, @intCast(fd.min_size), &sink);
 
     const ct = fd.ct;
-    var row: u32 = 0;
-    var pass: u3 = 0;
     var y: u32 = 0;
-    while (row < fh) : (row += 1) {
-        if (fd.interlaced) {
-            // pass starts / steps: (0,8) (4,8) (2,4) (1,2)
-            const starts = [4]u32{ 0, 4, 2, 1 };
-            while (pass < 4 and y >= fh) {
-                pass += 1;
-                if (pass < 4) y = starts[pass];
-            }
-            if (pass >= 4) break;
-        } else y = row;
-        const dy = @as(u64, fd.y) + y;
-        if (dy < c_h) {
-            var x: u32 = 0;
-            while (x < fw) : (x += 1) {
-                const dx = @as(u64, fd.x) + x;
-                if (dx >= cw) break;
-                const ci = idx[@as(usize, row) * fw + x];
-                if (fd.transparent != null and ci == fd.transparent.?) continue;
-                const p = @as(usize, ci) * 3;
-                const di = (@as(usize, @intCast(dy)) * cw + @as(usize, @intCast(dx))) * 4;
-                if (p + 3 <= ct.len) {
-                    out[di..][0..4].* = .{ ct[p], ct[p + 1], ct[p + 2], 255 };
-                } else out[di..][0..4].* = .{ 0, 0, 0, 255 };
-            }
-        }
-        if (fd.interlaced) {
-            const steps = [4]u32{ 8, 8, 4, 2 };
-            y += steps[pass];
+    while (y < vh) : (y += 1) {
+        const dy: usize = fd.y + y;
+        var x: u32 = 0;
+        while (x < vw) : (x += 1) {
+            const dx: usize = fd.x + x;
+            const ci = idx[@as(usize, y) * vw + x];
+            if (fd.transparent != null and ci == fd.transparent.?) continue;
+            const p = @as(usize, ci) * 3;
+            const di = (dy * cw + dx) * 4;
+            if (p + 3 <= ct.len) {
+                out[di..][0..4].* = .{ ct[p], ct[p + 1], ct[p + 2], 255 };
+            } else out[di..][0..4].* = .{ 0, 0, 0, 255 };
         }
     }
 }
 
-/// LZW-decodes into `out` (stops when full or at end-of-information / bad data).
-fn lzwDecode(data: []const u8, min_size: u4, out: []u8) void {
+/// Receives LZW output in stream order and stores only pixels inside the visible
+/// `vw`x`vh` window (frame rows de-interlaced). Spans outside it are skipped in bulk.
+const Sink = struct {
+    idx: []u8,
+    vw: u32,
+    vh: u32,
+    fw: u32,
+    fh: u32,
+    interlaced: bool,
+    x: u32 = 0,
+    /// Stream row (0..fh) and the frame row it maps to.
+    row: u32 = 0,
+    y: u32 = 0,
+    pass: u2 = 0,
+
+    /// True once no later output can land in the visible window.
+    fn done(s: *const Sink) bool {
+        return s.row >= s.fh or (s.y >= s.vh and (!s.interlaced or s.pass == 3));
+    }
+
+    fn write(s: *Sink, data: []const u8) void {
+        var d = data;
+        while (d.len > 0 and !s.done()) {
+            const n: u32 = @intCast(@min(d.len, s.fw - s.x));
+            if (s.y < s.vh and s.x < s.vw) {
+                const m = @min(n, s.vw - s.x);
+                @memcpy(s.idx[@as(usize, s.y) * s.vw + s.x ..][0..m], d[0..m]);
+            }
+            s.x += n;
+            d = d[n..];
+            if (s.x == s.fw) {
+                s.x = 0;
+                s.nextRow();
+            }
+        }
+    }
+
+    fn nextRow(s: *Sink) void {
+        s.row += 1;
+        if (!s.interlaced) {
+            s.y = s.row;
+            return;
+        }
+        // pass starts / steps: (0,8) (4,8) (2,4) (1,2)
+        const starts = [4]u32{ 0, 4, 2, 1 };
+        const steps = [4]u32{ 8, 8, 4, 2 };
+        s.y += steps[s.pass];
+        while (s.y >= s.fh) {
+            if (s.pass == 3) {
+                s.y = s.fh;
+                return;
+            }
+            s.pass += 1;
+            s.y = starts[s.pass];
+        }
+    }
+};
+
+/// LZW-decodes into `sink` (stops when it is done or at end-of-information / bad data).
+fn lzwDecode(data: []const u8, min_size: u4, sink: *Sink) void {
     var prefix: [4096]u16 = undefined;
     var suffix: [4096]u8 = undefined;
     var first: [4096]u8 = undefined; // first byte of each string
     var lens: [4096]u16 = undefined;
+    var str: [4096]u8 = undefined;
     const clear: u32 = @as(u32, 1) << min_size;
     const eoi = clear + 1;
     var i: u32 = 0;
@@ -244,8 +294,7 @@ fn lzwDecode(data: []const u8, min_size: u4, out: []u8) void {
     var bitbuf: u32 = 0;
     var nbits: u5 = 0;
     var pos: usize = 0;
-    var o: usize = 0;
-    while (o < out.len) {
+    while (!sink.done()) {
         while (nbits < size) {
             if (pos >= data.len) return;
             bitbuf |= @as(u32, data[pos]) << nbits;
@@ -276,16 +325,15 @@ fn lzwDecode(data: []const u8, min_size: u4, out: []u8) void {
                 if (next == (@as(u32, 1) << size) and size < 12) size += 1;
             }
         } else if (code >= clear) return; // first code after clear must be a literal
-        // Emit string(cur), written back to front.
+        // Emit string(cur), built back to front (lens <= 4096: one entry per table slot).
         const l: usize = lens[cur];
-        const end = @min(o + l, out.len);
-        var k = o + l;
-        while (k > o) {
+        var k = l;
+        while (k > 0) {
             k -= 1;
-            if (k < end) out[k] = suffix[cur];
+            str[k] = suffix[cur];
             cur = prefix[cur];
         }
-        o = end;
+        sink.write(str[0..l]);
         prev = code;
     }
 }
@@ -368,4 +416,41 @@ test "fuzz gif" {
         const len = if (i % 4 == 0) rnd.uintLessThan(usize, buf.len) else buf.len;
         if (decode(a, buf[0..len], .{ .max_pixels = 1 << 20 })) |img| img.deinit(a) else |_| {}
     }
+}
+
+test "huge frame headers on a tiny canvas: work and memory bounded by the canvas" {
+    const a = std.testing.allocator;
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    try file.appendSlice(a, "GIF89a\x01\x00\x01\x00\x80\x00\x00"); // 1x1 screen, 2-colour GCT
+    try file.appendSlice(a, "\x10\x20\x30\xa0\xb0\xc0");
+    for (0..200) |_| {
+        // 65535x366 frame (~24M px) whose LZW data is just EOI (min code size 2).
+        try file.appendSlice(a, &.{ 0x2c, 0, 0, 0, 0, 0xff, 0xff, 0x6e, 0x01, 0, 2, 1, 0x05, 0 });
+    }
+    try file.append(a, 0x3b);
+    var fa = std.testing.FailingAllocator.init(a, .{});
+    const img = try decode(fa.allocator(), file.items, .{ .max_pixels = 24 << 20 });
+    defer img.deinit(fa.allocator());
+    try std.testing.expect(fa.allocated_bytes < 4096);
+    // Undecoded pixels take index 0 (no transparency), as before.
+    try std.testing.expectEqualSlices(u8, &.{ 0x10, 0x20, 0x30, 255 }, img.data);
+    // Every frame via drawFrame stays small too.
+    var g = try Gif.init(file.items);
+    var canvas: [4]u8 = @splat(0);
+    var n: u32 = 0;
+    while (try g.next()) |fd| : (n += 1) {
+        try drawFrame(fa.allocator(), file.items, fd, &canvas, 1, 1, .{ .max_pixels = 24 << 20 });
+    }
+    try std.testing.expectEqual(@as(u32, 200), n);
+    try std.testing.expect(fa.allocated_bytes < 64 * 1024);
+    // A frame entirely off-canvas allocates nothing and leaves the canvas untouched.
+    var g2 = try Gif.init(file.items);
+    var fd = (try g2.next()).?;
+    fd.x = 5;
+    const before = fa.allocated_bytes;
+    canvas = @splat(7);
+    try drawFrame(fa.allocator(), file.items, fd, &canvas, 1, 1, .{ .max_pixels = 24 << 20 });
+    try std.testing.expectEqual(before, fa.allocated_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 7, 7, 7 }, &canvas);
 }

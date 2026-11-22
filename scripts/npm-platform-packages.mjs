@@ -161,7 +161,7 @@ function setVersion(v) {
       lock.packages[""].optionalDependencies = { ...rootPkg.optionalDependencies };
     }
     // entries of an installed older platform package would make `npm ci` reject the lock: drop them
-    for (const k of Object.keys(lock.packages || {})) if (/(^|\/)node_modules\/bm-render-[^/]+$/.test(k)) delete lock.packages[k];
+    for (const k of Object.keys(lock.packages || {})) if (/(^|\/)node_modules\/@hunghg255\/bm-render-[^/]+$/.test(k)) delete lock.packages[k];
     writeJson(lf, lock);
   }
   for (const name of Object.keys(PLATFORMS)) {

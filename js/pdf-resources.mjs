@@ -64,17 +64,35 @@ async function download(url, config, signal) {
   return data.buffer;
 }
 
+/** A signal aborted by the first of `signals` to abort (AbortSignal.any is missing before Node 18.17). */
+function anySignal(signals) {
+  const list = signals.filter(Boolean);
+  if (list.length <= 1) return list[0];
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(list);
+  const controller = new AbortController();
+  for (const s of list) {
+    if (s.aborted) { controller.abort(s.reason); break; }
+    s.addEventListener("abort", () => controller.abort(s.reason), { once: true, signal: controller.signal });
+  }
+  return controller.signal;
+}
+
 async function bytes(url, config, signal) {
   if (config.allowUrl && !config.allowUrl(url)) throw new Error(`URL blocked by allowUrl policy: ${url}`);
-  const requestSignal = config.timeout ? signal ? AbortSignal.any([signal, AbortSignal.timeout(config.timeout)]) : AbortSignal.timeout(config.timeout) : signal;
+  const limit = config.maxBytes ?? 33554432;
+  const timeout = config.timeout ? AbortSignal.timeout(config.timeout) : undefined;
+  const requestSignal = anySignal([signal, timeout]);
   requestSignal?.throwIfAborted?.();
-  let pending = config.fetchCache?.get(url);
+  const cache = config.fetchCache;
+  let pending = cache?.get(url);
   if (!pending) {
-    pending = download(url, config, requestSignal).catch((error) => { config.fetchCache?.delete(url); throw error; });
-    config.fetchCache?.set(url, pending);
+    // A cached download is shared by every caller: only the timeout may cancel it, never one
+    // caller's own signal (each caller stops waiting on its signal through waitFor below).
+    pending = download(url, config, cache ? timeout : requestSignal).catch((error) => { cache?.delete(url); throw error; });
+    cache?.set(url, pending);
   }
   const data = await waitFor(pending, requestSignal);
-  if (data.byteLength > (config.maxBytes ?? 33554432)) throw new Error(`Response exceeds ${config.maxBytes} bytes`);
+  if (data.byteLength > limit) throw new Error(`Response exceeds ${limit} bytes`);
   return new Uint8Array(data);
 }
 
