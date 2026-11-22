@@ -104,6 +104,19 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 
+    // `zig build fuzz -- [target...|all] [--seconds S] [--seed N] [--replay FILE]`: deterministic
+    // mutation driver for the src/fuzz.zig targets (coverage-guided: `zig build test --fuzz`).
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_main.zig"),
+        .target = native_target,
+        .optimize = .safe,
+    });
+    fuzz_mod.addOptions("build_options", flags);
+    const fuzz_exe = b.addExecutable(.{ .name = "bm_fuzz", .root_module = fuzz_mod, .use_llvm = true });
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    run_fuzz.addPassthruArgs();
+    b.step("fuzz", "Run the mutation fuzzer (src/fuzz_main.zig); args after --").dependOn(&run_fuzz.step);
+
     addNative(b, native_target, native_flags);
 }
 

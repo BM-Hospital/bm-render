@@ -601,11 +601,14 @@ fn parseResiduals(d: *Dec, mb_x: u32, br: *BoolDec) bool {
 
 // ------------------------------------------------------------------------------- transforms
 
+// The products are taken in 64 bits: the second pass of `transformOne` sees values up to
+// ~2^17 from corrupt coefficient data, and `a * 35468` would overflow i32 (libwebp's C relies on
+// wrap-around there; valid streams never get close). Results always fit i32 again.
 inline fn mul1(a: i32) i32 {
-    return ((a * 20091) >> 16) + a;
+    return @as(i32, @intCast((@as(i64, a) * 20091) >> 16)) + a;
 }
 inline fn mul2(a: i32) i32 {
-    return (a * 35468) >> 16;
+    return @intCast((@as(i64, a) * 35468) >> 16);
 }
 inline fn clip8(v: i32) u8 {
     return if (v < 0) 0 else if (v > 255) 255 else @intCast(v);
@@ -1452,6 +1455,16 @@ const bmodes_proba = [900]u8{
 
 test "vp8 compiles" {
     std.testing.refAllDecls(@This());
+}
+
+test "inverse transform of extreme (corrupt) coefficients does not overflow (fuzz regression)" {
+    var in: [16]i16 = undefined;
+    for (&in, 0..) |*c, i| c.* = if (i % 3 == 0) std.math.minInt(i16) else std.math.maxInt(i16);
+    var b: [4 * BPS]u8 = @splat(128);
+    transformOne(&in, &b, 0);
+    transformAc3(&in, &b, 0);
+    in = @splat(std.math.maxInt(i16));
+    transformOne(&in, &b, 0);
 }
 
 test "lossy webp matches libwebp (WebPDecodeRGBA) exactly" {

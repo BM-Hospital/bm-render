@@ -63,9 +63,13 @@ pub fn collectLookups(table: []const u8, feats: []const FeatureSel, out: []u16) 
         lang_off = rd16(script, 4 + 4);
     }
     const lang = tail(script, lang_off);
-    const n_feat: u32 = rd16(lang, 4);
+    // counts larger than the tables can hold are damage (past the end every index reads 0)
+    const n_feat: u32 = @min(rd16(lang, 4), @as(u32, @intCast((lang.len -| 6) / 2)));
     const total_feat: u32 = rd16(features, 0);
     var n: usize = 0;
+    // lookup indices visited; real fonts need a few hundred, damaged ones can make every
+    // feature record point at the same huge lookup list (quadratic in the table size)
+    var budget: u32 = 1 << 16;
     i = 0;
     while (i < n_feat) : (i += 1) {
         const fi: u32 = rd16(lang, 6 + i * 2);
@@ -78,6 +82,8 @@ pub fn collectLookups(table: []const u8, feats: []const FeatureSel, out: []u16) 
             var k: u32 = 0;
             while (k < nl) : (k += 1) {
                 if (6 + k * 2 > feat.len) break;
+                if (budget == 0) return n;
+                budget -= 1;
                 const li = rd16(feat, 4 + k * 2);
                 if (li > 0x7fff) continue;
                 var pos: usize = 0;
@@ -160,7 +166,9 @@ fn lookupAt(table: []const u8, index: u16) Lookup {
     const list = tail(table, rd16(table, 8));
     if (index >= rd16(list, 0)) return .{ .t = &.{}, .kind = 0, .count = 0, .flags = 0 };
     const t = tail(list, rd16(list, 2 + @as(u32, index) * 2));
-    const count: u32 = rd16(t, 4);
+    // a subtable count larger than the lookup can hold is damage: past the end every offset
+    // reads 0 and the "subtables" would all re-parse the lookup header
+    const count: u32 = @min(rd16(t, 4), @as(u32, @intCast((t.len -| 6) / 2)));
     var flags: u32 = rd16(t, 2);
     if (flags & 0x10 != 0) flags |= @as(u32, rd16(t, 6 + count * 2)) << 16;
     return .{ .t = t, .kind = rd16(t, 0), .count = count, .flags = flags };
@@ -185,6 +193,8 @@ fn subtable(l: Lookup, i: u32, ext_type: u16, kind: *u16) []const u8 {
 pub const Digest = struct {
     m: [3]u64 = .{ 0, 0, 0 },
     const shifts = [3]u4{ 0, 4, 9 };
+    /// May contain every glyph.
+    pub const full: Digest = .{ .m = @splat(~@as(u64, 0)) };
 
     pub inline fn add(d: *Digest, g: u16) void {
         inline for (shifts, 0..) |s, i| d.m[i] |= @as(u64, 1) << @as(u6, @truncate(g >> s));
@@ -209,11 +219,19 @@ pub const Digest = struct {
             }
         }
     }
-    fn addCoverage(d: *Digest, t: []const u8) void {
+    /// Adds a coverage table, spending at most `budget.*` entries of work. When the budget runs
+    /// out the digest becomes full (may contain anything), which is always correct.
+    fn addCoverage(d: *Digest, t: []const u8, budget: *u32) void {
         const format = rd16(t, 0);
         var n: u32 = rd16(t, 2);
+        n = @min(n, @as(u32, @intCast(t.len / 2)));
+        if (n > budget.*) {
+            d.* = full;
+            budget.* = 0;
+            return;
+        }
+        budget.* -= n;
         if (format == 1) {
-            n = @min(n, @as(u32, @intCast(t.len / 2)));
             var i: u32 = 0;
             while (i < n) : (i += 1) {
                 const g = rd16(t, 4 + i * 2);
@@ -232,15 +250,24 @@ pub const Digest = struct {
 pub fn lookupDigest(table: []const u8, index: u16, ext_type: u16) Digest {
     var d: Digest = .{};
     const l = lookupAt(table, index);
+    var budget: u32 = digest_budget;
     var i: u32 = 0;
     while (i < l.count) : (i += 1) {
-        const sd = subtableDigest(l, i, ext_type);
+        if (budget == 0) return Digest.full;
+        const sd = subtableDigest(l, i, ext_type, &budget);
         for (&d.m, sd.m) |*a, b| a.* |= b;
     }
     return d;
 }
 
-fn subtableDigest(l: Lookup, i: u32, ext_type: u16) Digest {
+/// Coverage entries a digest computation may visit (per lookup for `lookupDigest`, per table for
+/// a shape plan). Damaged fonts can make many lookups x subtables point at the same large
+/// coverage table (cubic in the font size); real fonts stay far below this.
+const digest_budget: u32 = 1 << 20;
+
+fn subtableDigest(l: Lookup, i: u32, ext_type: u16, budget: *u32) Digest {
+    if (budget.* == 0) return Digest.full;
+    budget.* -= 1;
     var d: Digest = .{};
     var kind: u16 = 0;
     const st = subtable(l, i, ext_type, &kind);
@@ -253,7 +280,7 @@ fn subtableDigest(l: Lookup, i: u32, ext_type: u16) Digest {
     } else if (format == 3 and kind == ctx) {
         cov = 6;
     }
-    d.addCoverage(tail(st, rd16(st, cov)));
+    d.addCoverage(tail(st, rd16(st, cov)), budget);
     return d;
 }
 
@@ -825,13 +852,18 @@ fn compileTable(alloc: std.mem.Allocator, tp: *TablePlan, table: []const u8, ls:
     }
     var subs: std.ArrayList(Digest) = .empty;
     errdefer subs.deinit(alloc);
+    var budget: u32 = digest_budget;
     for (list.items) |*it| {
+        if (budget == 0) {
+            it.digest = Digest.full;
+            continue;
+        }
         const l = lookupAt(table, it.index);
         const keep = l.count >= 2 and l.count <= 512;
         if (keep) it.sub_start = @intCast(subs.items.len);
         var i: u32 = 0;
         while (i < l.count) : (i += 1) {
-            const sd = subtableDigest(l, i, ext);
+            const sd = subtableDigest(l, i, ext, &budget);
             for (&it.digest.m, sd.m) |*a, b| a.* |= b;
             if (keep) try subs.append(alloc, sd);
         }
@@ -1979,4 +2011,66 @@ test "digest never has false negatives" {
     var g: u16 = 10;
     while (g <= 20) : (g += 1) try std.testing.expect(d.mayHave(g));
     try std.testing.expect(d.mayHave(700));
+}
+
+fn put16(b: []u8, off: usize, v: u16) void {
+    std.mem.writeInt(u16, b[off..][0..2], v, .big);
+}
+
+fn elapsedMs(io: std.Io, t0: std.Io.Timestamp) i64 {
+    return t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+}
+
+test "damaged feature counts stay cheap: collectLookups (fuzz regression)" {
+    // GSUB-like table: one `latn` script whose default LangSys claims 0xffff feature records
+    // (past the real data they all read feature 0), feature 0 = `kern` with 8000 lookups. This
+    // walked 65535 x 8000 lookup indices (seconds); now bounded by the table size and a budget.
+    const n_lookups = 8000;
+    var buf: [42 + n_lookups * 2]u8 = @splat(0);
+    put16(&buf, 0, 1);
+    put16(&buf, 4, 10); // script list at 10
+    put16(&buf, 6, 30); // feature list at 30
+    put16(&buf, 10, 1);
+    @memcpy(buf[12..16], "latn");
+    put16(&buf, 16, 8); // script at 18
+    put16(&buf, 18, 4); // default LangSys at 22
+    put16(&buf, 24, 0xffff); // no required feature
+    put16(&buf, 26, 0xffff); // feature index count (damaged)
+    put16(&buf, 30, 1);
+    @memcpy(buf[32..36], "kern");
+    put16(&buf, 36, 8); // feature at 38
+    put16(&buf, 40, n_lookups);
+    for (0..n_lookups) |k| put16(&buf, 42 + k * 2, @intCast(k));
+    const io = std.testing.io;
+    const t0 = std.Io.Clock.awake.now(io);
+    var out: [24]u16 = undefined;
+    const n = collectLookups(&buf, &.{.{ .tag = tag("kern"), .flag = 0 }}, &out);
+    try std.testing.expectEqual(@as(usize, 24), n);
+    try std.testing.expectEqual(@as(u16, 0), out[0]);
+    try std.testing.expect(elapsedMs(io, t0) < 1000);
+}
+
+test "damaged subtable lists stay cheap: digests (fuzz regression)" {
+    // One lookup whose 16000 subtables all point at the same 16000-glyph coverage table: a
+    // digest visited 16000 x 16000 coverage entries (seconds); now a budget makes it full.
+    const n = 16000;
+    const lk = 14; // lookup list at 10 (one entry) -> lookup at 14
+    const st = lk + 6 + n * 2; // the shared subtable
+    var buf: [st + 10 + n * 2]u8 = @splat(0);
+    put16(&buf, 8, 10);
+    put16(&buf, 10, 1);
+    put16(&buf, 12, lk - 10);
+    put16(&buf, lk, 1); // single substitution
+    put16(&buf, lk + 4, n);
+    for (0..n) |i| put16(&buf, lk + 6 + i * 2, st - lk);
+    put16(&buf, st, 1);
+    put16(&buf, st + 2, 6); // coverage at st + 6
+    put16(&buf, st + 6, 1);
+    put16(&buf, st + 8, n);
+    for (0..n) |i| put16(&buf, st + 10 + i * 2, @intCast(i));
+    const io = std.testing.io;
+    const t0 = std.Io.Clock.awake.now(io);
+    const d = lookupDigest(&buf, 0, 7);
+    try std.testing.expect(d.mayHave(5) and d.mayHave(12000));
+    try std.testing.expect(elapsedMs(io, t0) < 1000);
 }

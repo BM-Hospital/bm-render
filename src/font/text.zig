@@ -464,6 +464,60 @@ pub const BoxFragment = struct {
     slot: u32 = 0,
 };
 
+/// Shaping segments longer than this many characters are split at the start of a word.
+/// Ligatures and multiple substitutions edit the shaping buffer in place (O(segment) each), so
+/// one 120k-character run cost seconds; real text never shapes across thousands of characters.
+const max_segment = 4096;
+
+/// Whether a long segment may end before `cp` (after `prev`): at a word start, or past 4 x
+/// `max_segment` between any two Latin-range characters (never a cluster continuation).
+fn longSegmentBreak(prev: u21, cp: u21, len: usize) bool {
+    if (prev == ' ' and cp != ' ') return true;
+    return len >= 4 * max_segment and prev < 0x300 and cp < 0x300;
+}
+
+/// Stable sort of fragments by box (paint order: box by box, each box line by line). A counting
+/// sort: an insertion sort here was quadratic when many lines each add fragments of several
+/// boxes (a 125 KB text run spent 0.6 s here).
+fn sortFragsByBox(alloc: std.mem.Allocator, fr: []BoxFragment) !void {
+    var max_box: u32 = 0;
+    var sorted = true;
+    for (fr, 0..) |f, i| {
+        max_box = @max(max_box, f.box);
+        if (i > 0 and fr[i - 1].box > f.box) sorted = false;
+    }
+    if (sorted) return;
+    const start = try alloc.alloc(u32, @as(usize, max_box) + 1);
+    defer alloc.free(start);
+    const tmp = try alloc.dupe(BoxFragment, fr);
+    defer alloc.free(tmp);
+    @memset(start, 0);
+    for (fr) |f| start[f.box] += 1;
+    var sum: u32 = 0;
+    for (start) |*s| {
+        const c = s.*;
+        s.* = sum;
+        sum += c;
+    }
+    for (tmp) |f| {
+        fr[start[f.box]] = f;
+        start[f.box] += 1;
+    }
+}
+
+test "sortFragsByBox is a stable sort by box" {
+    var fr = [_]BoxFragment{
+        .{ .box = 2, .line = 0, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 1, .line = 0, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 2, .line = 1, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 0, .line = 1, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 1, .line = 1, .x0 = 0, .x1 = 0, .baseline = 0 },
+    };
+    try sortFragsByBox(std.testing.allocator, &fr);
+    const want = [_][2]u32{ .{ 0, 1 }, .{ 1, 0 }, .{ 1, 1 }, .{ 2, 0 }, .{ 2, 1 } };
+    for (fr, want) |f, w| try std.testing.expectEqual(w, [2]u32{ f.box, f.line });
+}
+
 /// A maximal sequence of glyphs of one run on one line (`glyphs[g0..g1]`), with its exact
 /// horizontal extent and its (possibly shifted) baseline.
 /// `box`: (internal) innermost inline box of the run, 0 = none.
@@ -2897,16 +2951,7 @@ pub const Paragraph = struct {
         if (self.has_rel) self.applyRel(&acc, rel_objs.items);
 
         // paint order: box by box (outer boxes first), each box line by line
-        {
-            const fr = frags.items;
-            var i: usize = 1;
-            while (i < fr.len) : (i += 1) {
-                const v = fr[i];
-                var j = i;
-                while (j > 0 and fr[j - 1].box > v.box) : (j -= 1) fr[j] = fr[j - 1];
-                fr[j] = v;
-            }
-        }
+        try sortFragsByBox(alloc, frags.items);
         var res: TextLayout = .{
             .width = if (flow) ceil64(max_w) else size.width,
             .height = if (flow) it.y else size.height,
@@ -3864,6 +3909,8 @@ const Builder = struct {
                 } else if (script != b.seg_script) {
                     // a segment that has seen no strong character yet adopts the script
                     if (b.seg_script == 0) b.seg_script = script else try b.flush(complex, style);
+                } else if (b.buf.g().len >= max_segment and !joiner and longSegmentBreak(b.chars[ci - 1].cp, c.cp, b.buf.g().len)) {
+                    try b.flush(complex, style);
                 }
             }
             cur_script = script;

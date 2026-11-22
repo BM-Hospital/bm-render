@@ -58,6 +58,7 @@ sẽ ưu tiên file `zig-out/bin/bm_render.wasm` vừa build hơn file `js/bm_re
 | Thăm dò tính năng theo profile | `node bench/probe/profiles.mjs` | mỗi binary xử lý đầu vào của tính năng bị thiếu ra sao; thất bại nếu có trap |
 | Trình duyệt thật | `cd bench && npm run browser:quick` | Edge / Chrome headless qua puppeteer-core; đầu ra raw phải trùng với Node |
 | Fuzz (toàn pipeline) | xem bên dưới | chạy trên bản build có kiểm tra an toàn |
+| Fuzz (parser, bộ giải mã) | `zig build test -Dtest-filter="fuzz: png" --fuzz=200K` | dẫn hướng theo độ phủ; xem [Fuzz các bộ phân tích cú pháp](#fuzz-các-bộ-phân-tích-cú-pháp) |
 
 Fuzz toàn pipeline bằng cây node ngẫu nhiên trên bản ReleaseSafe (vi phạm an toàn sẽ thành trap của
 wasm thay vì âm thầm làm hỏng bộ nhớ):
@@ -67,6 +68,43 @@ zig build -Dwasm-optimize=safe -Dstrip=false -p /tmp/bmsafe
 cd bench
 BM_WASM=/tmp/bmsafe/bin/bm_render.wasm node probe/fuzz.mjs 1 3000   # seed, iterations
 ```
+
+### Fuzz các bộ phân tích cú pháp
+
+`src/fuzz.zig` có một target `std.testing.fuzz` cho mỗi thành phần đọc dữ liệu không tin cậy: `png`,
+`jpeg`, `gif`, `webp` (giải mã + duyệt các khung hình động), `inflate`, `brotli`, `woff` (WOFF/WOFF2
++ font giải mã ra), `font` (TrueType / CFF / collection: metric, outline, shaping), `html`, `css`
+(parser, selector, cascade), `json`, `svg` (parse + render ra 64x64), `render_html` và
+`render_json` (toàn bộ renderer trên canvas 64x64). Dữ liệu mồi (seed) lấy từ các thư mục
+`testdata/` (cùng `src/testdata/fuzz/`).
+
+`zig build test` thông thường chạy mỗi target một lần cho mỗi seed (tổng cộng chưa tới một giây).
+Để fuzz một target bằng fuzzer dẫn hướng theo độ phủ của Zig (không có CI nào chạy việc này):
+
+```sh
+zig build test -Dtest-filter="fuzz: png" --fuzz=200K   # số lần lặp; bỏ con số để mở web UI
+```
+
+Lỗi được tính là: panic, vi phạm kiểm tra an toàn, rò rỉ bộ nhớ, hoặc một đầu vào chạy quá 8 giây
+(bản Debug; lỗi `SlowInput`). Lỗi do parser trả về là bình thường và bị bỏ qua. Bộ nhớ cho mỗi đầu
+vào bị giới hạn 512 MiB (`error.OutOfMemory`, không phải crash). Đầu vào gây lỗi được lưu vào
+`.zig-cache/f/crash`: 4 byte đầu là tiền tố độ dài, phần còn lại là đầu vào. Bỏ 4 byte đó, lưu đầu
+vào vào `src/testdata/fuzz/regress/` và thêm vào bảng `regressions` trong `src/fuzz.zig` cùng với
+bản sửa. Corpus mà một lần chạy tạo ra được giữ trong `.zig-cache/f/` và dùng lại ở lần sau. Mỗi
+lệnh chỉ nên fuzz một target: hai lần chạy `--fuzz` trong cùng một bản checkout dùng chung cache đó.
+
+`zig build fuzz` là bộ đột biến (mutation driver) tất định cho cùng các target (ReleaseSafe, không
+cần runtime fuzzing). Các phép đột biến của nó lặp một đoạn byte tới hàng nghìn lần, nhờ vậy tìm ra
+các trường hợp chạy bậc hai hoặc cấp phát bùng nổ mà fuzz dẫn hướng theo độ phủ hiếm khi chạm tới:
+
+```sh
+zig build fuzz -- all --seconds 60                  # mọi target, mỗi target 60 giây (seed mặc định 1)
+zig build fuzz -- font css --seconds 300 --slow-ms 200 --seed 7
+zig build fuzz -- font --replay path/to/input.bin   # chạy lại một đầu vào, in thời gian chạy
+```
+
+Đầu vào chạy lâu hơn `--slow-ms` (mặc định 1000) được lưu thành `zig-out/fuzz/slow-<target>-<n>.bin`;
+khi panic hoặc treo (20 giây), đầu vào được lưu thành `zig-out/fuzz/crash-<target>.bin` (Linux).
 
 ## Kiểm tra kết quả
 
