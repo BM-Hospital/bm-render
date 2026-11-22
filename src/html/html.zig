@@ -200,7 +200,32 @@ const Parser = struct {
     html_attrs: std.ArrayList(Attr) = .empty,
     body_attrs: std.ArrayList(Attr) = .empty,
     attr_buf: std.ArrayList(Attr) = .empty,
+    /// Name sets mirroring `attr_buf` / `html_attrs` / `body_attrs` once they grow past `attr_set_min`, so the
+    /// first-wins duplicate check stays linear (see `hasAttr`).
+    attr_set: AttrSet = .empty,
+    html_set: AttrSet = .empty,
+    body_set: AttrSet = .empty,
+    /// The text node that adjacent text is currently merged into, and its growable buffer (geometric growth,
+    /// so merging many small pieces is amortised linear instead of copying the whole run each time).
+    run_node: ?*Node = null,
+    run_buf: std.ArrayList(u8) = .empty,
     title: ?[]const u8 = null,
+
+    const AttrSet = std.StringHashMapUnmanaged(void);
+    const attr_set_min = 16;
+
+    /// Whether `list` (names unique, append-only since `set` was last cleared) already holds `name`.
+    fn hasAttr(p: *Parser, list: []const Attr, set: *AttrSet, name: []const u8) Error!bool {
+        if (list.len < attr_set_min) {
+            for (list) |e| {
+                if (std.mem.eql(u8, e.name, name)) return true;
+            }
+            return false;
+        }
+        // Catch the set up with names appended since the last call (names are unique, so count == synced prefix).
+        while (set.count() < list.len) try set.put(p.a, list[set.count()].name, {});
+        return set.contains(name);
+    }
 
     fn step(p: *Parser) Error!void {
         const rest = p.src[p.pos..];
@@ -273,6 +298,7 @@ const Parser = struct {
         while (i < s.len and !isTagDelim(s[i])) i += 1;
         const name = try lower(p.a, s[ns..i]);
         p.attr_buf.clearRetainingCapacity();
+        p.attr_set.clearRetainingCapacity();
         var self_closing = false;
         while (true) {
             while (i < s.len and isWs(s[i])) i += 1;
@@ -314,14 +340,7 @@ const Parser = struct {
                 i = j;
             } else i = ne;
             const lname = try lower(p.a, aname);
-            var dup = false;
-            for (p.attr_buf.items) |e| {
-                if (std.mem.eql(u8, e.name, lname)) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) try p.attr_buf.append(p.a, .{ .name = lname, .value = try decode(p.a, value, true) });
+            if (!try p.hasAttr(p.attr_buf.items, &p.attr_set, lname)) try p.attr_buf.append(p.a, .{ .name = lname, .value = try decode(p.a, value, true) });
         }
         p.pos = i;
         return .{ .name = name, .attrs = p.attr_buf.items, .self_closing = self_closing };
@@ -432,12 +451,9 @@ const Parser = struct {
             p.body_open = true;
         }
         if (target) |t| {
+            const set = if (sp == .html) &p.html_set else &p.body_set;
             for (tag.attrs) |at| {
-                var have = false;
-                for (t.items) |e| {
-                    if (std.mem.eql(u8, e.name, at.name)) have = true;
-                }
-                if (!have) try t.append(p.a, at);
+                if (!try p.hasAttr(t.items, set, at.name)) try t.append(p.a, at);
             }
         }
     }
@@ -460,12 +476,17 @@ const Parser = struct {
         if (p.kids.items.len > cs) {
             const last = p.kids.items[p.kids.items.len - 1];
             if (last.kind == .text) {
-                const buf = try p.a.alloc(u8, last.text.len + text.len);
-                @memcpy(buf[0..last.text.len], last.text);
-                @memcpy(buf[last.text.len..], text);
-                const n = try p.a.create(Node);
-                n.* = .{ .kind = .text, .text = buf };
-                p.kids.items[p.kids.items.len - 1] = n;
+                // `last` is only referenced from `kids` (it is copied into a parent's children when that closes,
+                // and is never the last kid again afterwards), so it can be extended in place.
+                if (p.run_node != last) {
+                    // Start a new run; the previous run's buffer stays alive in the arena for its node.
+                    p.run_buf = .empty;
+                    try p.run_buf.ensureTotalCapacity(p.a, 2 * (last.text.len + text.len));
+                    p.run_buf.appendSliceAssumeCapacity(last.text);
+                    p.run_node = last;
+                }
+                try p.run_buf.appendSlice(p.a, text);
+                last.text = p.run_buf.items;
                 return;
             }
         }
@@ -1007,6 +1028,64 @@ test "text, stray lt, comments, doctype" {
     try expectTree("<?php x ?>y", "y");
     try expectTree("x</>y</ >z</3>", "xyz");
     try expectTree("<div>a\r\nb\rc</div>", "<div>a\nb\nc</div>");
+}
+
+test "merged text runs, many pieces" {
+    try expectTree("<div>a<!---->b</div>c<!---->d<p>e<!---->f<!---->g</p>h", "<div>ab</div>cd<p>efg</p>h");
+    try expectTree("<!DOCTYPE html><body>x<body>y<!---->z<body a=1>w", "xyzw");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const n = 200_000;
+    const piece = "x<!---->";
+    const src = try arena.allocator().alloc(u8, piece.len * n);
+    for (0..n) |k| @memcpy(src[k * piece.len ..][0..piece.len], piece);
+    const doc = try parse(arena.allocator(), src);
+    try testing.expectEqual(@as(usize, 1), doc.root_children.len);
+    try testing.expectEqual(@as(usize, n), doc.root_children[0].text.len);
+    try testing.expect(std.mem.allEqual(u8, doc.root_children[0].text, 'x'));
+    // linear growth: far below the quadratic n^2/2 bytes
+    try testing.expect(arena.queryCapacity() < 64 * n);
+
+    // document mode, text split by repeated <body> tags
+    _ = arena.reset(.retain_capacity);
+    const piece2 = "ab<body>";
+    const src2 = try arena.allocator().alloc(u8, 15 + piece2.len * n);
+    @memcpy(src2[0..15], "<!DOCTYPE html>");
+    for (0..n) |k| @memcpy(src2[15 + k * piece2.len ..][0..piece2.len], piece2);
+    const doc2 = try parse(arena.allocator(), src2);
+    try testing.expectEqual(@as(usize, 1), doc2.root_children.len);
+    try testing.expectEqual(@as(usize, 2 * n), doc2.root_children[0].text.len);
+}
+
+test "many attributes: first wins, order kept, near-linear" {
+    try expectTree("<div b=1 a=2 B=3 c=4 a=5>t</div>", "<div b=1 a=2 c=4>t</div>");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = 60_000;
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "<!DOCTYPE html><html");
+    for (0..n) |k| try src.print(a, " x{d}={d}", .{ k, k });
+    try src.appendSlice(a, " X0=dup><body");
+    for (0..n) |k| try src.print(a, " y{d}", .{k});
+    try src.appendSlice(a, "><body y5=dup z=1><a");
+    for (0..n) |k| try src.print(a, " x{d}={d}", .{ k, k });
+    for (0..n) |k| try src.print(a, " X{d}=dup", .{k});
+    try src.appendSlice(a, ">t</a>");
+    const doc = try parse(a, src.items);
+    try testing.expectEqual(@as(usize, n), doc.html_attrs.len);
+    try testing.expectEqualStrings("0", doc.html_attrs[0].value);
+    try testing.expectEqual(@as(usize, n + 1), doc.body_attrs.len);
+    try testing.expectEqualStrings("", doc.body_attrs[5].value);
+    try testing.expectEqualStrings("z", doc.body_attrs[n].name);
+    const el = doc.root_children[0];
+    try testing.expectEqual(@as(usize, n), el.attrs.len);
+    for (el.attrs, 0..) |at, k| {
+        var nb: [16]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&nb, "x{d}", .{k}), at.name);
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&nb, "{d}", .{k}), at.value);
+    }
 }
 
 test "entities" {

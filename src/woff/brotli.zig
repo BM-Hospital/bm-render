@@ -654,8 +654,10 @@ const Decoder = struct {
                 copyMatch(out, pos, distance, copy_len);
                 pos += copy_len;
             }
-            p1 = out[pos - 1];
-            p2 = out[pos - 2];
+            // A transformed dictionary word can emit 0 or 1 bytes, so pos may still be < 2 here (RFC 7932: the
+            // context bytes before the start of the stream are 0).
+            p1 = if (pos > 0) out[pos - 1] else 0;
+            p2 = if (pos > 1) out[pos - 2] else 0;
         }
         d.pos = pos;
     }
@@ -812,4 +814,48 @@ fn readContextMap(br: *BitReader, ntrees: u32, map: []u8) Error!void {
 /// Test hook: decodes the embedded static dictionary (caller frees).
 pub fn loadDictionaryForTest(alloc: std.mem.Allocator) Error![]u8 {
     return loadDictionary(alloc);
+}
+
+test "brotli: transformed dictionary word emitting 0 bytes at stream start does not underflow" {
+    // Hand-built stream: one meta-block (MLEN 10), single-symbol prefix codes, insert&copy symbol 130
+    // (insert 0, copy 4), distance code 42 with extra bits making distance 34817 -> static dictionary word with
+    // transform 34 (omit-first-9), which emits 0 bytes while pos is still 0.
+    const W = struct {
+        buf: [64]u8 = @splat(0),
+        n: usize = 0,
+        fn put(w: *@This(), v: u32, k: u5) void {
+            var i: u5 = 0;
+            while (i < k) : (i += 1) {
+                if ((v >> i) & 1 != 0) w.buf[w.n >> 3] |= @as(u8, 1) << @intCast(w.n & 7);
+                w.n += 1;
+            }
+        }
+    };
+    var w = W{};
+    w.put(0, 1); // WBITS=16
+    w.put(1, 1); // ISLAST
+    w.put(0, 1); // !ISLASTEMPTY
+    w.put(0, 2); // MNIBBLES=4
+    w.put(9, 16); // MLEN-1
+    w.put(0, 1); // NBLTYPESL = 1
+    w.put(0, 1); // NBLTYPESI = 1
+    w.put(0, 1); // NBLTYPESD = 1
+    w.put(0, 2); // NPOSTFIX
+    w.put(0, 4); // NDIRECT
+    w.put(0, 2); // context mode
+    w.put(0, 1); // NTREESL = 1
+    w.put(0, 1); // NTREESD = 1
+    w.put(1, 2); // literal code: simple, 1 symbol
+    w.put(0, 2);
+    w.put('a', 8);
+    w.put(1, 2); // insert&copy code: simple, 1 symbol
+    w.put(0, 2);
+    w.put(130, 10);
+    w.put(1, 2); // distance code: simple, 1 symbol
+    w.put(0, 2);
+    w.put(42, 6);
+    w.put(2052, 14); // distance extra bits
+    var dst: [16]u8 = undefined;
+    // Must not panic (integer overflow on `pos - 2`); either result is acceptable.
+    _ = decompressInto(std.testing.allocator, w.buf[0 .. (w.n + 7) / 8 + 8], &dst) catch {};
 }
