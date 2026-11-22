@@ -98,7 +98,9 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addOptions("build_options", flags);
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this string");
-    const tests = b.addTest(.{ .root_module = test_mod, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+    // LLVM backend: the self-hosted x86_64 backend (default for Debug on Linux in Zig 0.17.1) miscompiles
+    // raster/blur.zig (segfault in columnPass); the same tests pass under LLVM.
+    const tests = b.addTest(.{ .use_llvm = true, .root_module = test_mod, .filters = if (test_filter) |filter| &.{filter} else &.{} });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 
