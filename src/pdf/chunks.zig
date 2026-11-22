@@ -20,6 +20,13 @@
 //!
 //! What the caller checks too: uniform page width, no page counter in the content, no page rules
 //! that depend on the root.
+//!
+//! A document with no such forced break (or whose parts links join) may still be cut at any page
+//! boundary (`Flow`, paged.zig `FlowIter`): the same flow and the same conditions, every child of
+//! the flow a block; a part lays out the children of the flow from the one holding its first
+//! page's start, and the page it stops at is chosen as it is laid out. A child may hold a part's
+//! start (`Flow.cuttable`) unless a `#fragment` link in it or before it reaches it or a later
+//! child, or it holds a positioned or transformed box.
 const std = @import("std");
 const render = @import("../render.zig");
 const style = @import("../style/style.zig");
@@ -94,9 +101,8 @@ fn parts(a: Allocator, f: *const Frame, starts: []const u32) Error![]const Part 
     return out;
 }
 
-fn no(comptime why: []const u8) ?Plan {
+fn no(comptime why: []const u8) void {
     memtrace.mark("chunks: whole: " ++ why);
-    return null;
 }
 
 fn zeroLp(v: style.computed.LP) bool {
@@ -178,16 +184,14 @@ fn blankText(f: *const Frame, i: u32) bool {
     return std.mem.trim(u8, e.text, " \t\r\n\x0c").len == 0;
 }
 
-/// Where `f`'s document (its element model and styles: `Frame.prepareDocument`) may be cut, or
-/// null when it has fewer than two parts or cannot be cut safely (see the file comment).
-pub fn plan(a: Allocator, f: *const Frame, min_elements: u32) Error!?Plan {
+/// The flow: from the root down the plain blocks that hold one element child (null: a box around
+/// the content draws, sizes or names itself).
+fn findFlow(f: *const Frame) ?u32 {
     const d = &f.dom;
-    if (d.root == none) return null;
-    // the flow: down the plain blocks that hold one element child
     var flow = d.root;
     var guard: u32 = 0;
     while (guard < 64) : (guard += 1) {
-        if (!plainBlock(f, flow)) return no("the flow or a box around it draws, sizes or names itself");
+        if (!plainBlock(f, flow)) return null;
         var only: u32 = none;
         var count: u32 = 0;
         var c = d.at(flow).first;
@@ -202,15 +206,150 @@ pub fn plan(a: Allocator, f: *const Frame, min_elements: u32) Error!?Plan {
         }
         break;
     }
-    // the elements of the document: nothing that repeats, floats or escapes its part
-    for (d.els.items, 0..) |*e, idx| {
+    return flow;
+}
+
+/// Whether the elements of the document stay in their child of `flow`: nothing that repeats on
+/// every page, floats or escapes its part (false after a memory checkpoint naming it).
+fn staysInParts(f: *const Frame, flow: u32) bool {
+    for (f.dom.els.items, 0..) |*e, idx| {
         if (bareText(f, @intCast(idx))) continue;
         const cs = e.cs;
         if (cs.display == .none) continue;
-        if (cs.position == .fixed) return no("a fixed box");
-        if (cs.float != .none) return no("a float");
-        if (cs.position == .absolute and !containedBelow(f, @intCast(idx), flow)) return no("an absolute box escapes its part");
+        if (cs.position == .fixed) {
+            no("a fixed box");
+            return false;
+        }
+        if (cs.float != .none) {
+            no("a float");
+            return false;
+        }
+        if (cs.position == .absolute and !containedBelow(f, @intCast(idx), flow)) {
+            no("an absolute box escapes its part");
+            return false;
+        }
     }
+    return true;
+}
+
+/// A document cut at any page boundary (paged.zig `writeFlowing`): its parts start at the page
+/// boundaries found as the document is laid out, a part's frame laying out the children of the
+/// flow from the one holding its first page's start (chunks.zig file comment).
+pub const Flow = struct {
+    parent: u32,
+    /// the flow's children that generate a box (element indices, source order)
+    kids: []const u32,
+    /// per kid: a part may start inside it or at it (no `#fragment` link in it or before it
+    /// reaches it or a kid after it: the link's annotation is decided when its part is drawn)
+    cuttable: []const bool,
+
+    /// The index in `kids` of the child of the flow holding element `el` (null: none).
+    pub fn kidOf(fl: *const Flow, f: *const Frame, el: u32) ?usize {
+        var cur = el;
+        var guard: u32 = 0;
+        while (cur != none and guard < 4096) : (guard += 1) {
+            const up = f.dom.at(cur).parent;
+            if (up == fl.parent) {
+                const k = std.sort.lowerBound(u32, fl.kids, cur, struct {
+                    fn order(x: u32, y: u32) std.math.Order {
+                        return std.math.order(x, y);
+                    }
+                }.order);
+                return if (k < fl.kids.len and fl.kids[k] == cur) k else null;
+            }
+            cur = up;
+        }
+        return null;
+    }
+};
+
+/// The flowing plan of `f`'s document, whose flow (`findFlow`) is `flow`: every child of the flow
+/// that generates a box is a block (an inline child would sit in an anonymous block spanning
+/// several of them). Null: it cannot be cut.
+fn flowPlan(a: Allocator, f: *const Frame, flow: u32) Error!?Flow {
+    const d = &f.dom;
+    var kids: std.ArrayList(u32) = .empty;
+    var c = d.at(flow).first;
+    while (c != none) : (c = d.at(c).next) {
+        if (blankText(f, c) or hidden(f, c)) continue;
+        if (!blockChild(f, c)) {
+            no("a child of the flow is not a block");
+            return null;
+        }
+        try kids.append(a, c);
+    }
+    if (kids.items.len < 2) {
+        no("the flow has fewer than two children");
+        return null;
+    }
+    var fl: Flow = .{ .parent = flow, .kids = kids.items, .cuttable = &.{} };
+    const cuttable = try a.alloc(bool, kids.items.len);
+    @memset(cuttable, true);
+    // per element id, the last kid holding an element with it (interactive.zig takes the first
+    // box with the id: an earlier element may have no box)
+    var ids: std.StringHashMapUnmanaged(usize) = .empty;
+    for (d.els.items, 0..) |*e, idx| {
+        if (e.run or e.id.len == 0) continue;
+        const k = fl.kidOf(f, @intCast(idx)) orelse continue;
+        const gop = try ids.getOrPut(a, e.id);
+        if (!gop.found_existing or k > gop.value_ptr.*) gop.value_ptr.* = k;
+    }
+    // a kid holding a positioned or transformed box: the boxes the walk lifts out of their page
+    // pass do not tag a page the same when the kid is laid out from one of its pages on (only
+    // the whole kid laid out gives the document's marked content)
+    for (kids.items, 0..) |kid, k| {
+        const end: usize = if (k + 1 < kids.items.len) kids.items[k + 1] else d.els.items.len;
+        for (d.els.items[kid..end], kid..) |*e, idx| {
+            if (bareText(f, @intCast(idx)) or e.cs.display == .none) continue;
+            const cs = e.cs;
+            if (cs.position != .static or cs.transform.len > 0 or cs.rotate != 0 or cs.scale[0] != 1 or cs.scale[1] != 1 or !zeroLp(cs.translate[0]) or !zeroLp(cs.translate[1])) {
+                cuttable[k] = false;
+                break;
+            }
+        }
+    }
+    for (d.els.items, 0..) |*e, idx| {
+        if (e.run) continue;
+        const href = d.attr(@intCast(idx), "href") orelse continue;
+        if (href.len < 2 or href[0] != '#') continue;
+        const id = try counters.percentDecode(a, href[1..]);
+        const to = ids.get(id) orelse continue;
+        const from = fl.kidOf(f, @intCast(idx)) orelse continue;
+        if (to >= from) @memset(cuttable[from .. to + 1], false);
+    }
+    fl.cuttable = cuttable;
+    return fl;
+}
+
+/// How a document is cut: at its forced page breaks (`Plan`), or at page boundaries found as it is
+/// laid out (`Flow`).
+pub const Cut = union(enum) { forced: Plan, flowing: Flow };
+
+/// Where `f`'s document (its element model and styles: `Frame.prepareDocument`) may be cut, or
+/// null when it cannot be cut safely (see the file comment): at forced page breaks when it has at
+/// least two parts of `min_elements` there, else at any page boundary between or inside the
+/// children of the flow (`flowPlan`).
+pub fn plan(a: Allocator, f: *const Frame, min_elements: u32) Error!?Cut {
+    const d = &f.dom;
+    if (d.root == none) return null;
+    const flow = findFlow(f) orelse {
+        no("the flow or a box around it draws, sizes or names itself");
+        return null;
+    };
+    if (!staysInParts(f, flow)) return null;
+    if (try forcedPlan(a, f, flow, min_elements)) |p| return .{ .forced = p };
+    const fl = try flowPlan(a, f, flow) orelse return null;
+    return .{ .flowing = fl };
+}
+
+/// A forced-break plan not taken (the document may still be cut at other page boundaries).
+fn soft(comptime why: []const u8) ?Plan {
+    memtrace.mark("chunks: no forced cut: " ++ why);
+    return null;
+}
+
+fn forcedPlan(a: Allocator, f: *const Frame, flow: u32, min_elements: u32) Error!?Plan {
+    const d = &f.dom;
     // the cuts
     var starts: std.ArrayList(u32) = .empty;
     var prev: u32 = none;
@@ -231,7 +370,7 @@ pub fn plan(a: Allocator, f: *const Frame, min_elements: u32) Error!?Plan {
         }
         prev = c;
     }
-    if (starts.items.len < 2) return no("no forced page break between the flow's blocks");
+    if (starts.items.len < 2) return soft("no forced page break between the flow's blocks");
     var p: Plan = .{ .parent = flow, .starts = starts.items };
     // a link to a later part joins the parts from the link's to the target's
     try joinForwardLinks(a, f, &p, &starts);
@@ -244,13 +383,13 @@ pub fn plan(a: Allocator, f: *const Frame, min_elements: u32) Error!?Plan {
         }
         starts = kept;
     }
-    if (starts.items.len < 2) return no("links ahead join every part");
+    if (starts.items.len < 2) return soft("links ahead join every part");
     p.starts = starts.items;
     // (a part's edge children are block elements: a start is one, and the child before it ended
     // the part before)
     for (p.starts[1..]) |st| {
         const pv = prevElement(f, st);
-        if (pv == none or !blockChild(f, pv)) return no("a part does not follow a block");
+        if (pv == none or !blockChild(f, pv)) return soft("a part does not follow a block");
     }
     p.parts = try parts(a, f, p.starts);
     return p;
@@ -258,22 +397,22 @@ pub fn plan(a: Allocator, f: *const Frame, min_elements: u32) Error!?Plan {
 
 /// Whether the anchors and headings collected for part `chunk` (laid out as `pt`) are elements of
 /// it (a box moved past the part's edge would be collected by the wrong part).
-pub fn ownsCollected(f: *const Frame, p: Plan, pt: Part, anchors: anytype, headings: anytype, chunk: u32) bool {
+pub fn ownsCollected(f: *const Frame, parent: u32, pt: Part, anchors: anytype, headings: anytype, chunk: u32) bool {
     const own = struct {
-        fn of(fr: *const Frame, parent: u32, part: Part, el: u32) bool {
+        fn of(fr: *const Frame, flow: u32, part: Part, el: u32) bool {
             var cur = el;
             var guard: u32 = 0;
             while (cur != none and guard < 4096) : (guard += 1) {
                 const up = fr.dom.at(cur).parent;
-                if (up == parent) return cur >= part.own_lo and cur < part.own_hi;
+                if (up == flow) return cur >= part.own_lo and cur < part.own_hi;
                 cur = up;
             }
             return false;
         }
     };
     var it = anchors.valueIterator();
-    while (it.next()) |an| if (an.chunk == chunk and !own.of(f, p.parent, pt, an.el)) return false;
-    for (headings) |h| if (h.chunk == chunk and !own.of(f, p.parent, pt, h.el)) return false;
+    while (it.next()) |an| if (an.chunk == chunk and !own.of(f, parent, pt, an.el)) return false;
+    for (headings) |h| if (h.chunk == chunk and !own.of(f, parent, pt, h.el)) return false;
     return true;
 }
 

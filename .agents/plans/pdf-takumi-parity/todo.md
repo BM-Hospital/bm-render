@@ -348,13 +348,13 @@ Chuyển việc đặt float và line wrapping vào vòng lặp layout theo tran
 
 ## 19 — Emit trang ổn định khi layout còn tiếp tục (P1)
 
-**Trạng thái:** in progress — đã có emit từng phần với tài liệu cắt được tại forced page break (`paged.writeChunked`, `chunks.zig`, `emit.DocWriter`): trang của mỗi phần được vẽ trước khi phần sau được layout, và output tương đương bản layout cả tài liệu (26 case, `npm run test:pdf:chunks`). Chưa có: cắt tại ranh giới trang bất kỳ (tài liệu không có forced break vẫn layout cả một lần). Xem `streaming-chunks.md`.
+**Trạng thái:** in progress — emit từng phần chạy cho cả hai kiểu cắt: tại forced page break (`chunks.plan` → `.forced`), và tại ranh giới trang bất kỳ khi không có forced break (`.flowing`, `paged.FlowIter`): mỗi phần layout các con của flow từ con chứa điểm bắt đầu trang đầu của nó, giữ mọi trang trừ trang cuối (cắt ở trang còn ít nhất một trang và một con của flow phía sau), phần sau tiếp tục bằng token theo phần tử DOM (`NodeKey` + dòng + glyph). Trường hợp không an toàn thì layout cả tài liệu. Output tương đương bản whole: 55/55 case (`npm run test:pdf:chunks`, native và wasm, 22 case `flow-*` mới), corpus 160/160 trùng byte. Còn thiếu: cắt trong bảng/flex/grid, trong con của flow có box positioned/transform; port các case của streaming_tests.rs/window_scenes.rs. Xem `streaming-chunks.md`.
 
 Port settled-page lifecycle của upstream; đây là streaming nội bộ, không tự thêm public streaming API.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Plain long document emit trang đầu trước khi layout toàn bộ xong.
+- [x] Plain long document emit trang đầu trước khi layout toàn bộ xong (`flow-*`, `flow-takumi-default`: 350 trang, 5 phần).
 - [ ] Transform nhìn ngược nhiều trang và positioned descendant chưa biết đích phải giữ đúng các trang cần giữ.
 - [ ] window_scenes so sánh paint chunks/paint order giữa incremental và after-layout tương đương.
 
@@ -384,14 +384,14 @@ Port pass đếm/settle và dữ liệu document-level cần sống qua release 
 
 ## 21 — Giới hạn live memory của tài liệu dài (P1)
 
-**Trạng thái:** in progress — có instrumentation allocator (native `memoryPeak`, `memoryTrace`, `src/memtrace.zig`). Stress doc, native, tiến trình mới: peak 153 → 61 MiB ở 500 trang, 297 → 119 MiB ở 1000 trang. Live sau trang ~200 / sau trang ~50 = 1,05–1,06. Vẫn tuyến tính: DOM + style dùng chung (~55 KiB/trang), khoảng 20 KiB/trang tích lũy khi emit, và bước ráp file. Tiêu chí `memory_tests.rs` (700 section không có forced break) chưa đạt vì tài liệu đó layout cả một lần.
+**Trạng thái:** in progress — có instrumentation allocator (native `memoryPeak`, `memoryTrace`, `src/memtrace.zig`) và `npm run test:pdf:memory` (`scripts/pdf-memory.mjs`). Case `memory_tests.rs` (700 section, không forced break, header totalPages, 2 pass) giờ được cắt tại ranh giới trang bất kỳ: pass đếm live trang 50 / 200 = 4,48 / 4,64 MiB (×1,036), pass vẽ 5,74 / 6,10 MiB (×1,064) — đạt; peak 18,7 → 7,6 MiB (350 trang), 61,7 → 21,9 MiB (1400 trang). Đã giảm tích lũy khi vẽ: text đã chuẩn hóa và cluster starts của đoạn văn nằm trong bộ nhớ trang thay vì bộ nhớ tài liệu (~800 B/trang), và file được cấp phát một lần khi ráp (`Doc.finish`). Stress doc (forced break), native: 100 trang peak 19,6 → 19,1 MiB, 500 trang 59,6 → 53,0 MiB, 1,7–3,0 ms/trang, 3,7–3,9 KiB/trang. Vẫn tuyến tính: DOM + style dùng chung, ~11 KiB/trang tích lũy khi emit ở stress doc (content stream, cây tag, heading), map/rows khi ráp file.
 
 Release layout/shaping/page allocations khi trang không còn được tham chiếu; tách memory đang sống với wasm capacity.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Port invariant memory_tests.rs: live bytes sau trang 200 không quá live bytes trang 50 ×1,1 trong từng pass của case 700 section.
-- [ ] Không dùng RSS hoặc WebAssembly.Memory.buffer.byteLength đơn lẻ làm bằng chứng live memory đã giảm.
+- [x] Port invariant memory_tests.rs: live bytes sau trang 200 không quá live bytes trang 50 ×1,1 trong từng pass của case 700 section (`scripts/pdf-memory.mjs`, native; ×1,036 và ×1,064).
+- [x] Không dùng RSS hoặc WebAssembly.Memory.buffer.byteLength đơn lẻ làm bằng chứng live memory đã giảm (bộ đếm allocator của addon native).
 - [ ] Benchmark 100/500 trang báo time/page, peak, live bytes và kích thước PDF; không có dữ liệu sống trỏ vào arena đã giải phóng.
 
 **Kiểm tra:** Memory/stress tests có instrumentation allocator, native sanitizer phù hợp và wasm; so sánh cùng workload/reference.

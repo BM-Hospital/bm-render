@@ -499,7 +499,8 @@ fn Engine(comptime T: type) type {
                 errdefer e.a.free(token.branches);
                 try e.starts.append(e.a, token);
             }
-            if (page == 0) if (e.start_h) |h0| return h0;
+            // (page 0 ends at the start: `Options.origin` is where it starts)
+            if (page == 0) if (e.start_h) |h0| return h0 - e.opts.origin;
             const h = if (e.opts.page_height_fn) |f| f(e.opts.ctx, page, name) else e.opts.page_height;
             if (!(h >= 1) or !(h < 16_777_216)) return error.InvalidPageSize;
             return h;
@@ -510,7 +511,8 @@ fn Engine(comptime T: type) type {
             while (e.tops.items.len < @as(usize, page) + 2) {
                 const k: u32 = @intCast(e.tops.items.len - 1);
                 const h = try e.pageHeight(k);
-                try e.tops.append(e.a, e.tops.items[k] + h);
+                // (page 1 of `Options.start` starts exactly at `start_top`)
+                try e.tops.append(e.a, if (k == 0 and e.start_h != null) e.start_h.? else e.tops.items[k] + h);
             }
         }
         fn window(e: *Self, page: u32) Error!Pg {
@@ -1915,6 +1917,8 @@ fn Engine(comptime T: type) type {
             for (ns) |*nd| {
                 if (nd.style.breaks.page != 0) e.any_names = true;
             }
+            // (the root moves first: a start is where the moved content has it)
+            if (e.opts.root_shift != 0) e.lay(root).y += e.opts.root_shift;
             if (e.opts.start) |s| if (e.startY(s)) |y| {
                 const h = e.opts.start_top orelse y;
                 if (h >= 1 and h < 16_777_216) {
@@ -1925,7 +1929,6 @@ fn Engine(comptime T: type) type {
                     e.lay(root).y += e.shift;
                 }
             };
-            if (e.opts.root_shift != 0) e.lay(root).y += e.opts.root_shift;
             try e.tops.append(e.a, e.opts.origin);
             try e.need(0);
             // (a fixed box keeps where it was laid out against the first page, whatever moves its

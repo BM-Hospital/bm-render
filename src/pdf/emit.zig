@@ -2678,6 +2678,12 @@ pub const Extents = struct {
     pre: []u32,
 
     pub fn compute(a: Allocator, f: *const Frame) Error!Extents {
+        return computeWith(a, f, true);
+    }
+
+    /// `compute` without the font size a glyph may overflow its line by (`glyphs` false): what
+    /// the boxes paint, a line of text being painted on the page that holds it only.
+    pub fn computeWith(a: Allocator, f: *const Frame, glyphs: bool) Error!Extents {
         const nn = f.nodes.items.len;
         const ex: Extents = .{ .y = try a.alloc(f32, nn), .lo = try a.alloc(f32, nn), .hi = try a.alloc(f32, nn), .pre = try a.alloc(u32, nn) };
         @memset(ex.y, std.math.nan(f32));
@@ -2718,8 +2724,11 @@ pub const Extents = struct {
                 ex.hi[id] = std.math.inf(f32);
                 continue;
             }
-            var reach = paintReach(cs) + cs.font_size;
-            for (cs.text_shadow) |sh| reach = @max(reach, cs.font_size + @abs(sh.y) + 3 * @max(sh.blur, 0));
+            var reach = paintReach(cs);
+            if (glyphs) {
+                reach += cs.font_size;
+                for (cs.text_shadow) |sh| reach = @max(reach, cs.font_size + @abs(sh.y) + 3 * @max(sh.blur, 0));
+            }
             ex.lo[id] = y - reach;
             ex.hi[id] = y + @max(l.h, 0) + reach;
             if (n.parent != none and f.nodes.items[n.parent].cs.display == .table_cell and tagsm.standsForParent(f, id)) {

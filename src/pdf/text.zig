@@ -846,9 +846,9 @@ fn clusterEnd(text: []const u8, starts: []const u32, start: u32) u32 {
 /// The paragraph text with the white space the text engine turns into spaces (segment breaks,
 /// tabs, form feeds) written as U+0020, so a space glyph maps to " " as in takumi's collapsed
 /// text (same byte offsets; cached per text).
-fn sanitizedText(reg: *FontRegistry, text: []const u8) ![]const u8 {
+fn sanitizedText(reg: *FontRegistry, a: Allocator, text: []const u8) ![]const u8 {
     if (reg.text_src.ptr == text.ptr and reg.text_src.len == text.len) return reg.text_clean;
-    const t = try reg.a.dupe(u8, text);
+    const t = try a.dupe(u8, text);
     for (t) |*ch| switch (ch.*) {
         '\n', '\r', '\t', 0x0c => ch.* = ' ',
         else => {},
@@ -858,12 +858,12 @@ fn sanitizedText(reg: *FontRegistry, text: []const u8) ![]const u8 {
     return t;
 }
 
-fn clusterStarts(reg: *FontRegistry, para: *const font_mod.Paragraph) ![]const u32 {
+fn clusterStarts(reg: *FontRegistry, a: Allocator, para: *const font_mod.Paragraph) ![]const u32 {
     if (reg.cluster_para == @as(?*const anyopaque, para)) return reg.cluster_starts;
     var list: std.ArrayList(u32) = .empty;
     for (para.glyphs) |g| {
         if (g.flags & font_mod.ShapedGlyph.SPECIAL != 0) continue;
-        try list.append(reg.a, g.cluster);
+        try list.append(a, g.cluster);
     }
     std.mem.sort(u32, list.items, {}, std.sort.asc(u32));
     var n: usize = 0;
@@ -1047,8 +1047,8 @@ fn buildRun(reg: *FontRegistry, a: Allocator, f: *rt.Frame, para: ?*const font_m
         }
         text = t.items;
     } else {
-        const starts: []const u32 = if (para) |p| try clusterStarts(reg, p) else &.{};
-        text = try sanitizedText(reg, text);
+        const starts: []const u32 = if (para) |p| try clusterStarts(reg, a, p) else &.{};
+        text = try sanitizedText(reg, a, text);
         for (gs, shaped) |g, *sg| {
             const st: u32 = @min(g.cluster, @as(u32, @intCast(text.len)));
             sg.* = .{ .gid = g.gid, .x = g.x, .y = g.y, .start = st, .end = clusterEnd(text, starts, st) };
