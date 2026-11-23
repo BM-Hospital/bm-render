@@ -18,6 +18,8 @@ pub const Image = struct {
 pub const Limits = struct {
     /// Maximum width*height accepted by any decoder (checked before the pixel buffer is allocated).
     max_pixels: u64 = 64 << 20,
+    /// Maximum frames of an animation walked by `anim.Animator` (never above `Animator.max_frames`).
+    max_frames: u32 = std.math.maxInt(u32),
     /// Apply the JPEG EXIF Orientation tag (rotate/flip). takumi (zune-jpeg) does NOT apply it,
     /// so the default `false` mirrors takumi; browsers do apply it for <img>.
     apply_exif_orientation: bool = false,

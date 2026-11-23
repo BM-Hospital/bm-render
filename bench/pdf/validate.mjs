@@ -306,7 +306,10 @@ for (const e of ENG) {
 }
 for (const [k2, p] of Object.entries(tools)) summary.tools[k2] = p ? path.relative(ROOT, p).split(path.sep).join("/") : null;
 const tm = toolsManifest().tools;
-summary.toolVersions = { qpdf: tm.qpdf?.version, pdfcpu: tm.pdfcpu?.version, poppler: tm.poppler?.version, jre: tm.jre?.version, verapdf: tm.verapdf?.version, pdfjs: pkgV("pdfjs-dist"), mupdf: pkgV("mupdf"), takumiPdf: manifest.versions?.['takumi-pdf']?.version ?? pkgV("takumi-pdf") };
+// (a tool installed outside setup.mjs, e.g. from the system packages on Linux, records its own version in .ok.json)
+const installed = (name) => { try { return JSON.parse(readFileSync(path.join(path.dirname(findBin(name, Object.keys(tm[name].bin)[0]) || ''), '.ok.json'), 'utf8')).version; } catch { return null; } };
+const tv = (name) => installed(name) ?? tm[name]?.version;
+summary.toolVersions = { qpdf: tv('qpdf'), pdfcpu: tv('pdfcpu'), poppler: tv('poppler'), jre: tv('jre'), verapdf: tv('verapdf'), pdfjs: pkgV("pdfjs-dist"), mupdf: pkgV("mupdf"), takumiPdf: manifest.versions?.['takumi-pdf']?.version ?? pkgV("takumi-pdf") };
 function pkgV(p) { try { return JSON.parse(readFileSync(path.join(ROOT, "bench", "pdf", "node_modules", ...p.split("/"), "package.json"), "utf8")).version; } catch { return null; } }
 
 const out = { date: new Date().toISOString(), build: { date: manifest.date, versions: manifest.versions, seconds: manifest.seconds }, args: process.argv.slice(2), gate, missingTools: missing, summary, docs: results, seconds: +((performance.now() - T0) / 1000).toFixed(1) };

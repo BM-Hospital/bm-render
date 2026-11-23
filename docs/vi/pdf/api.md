@@ -262,6 +262,7 @@ nhóm này loại trừ nhau. Mọi tùy chọn đều không bắt buộc.
 | `tagged` | `boolean \| "ua1" \| "ua2"` | `true` | Cây cấu trúc; `"ua1"` / `"ua2"` còn kiểm tra theo PDF/UA-1 / PDF/UA-2. | [PDF có thẻ](accessibility.md#pdf-có-thẻ), [PDF/UA](accessibility.md#pdfua) |
 | `pdfa` | `"2a" \| "2b" \| "2u" \| "3a" \| "3b" \| "3u" \| "4" \| "4f"` | không có | Mức PDF/A, có kiểm tra; vi phạm làm render thất bại. | [PDF/A](accessibility.md#pdfa) |
 | `signal` | `AbortSignal` | không có | Được kiểm tra trước khi render đọc và vẽ tài liệu. | [Lỗi](#errors) |
+| `limits` | `Limits` | các mức trần có sẵn | Giới hạn tài nguyên của bm-render cho đầu vào không tin cậy (`maxImagePixels`, `maxImageBytes`, `maxAnimationFrames`, `maxNodeDepth`; `maxCanvasPixels` không áp dụng cho trang). Cũng là tùy chọn của hàm khởi tạo `PdfRenderer`; một lần gọi chỉ có thể hạ nó. Ảnh vượt giới hạn làm render thất bại với `image exceeds limits.<tên>`. | [Giới hạn tài nguyên](../image/api.md#giới-hạn-tài-nguyên-cho-đầu-vào-không-tin-cậy) |
 
 Những tổ hợp `pdfa`, `tagged` và `attachments` mà không phiên bản PDF nào cho phép là lỗi kiểu và cũng là lỗi
 lúc chạy; bảng đầy đủ nằm ở [Phiên bản và tổ hợp](accessibility.md#phiên-bản-và-tổ-hợp). Tên tùy chọn lạ bị
@@ -270,7 +271,7 @@ bỏ qua, nên hãy kiểm tra chính tả: `{ sise: "a4" }` vẫn render khổ 
 ## Tùy chọn measure {#measure-options}
 
 `PdfMeasureOptions` nhận `size` và `landscape`, hoặc `viewport`, cộng với các tài nguyên dàn trang `fonts`,
-`images`, `css`, `cssVariables`, `fontFamilies`, `lang` và `signal`. Định nghĩa kiểu bỏ ra ngoài `margin`,
+`images`, `css`, `cssVariables`, `fontFamilies`, `lang`, `limits` và `signal`. Định nghĩa kiểu bỏ ra ngoài `margin`,
 các band và mọi tùy chọn đầu ra, vì chúng không làm đổi kích thước đo được; lúc chạy, `margin` vẫn được nhận
 và bị bỏ qua, nhưng `viewport` đi cùng `size` hoặc `landscape` ném đúng lỗi "mutually exclusive" như `render`.
 

@@ -14,7 +14,7 @@ console.log(backend); // "native" when this package is installed and loads, else
 
 It is released together with `bm-render` at the same version (0.1.3), which pins it exactly; an
 addon whose internal interface version does not match the installed `bm-render` is ignored (wasm is used).
-Requires Node-API 6 (`engines.node`: `>=10.20.0 <11 || >=12.17.0 <13 || >=14.0.0`); `bm-render` itself requires Node.js 18+.
+Requires Node-API 6 (`engines.node`: `>=10.20.0 <11 || >=12.17.0 <13 || >=14.0.0`); `bm-render` itself requires Node.js 20+.
 
 Status: cross-compiled and structurally verified (exports, imported symbols, CPU level), but **not yet executed on this platform** by the project; `bm-render` falls back to WebAssembly if it does not load.
 

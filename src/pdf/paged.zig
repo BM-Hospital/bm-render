@@ -25,8 +25,10 @@
 //! coordinates, and so on. The frames are one document (same element model and render nodes):
 //! counters (`counters.Seg`), links and anchors (`interactive.Collector.beginRun`), the structure
 //! tree and the emitter's neighbouring page passes (`emit.PageBox.frame` / `prev_win` / `next_win`)
-//! work across them. A page whose start is not one point (parallel flows broken inside) keeps the
-//! width of the run before it.
+//! work across them. Parallel flows broken inside (a table row's cells, a flex line's or a grid
+//! row's items) resume at one point each; a flex or grid container continued on a page of another
+//! width keeps laying its items out at its first fragment's width (`frozenWidths`). A page whose
+//! start cannot be found again in the new frame keeps the width of the run before it.
 //!
 //! Memory: each layout of the content (`Pass`) has an arena of its own (`Pass.mem`), released as
 //! soon as a later pass replaces it, so the counter and band passes of a long document hold one
@@ -259,12 +261,18 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
     var row_minimums: []const layout.fragment.RowMinimum = &.{};
     var float_shifts: []const f32 = &.{};
     var float_extents: []const f32 = &.{};
-    var assigned_rows: []const layout.fragment.RowMinimum = &.{};
-    var rows_recorded = false;
+    var frozen: []const layout.fragment.FrozenWidth = &.{};
+    // (the block size of each table row as laid out at the width of the page its table starts on:
+    // takumi lays a table's rows out once; a row that starts on a page of another width keeps it,
+    // a row broken inside goes on with the block size its last fragment's table left it,
+    // `Start.row_height`. The rows of a table with a row span keep it in either case.)
+    var assigned_rows: std.ArrayList(layout.fragment.RowMinimum) = .empty;
+    var spanning_rows: std.ArrayList(u32) = .empty;
+    var recorded_tables: std.ArrayList(u32) = .empty;
     var start_top: f32 = 0;
     var retried = false;
     while (true) {
-        const f = try bands.buildFrameCuts(cx.doc.r, a, cx.doc.o, cx.doc.css, cx.kind, cx.source, null, .{ width, g.area(base, null)[1] }, subst, cuts, row_minimums, float_shifts, float_extents);
+        const f = try bands.buildFrameCuts(cx.doc.r, a, cx.doc.o, cx.doc.css, cx.kind, cx.source, null, .{ width, g.area(base, null)[1] }, subst, cuts, row_minimums, float_shifts, float_extents, frozen);
         g.names = f.tree.paged.page_names;
         if (segs.items.len > 0 and !sameNodes(segs.items[0].frame, f)) return extendLast(segs);
         if (start) |*s| {
@@ -296,14 +304,9 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
         }
         const sc = try a.create(SegCtx);
         sc.* = .{ .g = g, .base = base, .fake = @intFromBool(start != null) };
-        var assigned: std.ArrayList(layout.fragment.RowMinimum) = .empty;
-        if (!rows_recorded) for (f.tree.table_geoms.items) |table| {
-            const spanning = for (table.cells) |cell| {
-                if (cell.rowspan > 1) break true;
-            } else false;
-            if (!spanning) continue;
-            for (table.rows) |row| if (row.node != no_node.node) try assigned.append(a, .{ .node = row.node, .height = row.h });
-        };
+        // (the rows' block sizes as laid out, before pagination moves lines down inside them)
+        var laid_rows: std.AutoHashMapUnmanaged(u32, f32) = .empty;
+        for (f.tree.table_geoms.items) |table| for (table.rows) |row| if (row.node != no_node.node) try laid_rows.put(a, row.node, row.h);
         const pages = try f.paginate(.{ .page_height = g.area(base, null)[1], .page_height_fn = SegCtx.height, .ctx = @ptrCast(sc), .start = start, .start_top = if (start != null) start_top else null, .record_starts = true, .max_pages = max_pages + 1 });
         // (page 1 must start where the run before stopped, else the run before goes on)
         if (start) |s| if (pages.start_page == 0 or pages.pages.len < 2 or !sameStart(pages.starts[1], s)) {
@@ -319,10 +322,6 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
                 continue;
             }
         }
-        if (!rows_recorded) {
-            assigned_rows = try assigned.toOwnedSlice(a);
-            rows_recorded = true;
-        }
         var stop: ?u32 = null;
         var i: u32 = fake + 1;
         while (i < pages.pages.len) : (i += 1) {
@@ -332,11 +331,34 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
             // A rowspan may be the only flow left on this page boundary: the main-flow token has
             // no node, while the spanning cell's paragraphs continue independently in side_flows.
             if (tok.node == no_node.node and tok.side_flows.len == 0) continue;
-            if (tok.line != no_node.line and lineGlyph(f, tok.node, tok.line) == null) continue;
+            // (line 0: a paragraph whose first line a float pushed onto this page resumes whole,
+            // no glyph cut needed)
+            if (tok.line != no_node.line and tok.line != 0 and lineGlyph(f, tok.node, tok.line) == null) continue;
             stop = i;
             break;
         }
         const end: u32 = stop orelse @intCast(pages.pages.len);
+        {
+            const shown_top = if (start != null) start_top else -std.math.inf(f32);
+            const shown_end = if (end < pages.pages.len) pages.pages[end].top else std.math.inf(f32);
+            for (f.tree.table_geoms.items) |table| {
+                if (table.node == no_node.node) continue;
+                const known = for (recorded_tables.items) |n| {
+                    if (n == table.node) break true;
+                } else false;
+                if (known) continue;
+                const top = absTop(f, table.node);
+                if (top < shown_top - 1.0 / 64.0 or top >= shown_end) continue;
+                try recorded_tables.append(a, table.node);
+                const spanning = for (table.cells) |cell| {
+                    if (cell.rowspan > 1) break true;
+                } else false;
+                for (table.rows) |row| if (row.node != no_node.node) {
+                    try assigned_rows.append(a, .{ .node = row.node, .height = laid_rows.get(row.node) orelse row.h });
+                    if (spanning) try spanning_rows.append(a, row.node);
+                };
+            }
+        }
         try segs.append(a, .{ .frame = f, .first = base, .local0 = fake, .count = end - fake });
         if (base + end - fake > max_pages) {
             cx.doc.r.setErr(too_many_pages, "");
@@ -362,18 +384,28 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
         start = tok;
         float_shifts = f.tree.paged.float_shifts;
         float_extents = f.tree.paged.float_extents;
+        frozen = try frozenWidths(a, f, tok, frozen);
         var rows: std.ArrayList(layout.fragment.RowMinimum) = .empty;
-        try rows.appendSlice(a, assigned_rows);
         for (f.tree.table_geoms.items) |table| for (table.rows) |row| {
-            for (assigned_rows) |minimum| {
+            for (assigned_rows.items) |minimum| {
                 if (row.node != minimum.node) continue;
                 var absolute_top: f32 = 0;
                 var ancestor = row.node;
                 while (ancestor < f.tree.nodes.items.len) : (ancestor = f.tree.nodes.items[ancestor].parent) absolute_top += f.tree.layout(ancestor).y;
-                if (absolute_top <= start_top + 1.0 / 64.0) try rows.append(a, .{ .node = row.node, .height = minimum.height, .top = row.y });
+                const spanning = std.mem.indexOfScalar(u32, spanning_rows.items, row.node) != null;
+                if (absolute_top <= start_top + 1.0 / 64.0) {
+                    if (spanning) {
+                        try rows.append(a, .{ .node = row.node, .height = minimum.height, .top = row.y });
+                    } else if (absolute_top + row.h <= start_top + 1.0 / 64.0) {
+                        // (a row that ended before the start stays where it was: the rows after it
+                        // keep their offsets, whatever the new width does to its content)
+                        try rows.append(a, .{ .node = row.node, .height = row.h, .top = row.y });
+                    }
+                } else try rows.append(a, minimum);
                 break;
             }
         };
+        for (assigned_rows.items) |minimum| if (std.mem.indexOfScalar(u32, spanning_rows.items, minimum.node) != null) try rows.append(a, minimum);
         if (tok.branches.len > 0 and tok.row_height > 0) {
             try rows.append(a, .{ .node = tok.node, .height = tok.row_height });
         }
@@ -392,7 +424,7 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
                 const glyph = lineGlyph(f, p.node, p.line) orelse return extendLast(segs);
                 try next_cuts.append(a, .{ .node = f.lid_node.items[p.node], .glyph = glyph });
             }
-        } else if (tok.line != no_node.line) try next_cuts.append(a, .{ .node = f.lid_node.items[tok.node], .glyph = lineGlyph(f, tok.node, tok.line).? });
+        } else if (tok.line != no_node.line and tok.line != 0) try next_cuts.append(a, .{ .node = f.lid_node.items[tok.node], .glyph = lineGlyph(f, tok.node, tok.line).? });
         for (tok.side_flows) |point| {
             const id = f.lid_node.items[point.node];
             if (point.finished) {
@@ -404,6 +436,40 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
         }
         cuts = next_cuts.items;
     }
+}
+
+/// The flex and grid containers the content from `tok` on continues in (its points' ancestors), with
+/// the width their items lay out at: takumi lays a flex / grid container's items out once, so on a
+/// page of another width the container's box takes that page's width while its items keep their
+/// sizes and offsets (`FrozenWidth`). `prev`: the widths frame `f` was laid out with.
+fn frozenWidths(a: Allocator, f: *const Frame, tok: layout.fragment.Start, prev: []const layout.fragment.FrozenWidth) Error![]const layout.fragment.FrozenWidth {
+    const t = &f.tree;
+    var out: std.ArrayList(layout.fragment.FrozenWidth) = .empty;
+    var points: std.ArrayList(u32) = .empty;
+    if (tok.node != rt.none) try points.append(a, tok.node);
+    for (tok.branches) |p| try points.append(a, p.node);
+    for (tok.side_flows) |p| try points.append(a, p.node);
+    for (points.items) |start| {
+        var n = start;
+        var guard: u32 = 0;
+        while (n < t.nodes.items.len and guard < layout.max_depth + 8) : (guard += 1) {
+            const d = t.nodes.items[n].style.display;
+            if (n != start and (d == .flex or d == .grid)) {
+                const known = for (out.items) |fw| {
+                    if (fw.node == n) break true;
+                } else false;
+                if (!known) {
+                    const w = for (prev) |fw| {
+                        if (fw.node == n) break fw.w;
+                    } else t.layout(n).w;
+                    try out.append(a, .{ .node = n, .w = w });
+                }
+            }
+            if (n == f.lroot) break;
+            n = t.nodes.items[n].parent;
+        }
+    }
+    return out.items;
 }
 
 /// takumi lays a table cell out at its row's block size and never breaks before its block-end
@@ -496,9 +562,31 @@ fn absTop(f: *const Frame, n: u32) f32 {
 }
 
 fn sameStart(a: layout.fragment.Start, b: layout.fragment.Start) bool {
-    if (a.node != b.node or a.line != b.line or a.forced != b.forced or a.branches.len != b.branches.len or a.side_flows.len != b.side_flows.len) return false;
-    for (a.branches, b.branches) |x, y| if (!std.meta.eql(x, y)) return false;
+    if (a.side_flows.len != b.side_flows.len) return false;
     for (a.side_flows, b.side_flows) |x, y| if (!std.meta.eql(x, y)) return false;
+    if (a.node == b.node and a.line == b.line and a.forced == b.forced and a.branches.len == b.branches.len) {
+        for (a.branches, b.branches) |x, y| if (!std.meta.eql(x, y)) return false;
+        return true;
+    }
+    // (parallel flows of which all but some ended resume where those go on: a band whose other
+    // items a new width ended earlier is the same start as its one flow still going)
+    if (a.branches.len == 0 and b.branches.len == 0) return false;
+    return samePoints(a, b) and samePoints(b, a);
+}
+
+/// Every flow `a` resumes (its unfinished branches, or its one point) resumes in `b` at the same place.
+fn samePoints(a: layout.fragment.Start, b: layout.fragment.Start) bool {
+    const one = [_]layout.fragment.ResumePoint{.{ .node = a.node, .line = a.line, .forced = a.forced }};
+    const pa: []const layout.fragment.ResumePoint = if (a.branches.len > 0) a.branches else if (a.node != rt.none) &one else &.{};
+    const one_b = [_]layout.fragment.ResumePoint{.{ .node = b.node, .line = b.line, .forced = b.forced }};
+    const pb: []const layout.fragment.ResumePoint = if (b.branches.len > 0) b.branches else if (b.node != rt.none) &one_b else &.{};
+    for (pa) |x| {
+        if (x.finished) continue;
+        const found = for (pb) |y| {
+            if (!y.finished and y.node == x.node and y.line == x.line and y.forced == x.forced) break true;
+        } else false;
+        if (!found) return false;
+    }
     return true;
 }
 
@@ -870,27 +958,6 @@ fn docRootContext(doc: *const Frame) page_rules.Context {
     return contextOf(doc.r, d.at(el).cs, d.at(d.root).cs, tag.len > 0);
 }
 
-/// Whether some text may set a page break (`break-*` / `page-break-*`, any case).
-fn mentionsBreak(text: []const u8) bool {
-    if (text.len < 5) return false;
-    var i: usize = 0;
-    while (i + 5 <= text.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(text[i .. i + 5], "break")) return true;
-    }
-    return false;
-}
-
-fn cssMentionsBreak(css: ?json.Value) bool {
-    const c = css orelse return false;
-    return switch (c) {
-        .string => |s| mentionsBreak(s),
-        .array => |arr| for (arr) |e| {
-            if (e == .string and mentionsBreak(e.string)) break true;
-        } else false,
-        else => false,
-    };
-}
-
 /// How far below a page's top a box may be computed and still start that page (`layPart`).
 const seam_eps: f32 = 1.0 / 16.0;
 
@@ -991,16 +1058,402 @@ fn countParts(r: *rt.Renderer, doc: *const Frame, plan: chunks.Plan, geo: *const
     return n;
 }
 
+/// (no node / no line: `layout.fragment.Start`)
+const no_start = layout.fragment.Start{};
+
+/// The source elements a part of a flowing document lays out at least (`chunks.Flow`): a quarter
+/// of the forced-break parts' (`PdfOptions.chunk_elements`), as a part lays out its last pages
+/// again with the next.
+fn flowBudget(o: opt.PdfOptions) u32 {
+    return @max(1, o.chunk_elements / 4);
+}
+
+/// A render node of one frame named so that another frame of the same document finds it
+/// (`tags.Carry`): the nearest node at or above it with an element (that element, its kind) and
+/// the child indices down from there.
+const NodeKey = struct {
+    el: u32,
+    kind: rt.Kind,
+    path: []const u32,
+
+    fn of(a: Allocator, f: *const Frame, id: u32) Error!?NodeKey {
+        var path: std.ArrayList(u32) = .empty;
+        var cur = id;
+        var guard: u32 = 0;
+        while (f.nodes.items[cur].el == rt.none) : (guard += 1) {
+            const parent = f.nodes.items[cur].parent;
+            if (parent == rt.none or guard > 4096) return null;
+            var idx: u32 = 0;
+            var sib = f.nodes.items[parent].first_child;
+            while (sib != rt.none and sib != cur) : (sib = f.nodes.items[sib].next) idx += 1;
+            try path.insert(a, 0, idx);
+            cur = parent;
+        }
+        return .{ .el = f.nodes.items[cur].el, .kind = f.nodes.items[cur].kind, .path = path.items };
+    }
+
+    fn find(k: NodeKey, f: *const Frame) ?u32 {
+        var node = for (f.nodes.items, 0..) |n, i| {
+            if (n.el == k.el and n.kind == k.kind) break @as(u32, @intCast(i));
+        } else return null;
+        for (k.path) |idx| {
+            var sib = f.nodes.items[node].first_child;
+            var i: u32 = 0;
+            while (sib != rt.none and i < idx) : (i += 1) sib = f.nodes.items[sib].next;
+            if (sib == rt.none) return null;
+            node = sib;
+        }
+        return node;
+    }
+};
+
+/// Where the next part of a flowing document (`chunks.Flow`) starts: the page break before
+/// `node`'s box or line `line` of its paragraph (a `layout.fragment.Start` of the part before's
+/// frame, named for the next frame), page `page` of the document at block offset `top`, laid out
+/// from the flow's child `kid`, whose box starts at `y_kid`.
+const Resume = struct {
+    kid: usize,
+    node: NodeKey,
+    line: u32,
+    forced: bool,
+    /// the glyph line `line` starts at (the next frame must break the paragraph there too)
+    glyph: u32,
+    top: f32,
+    /// the tops of the pages before and after it (the part before lays them out too)
+    before: f32,
+    after: f32,
+    y_kid: f32,
+    page: usize,
+};
+
+/// A part of a flowing document laid out: its frame, whose pages [`s`, `e`) are the document's
+/// pages `first`.. (`s` = 1 past the first part: page 0 holds what the parts before show), the
+/// render node of the flow, the flow's children it starts with (`kid0`) and hands on from
+/// (`cut`: the child the next part starts in; none for the last part).
+const FlowPart = struct {
+    f: *Frame,
+    s: u32,
+    e: u32,
+    first: usize,
+    flow: u32,
+    kid0: usize,
+    cut: ?usize,
+};
+
+/// Lays a flowing document out a part at a time (`next`), each part in an arena of its own,
+/// released when the next one is laid out (or on `deinit`). A part's frame lays out the flow's
+/// children from the one holding its first page's start up to at least `budget` source elements
+/// further (more when no page boundary of those can be cut at), and gives up all but its last
+/// pages: the page it stops at is where the next part starts. The pages it keeps are those of the
+/// whole document laid out at once: the content before its first page only moves the boxes, which
+/// the part lays out where the document has them (`Options.root_shift`, `Options.start` /
+/// `start_top`), and what follows its last kept page is laid out with it, at least a page and a
+/// child of the flow past it.
+const FlowIter = struct {
+    r: *rt.Renderer,
+    /// (what lives from one part to the next: the resume points)
+    keep: Allocator,
+    doc: *const Frame,
+    fl: chunks.Flow,
+    geo: *const Geo,
+    blank: bool,
+    budget: u32,
+    kid0: usize = 0,
+    res: ?Resume = null,
+    page: usize = 0,
+    done: bool = false,
+    mem: ?*bump.Bump = null,
+
+    fn deinit(it: *FlowIter) void {
+        if (it.mem) |m| freeMem(it.r, m);
+        it.mem = null;
+    }
+
+    /// The next part (null: the document cannot be drawn a part at a time).
+    fn next(it: *FlowIter) Error!?FlowPart {
+        std.debug.assert(!it.done);
+        const kids = it.fl.kids;
+        var budget = it.budget;
+        var min_j = it.kid0 + 3;
+        while (true) {
+            it.deinit();
+            var j = it.kid0 + 1;
+            while (j < kids.len and (kids[j] - kids[it.kid0] < budget or j < min_j)) j += 1;
+            // (a first part that would hold the whole document: laid out whole)
+            if (j >= kids.len and it.res == null) return refuse(FlowPart, "no page boundary to cut at");
+            const mem = try newMem(it.r);
+            it.mem = mem;
+            const got = try it.lay(mem.allocator(), j);
+            switch (got) {
+                .refuse => return null,
+                .grow => {
+                    // (a last part has nothing past it to cut at)
+                    if (j >= kids.len) return refuse(FlowPart, "a last part without pages");
+                    budget *|= 2;
+                    min_j = j + 1;
+                },
+                .part => |p| {
+                    it.page += p.e - p.s;
+                    if (p.cut == null) it.done = true;
+                    return p;
+                },
+            }
+        }
+    }
+
+    const Laid = union(enum) { part: FlowPart, grow, refuse };
+
+    fn no(comptime why: []const u8) Laid {
+        memtrace.mark("chunks: whole: " ++ why);
+        return .refuse;
+    }
+
+    /// Lays the flow's children [`kid0`, `j`) out from the resume point.
+    fn lay(it: *FlowIter, a: Allocator, j: usize) Error!Laid {
+        const fl = it.fl;
+        const kids = fl.kids;
+        const last = j >= kids.len;
+        const f = try a.create(Frame);
+        f.* = try Frame.initChunk(it.doc, a);
+        f.tree.paged.chunk = .{ .parent = fl.parent, .lo = kids[it.kid0], .hi = if (last) std.math.maxInt(u32) else kids[j] };
+        try f.prepareLayout();
+        try @import("text.zig").requireFont(f, it.blank);
+        var start: ?layout.fragment.Start = null;
+        var shift: f32 = 0;
+        var base: i64 = 0;
+        if (it.res) |rs| {
+            const y0 = elementTop(f, kids[it.kid0]) orelse return no("no box for a part's first child");
+            shift = rs.y_kid - y0;
+            const id = rs.node.find(f) orelse return no("no resume box");
+            const lid = f.nodes.items[id].lid;
+            if (lid == rt.none) return no("no resume box");
+            if (rs.line != no_start.line) {
+                const tl = paragraphLines(f, id) orelse return no("no resume paragraph");
+                if (rs.line >= tl.lines.len or tl.lines[rs.line].start != rs.glyph) return no("the resume paragraph breaks elsewhere");
+            }
+            start = .{ .node = lid, .line = rs.line, .forced = rs.forced };
+            base = @as(i64, @intCast(rs.page)) - 1;
+        }
+        const hc = try a.create(PartHeights);
+        hc.* = .{ .g = it.geo, .base = base };
+        const pages = try f.paginate(.{
+            .page_height = it.geo.area(0, null)[1],
+            .page_height_fn = if (it.geo.uniformHeight()) null else PartHeights.height,
+            .ctx = @ptrCast(hc),
+            .start = start,
+            .start_top = if (it.res) |rs| rs.top else null,
+            // (page 0, before the part's first page, is the page before it in the document)
+            .origin = if (it.res) |rs| rs.before else 0,
+            .root_shift = shift,
+            .record_starts = true,
+        });
+        var s: u32 = 0;
+        if (start) |st| {
+            // (page 1 starts where the part before stopped, at the same offset)
+            // and ends where the part before has it end (its start is recorded when the walk
+            // first reaches the page, which content ending right at the start may do before the
+            // main flow is there: no point, `layout.fragment.Pages.starts`)
+            const rs = it.res.?;
+            if (pages.start_page != 1 or pages.pages.len < 2) return no("a part does not start where the part before stopped");
+            if (pages.pages[1].top != rs.top) return no("a part does not start where the part before stopped");
+            if (pages.pages.len < 3) {
+                // (its content ends on its first page: the document's, or too little laid out)
+                if (!last) return .grow;
+            } else if (@abs(pages.pages[2].top - rs.after) > 1.0 / 64.0) return no("a part's first page is not the part before's");
+            const got = pages.starts[1];
+            if (!(got.node == no_start.node and got.branches.len == 0 and got.side_flows.len == 0) and !sameStart(got, st)) return no("a part does not start where the part before stopped");
+            s = 1;
+        }
+        const flow = nodeOfElement(f, fl.parent);
+        if (flow == rt.none) return no("no flow box");
+        var e: u32 = @intCast(pages.pages.len);
+        var cut: ?usize = null;
+        var next_res: ?Resume = null;
+        if (!last) {
+            // the last page boundary that can be cut at, a page and a child of the flow before
+            // the frame's content ends
+            var c: u32 = @intCast(pages.pages.len -| 2);
+            while (c > s) : (c -= 1) {
+                const tok = pages.starts[c];
+                if (tok.node == no_start.node or tok.branches.len > 0 or tok.side_flows.len > 0) continue;
+                if (tok.node >= f.lid_node.items.len) continue;
+                const id = f.lid_node.items[tok.node];
+                if (id == rt.none) continue;
+                const ki = resumeKid(f, fl, flow, id) orelse continue;
+                if (ki < it.kid0 or ki + 2 > j or !fl.cuttable[ki]) continue;
+                var glyph: u32 = 0;
+                if (tok.line != no_start.line) {
+                    const tl = paragraphLines(f, id) orelse continue;
+                    if (tok.line >= tl.lines.len) continue;
+                    glyph = tl.lines[tok.line].start;
+                }
+                const y_kid = elementTop(f, kids[ki]) orelse continue;
+                const key = try NodeKey.of(it.keep, f, id) orelse continue;
+                next_res = .{ .kid = ki, .node = key, .line = tok.line, .forced = tok.forced, .glyph = glyph, .top = pages.pages[c].top, .before = pages.pages[c - 1].top, .after = pages.pages[c + 1].top, .y_kid = y_kid, .page = it.page + (c - s) };
+                cut = ki;
+                e = c;
+                break;
+            }
+            if (cut == null) return .grow;
+        }
+        if (!(s < e)) return .grow;
+        // What the part paints stays on its pages: the children of the flow before the one the
+        // next part starts in paint above the page it starts with, those after the first child
+        // below the part's first page (the frames around lay out neither).
+        if (start != null or cut != null) {
+            const ex = try emit.Extents.computeWith(a, f, false);
+            const lo = if (start != null) pages.pages[s].top - seam_eps else -std.math.inf(f32);
+            const hi = if (cut != null) pages.pages[e].top + seam_eps else std.math.inf(f32);
+            var ch = f.nodes.items[flow].first_child;
+            while (ch != rt.none) : (ch = f.nodes.items[ch].next) {
+                const el = f.nodes.items[ch].el;
+                const k = if (el == rt.none) null else fl.kidOf(it.doc, el);
+                const ki = k orelse return no("a box of the flow that is no child of it");
+                if (cut) |cu| if (ki < cu and ex.hi[ch] > hi) return no("a box paints onto the part after");
+                if (start != null and ki > it.kid0 and ex.lo[ch] < lo) return no("a box paints onto the part before");
+            }
+        }
+        f.tree.dropCaches();
+        const part: FlowPart = .{ .f = f, .s = s, .e = e, .first = it.page, .flow = flow, .kid0 = it.kid0, .cut = cut };
+        if (next_res) |nr| {
+            it.res = nr;
+            it.kid0 = nr.kid;
+        }
+        return .{ .part = part };
+    }
+};
+
+/// An anchor (`id`) or heading (`heading`, an index) a part of a flowing document collected whose
+/// element is in the child of the flow the next part starts in, or after it: its structure element
+/// is that part's (`tags.Skip`), so its destination names that part's render node `node`.
+const HandOn = struct { id: ?[]const u8 = null, heading: usize = 0, node: ?NodeKey };
+
+/// Moves the anchors and headings part `chunk` (frame `f`) collected for the elements from kid
+/// `cut` on to the next part (`HandOn`, in `out`).
+fn handOn(a: Allocator, links: *@import("interactive.zig").Collector, f: *const Frame, fl: chunks.Flow, cut: usize, chunk: u32, out: *std.ArrayList(HandOn)) Error!void {
+    out.clearRetainingCapacity();
+    const S = struct {
+        fn moves(fr: *const Frame, flow: chunks.Flow, k: usize, el: u32) bool {
+            const ki = flow.kidOf(fr, el) orelse return false;
+            return ki >= k;
+        }
+        fn key(al: Allocator, fr: *const Frame, node: u32) Error!?NodeKey {
+            if (node == rt.none or node >= fr.nodes.items.len) return null;
+            return NodeKey.of(al, fr, node);
+        }
+    };
+    var it = links.anchors.iterator();
+    while (it.next()) |en| {
+        const an = en.value_ptr;
+        if (an.chunk != chunk or !S.moves(f, fl, cut, an.el)) continue;
+        try out.append(a, .{ .id = en.key_ptr.*, .node = try S.key(a, f, an.node) });
+        an.chunk = chunk + 1;
+    }
+    for (links.headings.items, 0..) |*h, k| {
+        if (h.chunk != chunk or !S.moves(f, fl, cut, h.el)) continue;
+        try out.append(a, .{ .heading = k, .node = try S.key(a, f, h.node) });
+        h.chunk = chunk + 1;
+    }
+}
+
+/// Gives the anchors and headings `handOn` moved to part `chunk` the render nodes of its frame
+/// `f`. False: one has no node there.
+fn takeOn(links: *@import("interactive.zig").Collector, f: *const Frame, list: []const HandOn, chunk: u32) bool {
+    for (list) |ho| {
+        const node = if (ho.node) |k| k.find(f) orelse return false else rt.none;
+        if (ho.id) |id| {
+            const an = links.anchors.getPtr(id) orelse return false;
+            retarget(&an.node, &an.dest, chunk, node);
+        } else {
+            const h = &links.headings.items[ho.heading];
+            retarget(&h.node, &h.dest, chunk, node);
+        }
+    }
+    return true;
+}
+
+/// (a destination naming the structure element of the node, `interactive.Dest.place`, names the
+/// new one)
+fn retarget(node: *u32, dest: anytype, to_chunk: u32, to_node: u32) void {
+    if (dest.*) |*d| if (d.chunk + 1 == to_chunk and d.node == node.* and d.node != rt.none) {
+        d.chunk = to_chunk;
+        d.node = to_node;
+    };
+    node.* = to_node;
+}
+
+/// The lines of render node `id`'s paragraph as laid out in frame `f` (null: none).
+fn paragraphLines(f: *Frame, id: u32) ?*const @import("../font/font.zig").TextLayout {
+    const n = &f.nodes.items[id];
+    if (n.tl) |tl| return tl;
+    if (n.para == null or n.lid == rt.none) return null;
+    const l = f.tree.layout(n.lid);
+    const cw = l.w - l.border.left - l.border.right - l.padding.left - l.padding.right;
+    return f.textLayout(id, cw) catch null;
+}
+
+/// The child of the flow (index in `fl.kids`) holding render node `id` of frame `f`, when the
+/// boxes from it up to the flow are boxes a page break can resume in: blocks, the row groups and
+/// rows of a table, flex and grid containers and their items (null: an inline box, a cell, an
+/// absolutely positioned box ...). A token that is one point never names a cell (a row broken
+/// inside resumes its cells in parallel: `Start.branches`, which a part does not take), so a
+/// table resumes between its rows; the part laying the table out from that row checks that its
+/// pages start and end where the part before had them (`FlowIter.lay`).
+fn resumeKid(f: *const Frame, fl: chunks.Flow, flow: u32, id: u32) ?usize {
+    var cur = id;
+    var guard: u32 = 0;
+    while (guard < 4096) : (guard += 1) {
+        const n = &f.nodes.items[cur];
+        const parent = n.parent;
+        if (parent == rt.none) return null;
+        if (cur != id or n.kind == .container) {
+            const pd = f.nodes.items[parent].cs.display;
+            // (an item of a flex / grid container is blockified whatever its display)
+            const item = parent != flow and switch (pd) {
+                .flex, .grid => true,
+                else => false,
+            };
+            if (!item) switch (n.cs.display) {
+                .block, .flow_root, .list_item, .flex, .grid => {},
+                // (a row group or a row of a table broken between its rows: the token is one
+                // point, the row; a row broken inside is parallel flows, never one point)
+                .table, .table_row_group, .table_header_group, .table_footer_group, .table_row => {},
+                else => return null,
+            };
+        }
+        if (n.cs.position != .static and n.cs.position != .relative) return null;
+        if (parent == flow) {
+            if (n.el == rt.none) return null;
+            return fl.kidOf(f, n.el);
+        }
+        cur = parent;
+    }
+    return null;
+}
+
+/// The page count of a flowing document laid out a part at a time (each part released at once),
+/// a memory checkpoint per page. Null: it cannot be drawn a part at a time.
+fn countFlow(r: *rt.Renderer, a: Allocator, doc: *const Frame, fl: chunks.Flow, geo: *const Geo, blank: bool, budget: u32) Error!?usize {
+    var it: FlowIter = .{ .r = r, .keep = a, .doc = doc, .fl = fl, .geo = geo, .blank = blank, .budget = budget };
+    defer it.deinit();
+    while (!it.done) {
+        const p = try it.next() orelse return null;
+        for (p.s..p.e) |_| memtrace.mark("count: page");
+    }
+    return it.page;
+}
+
 /// The paged document `o_in` (geometry `p_in`) laid out and drawn a part at a time when it can be
-/// cut at forced page breaks (chunks.zig): the same file as `layOut` + `emit.writeDocument`, with
+/// cut at forced page breaks, or else at page boundaries found as it is laid out (chunks.zig,
+/// `FlowIter`): the same file as `layOut` + `emit.writeDocument`, with
 /// one part's layout in memory at a time. Null: it cannot be (the caller lays it out whole).
 pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?json.Value, kind: rt.SourceKind, source: []const u8, p_in: opt.Page, background: ?style.Color, policy: emit.DocOptions) Error!?[]const u8 {
     if (comptime !layout.fragment.enabled) return null;
     if (!o_in.chunks) return null;
     // (cheap first: a document too short for two parts, or without any page break property, is
     // laid out whole without building it twice)
-    if (source.len < @as(usize, o_in.chunk_elements) * 2 * 7 and o_in.chunk_elements > 1) return null;
-    if (!mentionsBreak(source) and !cssMentionsBreak(css)) return null;
+    const budget = flowBudget(o_in);
+    if (source.len < @as(usize, budget) * 2 * 7 and o_in.chunk_elements > 1) return null;
     var rules = try pageRules(a, o_in, kind, source, p_in, .{});
     var o = o_in;
     o.geometry = .{ .page = rules.rest };
@@ -1039,7 +1492,12 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
             if (subst.hooks.items.len > 0) return refuse([]const u8, "page counters in the content");
         }
     }
-    const plan = try chunks.plan(a, doc, o.chunk_elements) orelse return refuse([]const u8, "no cut");
+    const cut = try chunks.plan(a, doc, o.chunk_elements) orelse return refuse([]const u8, "no cut");
+    if (cut == .flowing) {
+        // (a document too short for two parts is laid out whole)
+        const kids = cut.flowing.kids;
+        if (kids[kids.len - 1] - kids[0] < 2 * budget) return refuse([]const u8, "too short for two parts");
+    }
     const names = doc.tree.paged.page_names;
     geo.names = names;
     const blank = o.uncovered_text == .blank;
@@ -1051,7 +1509,7 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
     const varies = (if (header) |s| s.varies else false) or (if (footer) |s| s.varies else false);
     var n: usize = 0;
     if (dynamic or varies) {
-        n = try countParts(r, doc, plan, &geo, blank) orelse return null;
+        n = try countCut(r, a, doc, cut, &geo, blank, budget) orelse return null;
         if (dynamic) {
             var follows = rules.first.margin.followBands() or rules.left.margin.followBands() or rules.right.margin.followBands();
             for (rules.named) |e| follows = follows or e.first.margin.followBands() or e.left.margin.followBands() or e.right.margin.followBands();
@@ -1066,43 +1524,110 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
                 if (!follows) break;
                 geo2.names = names;
                 geo = geo2;
-                n = try countParts(r, doc, plan, &geo, blank) orelse return null;
+                n = try countCut(r, a, doc, cut, &geo, blank, budget) orelse return null;
             }
         }
     }
 
     const dw = try emit.DocWriter.init(a, doc, policy);
     defer dw.deinit();
-    var sel = opt.PageSelection.init(o.page_ranges);
     // (the bands of a single page are laid out when it is drawn, from this copy)
     const band_doc = try a.create(bands.Doc);
     band_doc.* = cx.doc;
-    const own = struct {
-        fn win(p: layout.fragment.Page) emit.Window {
-            return .{ .top = p.top, .bottom = p.top + p.height, .lines_top = p.top, .lines_bottom = p.top + p.height };
-        }
+    var pd: PartDraw = .{ .a = a, .dw = dw, .sel = opt.PageSelection.init(o.page_ranges), .geo = &geo, .header = &header, .footer = &footer, .band_doc = band_doc, .n = n, .background = background };
+    switch (cut) {
+        .forced => |plan| {
+            var i: usize = 0;
+            var seam: ?Seam = null;
+            for (0..plan.parts.len) |k| {
+                memtrace.mark("part: start");
+                const mem = try newMem(r);
+                defer freeMem(r, mem);
+                const pa = mem.allocator();
+                const lp = try layPart(pa, doc, plan, k, &geo, seam, blank) orelse return null;
+                if (seam) |sm| if (sm.page + lp.s != i) return refuse([]const u8, "pages moved at a seam");
+                if (k + 1 < plan.parts.len) seam = seamAfter(lp, plan, k, i) orelse return null;
+                memtrace.mark("part: laid out");
+                if (!try pd.draw(pa, lp.f, lp.s, lp.e, i, k == 0, k + 1 == plan.parts.len)) return null;
+                i += lp.e - lp.s;
+                const pt = plan.parts[k];
+                if (!chunks.ownsCollected(doc, plan.parent, pt, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refuse([]const u8, "an anchor or heading outside its part");
+                if (!try dw.endChunk(pa, .{ .parent = lp.flow, .lo = pt.own_lo, .hi = pt.own_hi })) return refuse([]const u8, "structure crosses a seam");
+                memtrace.mark("part: drawn");
+            }
+        },
+        .flowing => |fl| {
+            var it: FlowIter = .{ .r = r, .keep = a, .doc = doc, .fl = fl, .geo = &geo, .blank = blank, .budget = budget };
+            defer it.deinit();
+            var moved: std.ArrayList(HandOn) = .empty;
+            var k: usize = 0;
+            while (!it.done) : (k += 1) {
+                memtrace.mark("part: start");
+                const p = try it.next() orelse return null;
+                memtrace.mark("part: laid out");
+                const pa = it.mem.?.allocator();
+                const last_part = p.cut == null;
+                if (!try pd.draw(pa, p.f, p.s, p.e, p.first, k == 0, last_part)) return null;
+                // (the anchors and headings it collected: of the children of the flow from its
+                // first one to the one the next part starts in, which both lay out)
+                const own: chunks.Part = .{ .lo = fl.kids[p.kid0], .hi = 0, .own_lo = fl.kids[p.kid0], .own_hi = if (p.cut) |c| fl.kids[c] + 1 else std.math.maxInt(u32) };
+                if (!chunks.ownsCollected(doc, fl.parent, own, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refuse([]const u8, "an anchor or heading outside its part");
+                // (the structure recorded for the child the next part starts in, and those after
+                // it, goes to the next part, and with it the elements destinations name)
+                if (!takeOn(&dw.links, p.f, moved.items, dw.links.chunk)) return refuse([]const u8, "a destination has no box");
+                if (p.cut) |c| try handOn(a, &dw.links, p.f, fl, c, dw.links.chunk, &moved);
+                const hi = if (p.cut) |c| fl.kids[c] else std.math.maxInt(u32);
+                if (!try dw.endChunk(pa, .{ .parent = p.flow, .lo = fl.kids[p.kid0], .hi = hi })) return refuse([]const u8, "structure crosses a seam");
+                memtrace.mark("part: drawn");
+            }
+        },
+    }
+    var diag: opt.Diag = .{};
+    pd.sel.finish(&diag) catch {
+        r.setErr(diag.message(), "");
+        return error.Invalid;
     };
-    var i: usize = 0;
-    var seam: ?Seam = null;
-    for (0..plan.parts.len) |k| {
-        memtrace.mark("part: start");
-        const mem = try newMem(r);
-        defer freeMem(r, mem);
-        const pa = mem.allocator();
-        const lp = try layPart(pa, doc, plan, k, &geo, seam, blank) orelse return null;
-        if (seam) |sm| if (sm.page + lp.s != i) return refuse([]const u8, "pages moved at a seam");
-        if (k + 1 < plan.parts.len) seam = seamAfter(lp, plan, k, i) orelse return null;
-        memtrace.mark("part: laid out");
-        const f = lp.f;
+    return try dw.finish();
+}
+
+/// The page count of `doc`'s document laid out a part at a time. Null: it cannot be.
+fn countCut(r: *rt.Renderer, a: Allocator, doc: *const Frame, cut: chunks.Cut, geo: *const Geo, blank: bool, budget: u32) Error!?usize {
+    return switch (cut) {
+        .forced => |plan| countParts(r, doc, plan, geo, blank),
+        .flowing => |fl| countFlow(r, a, doc, fl, geo, blank, budget),
+    };
+}
+
+/// Draws the pages of the parts of a document laid out a part at a time (`writeChunked`).
+const PartDraw = struct {
+    a: Allocator,
+    dw: *emit.DocWriter,
+    sel: opt.PageSelection,
+    geo: *const Geo,
+    header: *?bands.Slot,
+    footer: *?bands.Slot,
+    band_doc: *bands.Doc,
+    /// the document's page count (0: no band needs it)
+    n: usize,
+    background: ?style.Color,
+
+    fn win(p: layout.fragment.Page) emit.Window {
+        return .{ .top = p.top, .bottom = p.top + p.height, .lines_top = p.top, .lines_bottom = p.top + p.height };
+    }
+
+    /// Draws pages [`s`, `e`) of part frame `f` (document pages `first`..; `pa`: the part's
+    /// memory) that `pageRanges` keeps, or collects the part's anchors and headings when it keeps
+    /// none. False: the parts cannot be drawn apart.
+    fn draw(pd: *PartDraw, pa: Allocator, f: *Frame, s: u32, e: u32, first: usize, first_part: bool, last_part: bool) Error!bool {
+        const geo = pd.geo;
         const paged = f.paginated().?;
-        const last_part = k + 1 == plan.parts.len;
         var boxes: std.ArrayList(emit.PageBox) = .empty;
         var windows: std.ArrayList(emit.Window) = .empty;
-        var local: usize = lp.s;
-        while (local < lp.e) : (local += 1) {
+        var local: usize = s;
+        while (local < e) : (local += 1) {
             const pg = paged.pages[local];
-            const gi = i + (local - lp.s);
-            const kept = try sel.pushPage(a);
+            const gi = first + (local - s);
+            const kept = try pd.sel.pushPage(pd.a);
             if (kept == null) continue;
             const name = geo.nameOf(if (local < paged.names.len) paged.names[local] else 0);
             const pp = geo.page(gi, name);
@@ -1112,16 +1637,16 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
                 .width = pp.width,
                 .height = pp.height,
                 .content = .{ .x = m.left, .y = m.top, .w = area[0], .h = area[1] },
-                .background = background,
+                .background = pd.background,
                 .clip = true,
                 .repeats = paged.repeatsOf(@intCast(local)),
                 .fixed = &.{},
             };
             // (the frame's own pages around the part's take part as neighbouring passes)
-            if (local == lp.s and lp.s > 0) box.prev_win = own.win(paged.pages[lp.s - 1]);
-            if (local + 1 == lp.e and lp.e < paged.pages.len) box.next_win = own.win(paged.pages[lp.e]);
-            if (header) |*s| box.header = try bands.forPage(band_doc, s, gi, n, pp.width, pp.height);
-            if (footer) |*s| box.footer = try bands.forPage(band_doc, s, gi, n, pp.width, pp.height);
+            if (local == s and s > 0) box.prev_win = win(paged.pages[s - 1]);
+            if (local + 1 == e and e < paged.pages.len) box.next_win = win(paged.pages[e]);
+            if (pd.header.*) |*hs| box.header = try bands.forPage(pd.band_doc, hs, gi, pd.n, pp.width, pp.height);
+            if (pd.footer.*) |*fs| box.footer = try bands.forPage(pd.band_doc, fs, gi, pd.n, pp.width, pp.height);
             try boxes.append(pa, box);
             // takumi `PageSlice::lines`: the first page also owns the lines above it, the last the
             // lines below it
@@ -1129,39 +1654,26 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
                 .top = pg.top,
                 .bottom = pg.top + pg.height,
                 .lines_top = if (gi == 0) -std.math.inf(f32) else pg.top,
-                .lines_bottom = if (last_part and local + 1 == lp.e) std.math.inf(f32) else pg.top + pg.height,
+                .lines_bottom = if (last_part and local + 1 == e) std.math.inf(f32) else pg.top + pg.height,
             });
         }
-        i += lp.e - lp.s;
-        if (!try dw.beginChunk(f)) return refuse([]const u8, "carried structure has no box");
+        if (!try pd.dw.beginChunk(f)) return refuse(bool, "carried structure has no box") orelse false;
         // (the part's anchors and headings: those whose box starts between its first page's top and
         // the next part's first page's, as the whole document's first page collects them all)
-        const bounds: [2]f32 = .{ if (k == 0) -std.math.inf(f32) else paged.pages[lp.s].top - seam_eps, if (last_part) std.math.inf(f32) else paged.pages[lp.e].top - seam_eps };
+        const bounds: [2]f32 = .{ if (first_part) -std.math.inf(f32) else paged.pages[s].top - seam_eps, if (last_part) std.math.inf(f32) else paged.pages[e].top - seam_eps };
         if (boxes.items.len > 0) {
-            try dw.drawPages(f, boxes.items, windows.items, pa, bounds);
+            try pd.dw.drawPages(f, boxes.items, windows.items, pa, bounds);
         } else {
             // every page of the part dropped: its anchors and headings are still the document's
-            const pg = paged.pages[lp.s];
-            const gi = i - (lp.e - lp.s);
-            const name = geo.nameOf(if (lp.s < paged.names.len) paged.names[lp.s] else 0);
-            const pp = geo.page(gi, name);
-            const m = geo.margins(gi, name);
-            const area = geo.area(gi, name);
-            _ = pg;
-            try dw.collect(f, .{ .width = pp.width, .height = pp.height, .content = .{ .x = m.left, .y = m.top, .w = area[0], .h = area[1] }, .clip = true }, bounds);
+            const name = geo.nameOf(if (s < paged.names.len) paged.names[s] else 0);
+            const pp = geo.page(first, name);
+            const m = geo.margins(first, name);
+            const area = geo.area(first, name);
+            try pd.dw.collect(f, .{ .width = pp.width, .height = pp.height, .content = .{ .x = m.left, .y = m.top, .w = area[0], .h = area[1] }, .clip = true }, bounds);
         }
-        const pt = plan.parts[k];
-        if (!chunks.ownsCollected(doc, plan, pt, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refuse([]const u8, "an anchor or heading outside its part");
-        if (!try dw.endChunk(pa, .{ .parent = lp.flow, .lo = pt.own_lo, .hi = pt.own_hi })) return refuse([]const u8, "structure crosses a seam");
-        memtrace.mark("part: drawn");
+        return true;
     }
-    var diag: opt.Diag = .{};
-    sel.finish(&diag) catch {
-        r.setErr(diag.message(), "");
-        return error.Invalid;
-    };
-    return try dw.finish();
-}
+};
 
 /// takumi `measure` with page options: the tree laid out like a band (the full page width, an
 /// unbounded height) with three-digit counters (`999`), target counters empty; its own size.

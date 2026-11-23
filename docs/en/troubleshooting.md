@@ -2,7 +2,7 @@
 
 [English](troubleshooting.md) · [Tiếng Việt](../vi/troubleshooting.md)
 
-Symptoms you are likely to hit with bm-render 0.1.0, their cause and the fix. Most of them come from
+Symptoms you are likely to hit with bm-render, their cause and the fix. Most of them come from
 two defaults (`display` defaults to `inline`; inputs are never fetched)
 and one of bm-render's own (no bundled font).
 

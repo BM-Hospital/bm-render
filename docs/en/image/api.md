@@ -103,11 +103,13 @@ On WebAssembly, both variants perform rendering on the calling thread. On the na
 ### Constructor
 
 ```ts
-new Renderer(options?: { cacheMaxBytes?: number; fontCacheMaxBytes?: number })
+new Renderer(options?: { limits?: Limits; cacheMaxBytes?: number; fontCacheMaxBytes?: number })
 ```
 
-Throws `bm-render: call init()/initSync() before creating a Renderer` before initialisation. Both
-options are accepted and ignored (fixed budgets: 96 MiB of decoded images, 8 MiB of glyph masks).
+Throws `bm-render: call init()/initSync() before creating a Renderer` before initialisation.
+`limits` sets the default [resource limits](#resource-limits-for-untrusted-input) of every call on
+this renderer. `cacheMaxBytes` and `fontCacheMaxBytes` are accepted and ignored (fixed budgets: 96 MiB
+of decoded images, 8 MiB of glyph masks).
 
 ### `registerFont`
 
@@ -350,6 +352,7 @@ The [CSS support](css-support.md) page lists every supported property and value.
 | `lang` | string | | Root language for `:lang()` and OpenType language systems. |
 | `fonts` | `FontLoader[] \| Promise<FontLoader[]>` | | Async API only: registered before rendering; without `fontFamilies` their families become the root font stack. |
 | `signal` | `AbortSignal` | | Checked before rendering (throws `signal.reason`). Rendering itself cannot be interrupted. |
+| `limits` | `Limits` | built-in caps | Lower resource limits for this call; see [Resource limits](#resource-limits-for-untrusted-input). Also taken by `renderAnimation`, `measure`, `renderSvg` and `renderPdf`. |
 | `lossless` | boolean | | Accepted, ignored: WebP is always lossless. |
 | `drawDebugBorder`, `dithering` | | | Accepted, ignored. |
 
@@ -386,6 +389,43 @@ all three profiles.
 | Decoded images | the per-renderer image cache is cleared when it exceeds 96 MiB; one decoded image may have at most 24 megapixels (larger images are not drawn) |
 | Glyph mask cache | 8 MiB per renderer |
 | wasm shadow stack | 1 MiB (custom builds: `-Dstack-kib=`) |
+
+### Resource limits for untrusted input
+
+A server that renders user-supplied HTML, node trees or images can lower some of the limits above, so
+that one request cannot make the engine decode a huge image or lay out a huge canvas. Pass `limits` to
+the `Renderer` constructor (the default of every call) and/or to a single call:
+
+```ts
+const r = new Renderer({ limits: { maxImagePixels: 4_000_000, maxImageBytes: 5 << 20, maxNodeDepth: 64 } });
+await r.render(userHtml, { width: 1200, height: 630, limits: { maxCanvasPixels: 1200 * 630 } });
+```
+
+| Limit | Applies to | Built-in cap (default) | When exceeded |
+|:--|:--|:--|:--|
+| `maxImagePixels` | width × height of one raster image source (encoded or raw RGBA), every frame of an animated one, and `<image>`s inside SVG images | 25,165,824 (24 megapixels; 16 Mi inside SVG) | the image is skipped |
+| `maxImageBytes` | encoded byte size of one image source: PNG / JPEG / WebP / GIF bytes, decoded `data:` URIs, SVG markup | none | the image is skipped |
+| `maxAnimationFrames` | frames of one animated GIF / WebP / APNG source | 10,000 | the image is skipped |
+| `maxCanvasPixels` | width × height of the output canvas, each frame of `renderAnimation` included (not PDF pages) | 40,000,000 | throws `canvas exceeds limits.maxCanvasPixels` |
+| `maxNodeDepth` | nesting levels of the node tree or the HTML document | 512 | throws `node tree exceeds limits.maxNodeDepth` |
+
+Rules:
+
+- A limit can only be **lowered**. A value above the built-in cap is clamped to the cap; a call's
+  `limits` cannot raise the renderer's (the smaller value wins per limit; the others are merged).
+- Values must be numbers ≥ 1 (fractions are floored). An unknown name, a value that is not a number ≥ 1,
+  or a `limits` that is not an object throws (`unknown limit: limits.maxPixels`,
+  `limit must be a number >= 1: limits.maxNodeDepth`, `limits must be an object`); the constructor
+  throws these as `TypeError`s.
+- An image over a limit is handled like an image that cannot be decoded: it paints nothing and has a
+  0 × 0 intrinsic size, and the render succeeds. Sizes and frame counts are read from the file
+  headers, before any pixel is decoded. An image already decoded by an earlier call with looser limits
+  is still refused. `renderPdf` / `measurePdf` fail instead, with
+  `image exceeds limits.maxImagePixels` (or the name of the limit), as they do for an undecodable image.
+- Limits hold per call and per renderer: concurrent renders on different renderers (native addon
+  thread pool, worker threads) never see each other's limits.
+- Font files and the stylesheet size are not limited by this option: register fonts yourself and bound
+  the source size before calling the renderer.
 
 ## Memory, instances and threads
 

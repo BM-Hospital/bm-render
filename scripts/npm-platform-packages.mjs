@@ -51,7 +51,7 @@ const EXECUTED = new Set(["win32-x64-msvc"]);
 
 /**
  * Node versions with Node-API version 6, the highest version of the functions src/native/napi.zig binds
- * (napi_set_instance_data; everything else is Node-API 1). The main package's own floor is higher (>=18).
+ * (napi_set_instance_data; everything else is Node-API 1). The main package's own floor is higher (>=20).
  */
 export const NAPI_VERSION = 6;
 export const NODE_RANGE = ">=10.20.0 <11 || >=12.17.0 <13 || >=14.0.0";

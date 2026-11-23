@@ -1,0 +1,406 @@
+{
+  "meaning": "The only failures `node scripts/pdf-audit/run.mjs --strict` accepts. Each names one probe, one assertion kind (scripts/pdf-audit/gate.mjs KINDS) and a pattern of the failure text; status `deliberate` = bm-render follows CSS or its own API on purpose (a row of docs/PDF_AUDIT.md says so), `open` = a known difference not resolved yet. Another probe, another kind, another failure text, or an exception no failure matches (stale) fails the strict gate. `golden`: the differences scripts/pdf-compare.mjs --strict accepts, per fixture and part (content, an interchange part, fonts); status `noise` = float noise within or just past the comparison bound, explained per fixture.",
+  "exceptions": [
+    {
+      "probe": "api.size.invalid",
+      "kind": "error",
+      "match": "^huge: error: bm \"invalid page size\" vs takumi \"\\(renders\\)\"$",
+      "status": "deliberate",
+      "reason": "bm-render rejects a 1e9 x 1e9 px page (no PDF viewer can open a page past 14,400 user units); takumi writes it. docs/PDF_AUDIT.md, JS API surface: size."
+    },
+    {
+      "probe": "api.input.kinds",
+      "kind": "text",
+      "match": "^json source: text: bm \\[\"Node text Tailwind\"\\] vs takumi \\[\"\\[object Object\\]\"\\]$",
+      "status": "deliberate",
+      "reason": "`{ json }` input is a bm-render extension that renders the node tree; takumi stringifies the object and prints `[object Object]`. docs/PDF_AUDIT.md, JS API surface: input."
+    },
+    {
+      "probe": "api.input.kinds",
+      "kind": "error",
+      "match": "^bad json: error: bm \"invalid node JSON\" vs takumi \"\\(renders\\)\"$",
+      "status": "deliberate",
+      "reason": "The same `{ json }` extension validates its JSON and rejects a malformed tree; takumi renders the stringified object. docs/PDF_AUDIT.md, JS API surface: input."
+    },
+    {
+      "probe": "paint.gradient.linear-in-oklch",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 50 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "takumi ignores the gradient interpolation colour space (`in oklch`) and interpolates in sRGB; bm-render interpolates in the space CSS asks for, so the shading samples differ while the operators are the same. docs/PDF_AUDIT.md, Not ported: gradients interpolated in sRGB."
+    },
+    {
+      "probe": "paint.gradient.linear-in-oklab",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 50 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "takumi ignores the gradient interpolation colour space (`in oklab`) and interpolates in sRGB; bm-render follows CSS Color 4. docs/PDF_AUDIT.md, Not ported: gradients interpolated in sRGB."
+    },
+    {
+      "probe": "paint.gradient.linear-in-hsl-longer",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 50 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "takumi ignores `in hsl longer hue` and interpolates in sRGB; bm-render interpolates hue the long way round as CSS asks. docs/PDF_AUDIT.md, Not ported: gradients interpolated in sRGB."
+    },
+    {
+      "probe": "paint.gradient.linear-in-srgb-linear",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 50 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "takumi ignores `in srgb-linear` and interpolates in sRGB; bm-render interpolates in linear light as CSS asks. docs/PDF_AUDIT.md, Not ported: gradients interpolated in sRGB."
+    },
+    {
+      "probe": "paint.box-shadow.current-color",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 0 \\(33 vs 0 tokens; operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "A box-shadow without a colour uses currentColor in CSS; takumi draws no shadow at all, bm-render draws it in the current colour. docs/PDF_AUDIT.md, Painting: box-shadow."
+    },
+    {
+      "probe": "paint.clip-path.inset-round-elliptical",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi's parser rejects `inset() round a / b` (elliptical corner radii) and drops the clip; bm-render clips as CSS Shapes defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path.ellipse",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi's parser rejects this `ellipse()` form and drops the clip; bm-render clips as CSS Shapes defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path.ellipse-default",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi rejects `ellipse()` without radii (closest-side defaults) and drops the clip; bm-render clips as CSS Shapes defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path.geometry-box",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi does not parse a basic shape followed by a geometry box and drops the clip; bm-render uses the reference box CSS names. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path.margin-box",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 9 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi drops `clip-path: margin-box`; bm-render writes one clip equal to the border box (no margin here), so the painted result is the same with one extra clip operator. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path.content-box-only",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi does not parse a lone geometry box (`content-box`) and drops the clip; bm-render clips to the content box as CSS Masking defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path.border-box-radius",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 48 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi drops `clip-path: border-box` on a rounded box; bm-render clips to the rounded border box as CSS Masking defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.mask.mode-luminance",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 109 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "takumi does not support `mask-mode` and always uses alpha; bm-render applies the luminance mask CSS asks for. docs/PDF_AUDIT.md, Painting: mask-mode / mask-clip / mask-origin."
+    },
+    {
+      "probe": "paint.mask.clip-content-box",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 30 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi does not support `mask-clip`; bm-render clips the mask to the content box as CSS asks. docs/PDF_AUDIT.md, Painting: mask-mode / mask-clip / mask-origin."
+    },
+    {
+      "probe": "paint.mask.origin-content-box",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 16 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "takumi does not support `mask-origin`; bm-render positions the mask from the content box as CSS asks. docs/PDF_AUDIT.md, Painting: mask-mode / mask-clip / mask-origin."
+    },
+    {
+      "probe": "paint.stacking.sticky",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 8 .*operator sequence identical\\)$",
+      "status": "deliberate",
+      "reason": "`position: sticky` creates a positioned box in CSS (paints in the positioned layer); takumi paints it as static. docs/PDF_AUDIT.md, Painting: position sticky."
+    },
+    {
+      "probe": "paint.clip-path-syntax.circle-keyword-position",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi's parser rejects keyword positions in `circle(... at <keywords>)` and drops the clip; bm-render clips as CSS Shapes defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "paint.clip-path-syntax.circle-top-left",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token 1 .*operator sequence DIFFERENT\\)$",
+      "status": "deliberate",
+      "reason": "takumi's parser rejects `circle(... at top left)` and drops the clip; bm-render clips as CSS Shapes defines. docs/PDF_AUDIT.md, Painting: clip-path."
+    },
+    {
+      "probe": "page.at-page.var.no-root-element",
+      "kind": "page-count",
+      "match": "^cssVariables option, full document: page count: bm 5 \\| takumi 3 ",
+      "status": "deliberate",
+      "reason": "bm-render applies the `cssVariables` option to `@page` of a whole HTML document too (`@page { margin: var(--m) }` gets 40px, so more pages); takumi leaves the variable unset there. docs/PDF_AUDIT.md, Page model: cssVariables reaching the page context."
+    },
+    {
+      "probe": "page.at-page.var.no-root-element",
+      "kind": "text",
+      "match": "^cssVariables option, full document: text per page: bm ",
+      "status": "deliberate",
+      "reason": "The same cssVariables difference: with the 40px @page margin the lines land on other pages, so the text per page differs. docs/PDF_AUDIT.md, Page model: cssVariables reaching the page context."
+    },
+    {
+      "probe": "tagging.generated.mixed-image",
+      "kind": "tags",
+      "match": "^structure tree: first difference at 23: ",
+      "status": "deliberate",
+      "reason": "takumi turns a `content: url()` image of a pseudo-element into a block, so each part gets its own P; bm-render keeps it inline as CSS does, so one P holds the four leaves. docs/PDF_AUDIT.md, Painting: content url()."
+    },
+    {
+      "probe": "tagging.generated.mixed-image",
+      "kind": "tags",
+      "match": "^parent tree: first difference at 36: ",
+      "status": "deliberate",
+      "reason": "The parent tree follows the same single P of the inline generated image (see the structure-tree exception of this probe). docs/PDF_AUDIT.md, Painting: content url()."
+    },
+    {
+      "probe": "upstream.content_beside_a_table_does_not_replay_with_its_header",
+      "kind": "text",
+      "match": "^sidebar: text per page: bm ",
+      "status": "open",
+      "reason": "Not what the Rust test asserts (that passes: the sidebar paints once). On the last page of a table that is a row-flex item and breaks over pages, takumi's rows are 14.3-14.4 px tall where both engines use 13.5 px on every earlier page; bm keeps 13.5 px, so pdftotext orders the words of page 3 differently (same words). Chrome agrees with takumi: the table is stretched to the flex line (align-items: stretch) and the extra block size of that definite height goes to the rows of the last fragment (with align-items: start Chrome, takumi and bm all keep the row height). Open bm bug, not fixed; docs/PDF_AUDIT.md, Page model."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^certificate\\.html 523x770: text per page: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^certificate\\.html 400x300: text per page: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^certificate\\.html 300x120: text per page: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^certificate\\.html 250x90: text per page: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "page-content",
+      "match": "^certificate\\.html 250x90: paint fills per page: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^invoice\\.html 300x120: text per page: bm ",
+      "status": "open",
+      "reason": "Open: on 120 px / 90 px pages (window_scenes.rs sizes) the invoice table header row (Product count / Pos Product Unit Quantity) lands one page later in bm than in takumi, so the fills and text of later pages shift. Found by the window_scenes port; pagination at tiny page heights not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "page-content",
+      "match": "^invoice\\.html 300x120: paint fills per page: bm ",
+      "status": "open",
+      "reason": "Open: on 120 px / 90 px pages (window_scenes.rs sizes) the invoice table header row (Product count / Pos Product Unit Quantity) lands one page later in bm than in takumi, so the fills and text of later pages shift. Found by the window_scenes port; pagination at tiny page heights not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^invoice\\.html 250x90: text per page: bm ",
+      "status": "open",
+      "reason": "Open: on 120 px / 90 px pages (window_scenes.rs sizes) the invoice table header row (Product count / Pos Product Unit Quantity) lands one page later in bm than in takumi, so the fills and text of later pages shift. Found by the window_scenes port; pagination at tiny page heights not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "page-content",
+      "match": "^invoice\\.html 250x90: paint fills per page: bm ",
+      "status": "open",
+      "reason": "Open: on 120 px / 90 px pages (window_scenes.rs sizes) the invoice table header row (Product count / Pos Product Unit Quantity) lands one page later in bm than in takumi, so the fills and text of later pages shift. Found by the window_scenes port; pagination at tiny page heights not investigated yet."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "text",
+      "match": "^report\\.html 300x120: text per page: bm ",
+      "status": "open",
+      "reason": "Open: on 300x120 pages with no margin the report's appendix paragraph (one line, 16 px block margins) ends inside page 13 but its block-end margin does not: takumi and Chrome keep it on page 13 and add an empty page 14 for the margin; bm treats the column-flex item's margin box as not fitting and moves it to page 14. (The 250x90 page count, from the block-end margin of the item before a break carried onto the next page, is fixed: src/layout/fragment.zig, test `paged flex column: ...`.) docs/PDF_AUDIT.md, Page model."
+    },
+    {
+      "probe": "upstream.html_fixtures_paint_from_their_windows",
+      "kind": "page-content",
+      "match": "^report\\.html 300x120: paint fills per page: bm ",
+      "status": "open",
+      "reason": "Open: on 300x120 pages with no margin the report's appendix paragraph (one line, 16 px block margins) ends inside page 13 but its block-end margin does not: takumi and Chrome keep it on page 13 and add an empty page 14 for the margin; bm treats the column-flex item's margin box as not fitting and moves it to page 14. (The 250x90 page count, from the block-end margin of the item before a break carried onto the next page, is fixed: src/layout/fragment.zig, test `paged flex column: ...`.) docs/PDF_AUDIT.md, Page model."
+    },
+    {
+      "probe": "upstream.page_summaries_add_up_to_the_summary_of_the_whole_scene",
+      "kind": "page-count",
+      "match": "^certificate\\.html 250x90: page count: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "upstream.page_summaries_add_up_to_the_summary_of_the_whole_scene",
+      "kind": "links",
+      "match": "^certificate\\.html 250x90: link destinations per page: bm ",
+      "status": "open",
+      "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    }
+  ],
+  "golden": [
+    {
+      "fixture": "color-glyph-text-shadow",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "Only a form /BBox differs (124.51 vs 124.546: takumi measures it on tiny-skia's stroked outline); accepted only through the verified fixture equivalence of scripts/pdf-fixture-equivalence.mjs (extraction and raster checks). docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "text-stroke-paint-order",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "f32 sums of glyph advances added in another order (50.000122 vs 50.00006), within the comparison's float noise. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-links-outline",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "The outline destination of a heading on page 2 is 0.005 pt off (same cause as content-page-counters); link rectangles' right edges differ by up to 0.011 pt (advance sums), just past the 0.01 comparison bound. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-links-outline",
+      "part": "annots",
+      "verdict": "DIFFER",
+      "status": "noise",
+      "reason": "The outline destination of a heading on page 2 is 0.005 pt off (same cause as content-page-counters); link rectangles' right edges differ by up to 0.011 pt (advance sums), just past the 0.01 comparison bound. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-links-outline",
+      "part": "outline",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "The outline destination of a heading on page 2 is 0.005 pt off (same cause as content-page-counters); link rectangles' right edges differ by up to 0.011 pt (advance sums), just past the 0.01 comparison bound. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "content-page-counters",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "takumi stacks pages at the exact height but breaks at the height truncated to 1/64 px; content after a sliced box is 0.0073 px higher in bm-render. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "at-page-first-left-right",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "Pages of different widths laid out at their own width; numbers within 0.01. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-tagged-ua1",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "Same as report-links-outline: outline destination 0.005 pt off, link rectangle right edges up to 0.011 pt (advance sums). docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-tagged-ua1",
+      "part": "annots",
+      "verdict": "DIFFER",
+      "status": "noise",
+      "reason": "Same as report-links-outline: outline destination 0.005 pt off, link rectangle right edges up to 0.011 pt (advance sums). docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-tagged-ua1",
+      "part": "outline",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "Same as report-links-outline: outline destination 0.005 pt off, link rectangle right edges up to 0.011 pt (advance sums). docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-tagged-a2a",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "Same as report-links-outline: link rectangle right edges up to 0.011 pt off (advance sums), page content within float noise. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "report-tagged-a2a",
+      "part": "annots",
+      "verdict": "DIFFER",
+      "status": "noise",
+      "reason": "Same as report-links-outline: link rectangle right edges up to 0.011 pt off (advance sums), page content within float noise. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "structure-types-a4",
+      "part": "annots",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "Link annotation rectangles within the comparison's float noise (0.01 pt); page content identical. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "svg-filters-masks-and-patterns",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "SVG filter / mask / pattern operators identical, numbers within 0.01. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "paged-transforms",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "The last float step of a rotated fragment's cm (22.560555 vs 22.560556); fragments, page counts and interchange trees identical. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "list-marker-pagination",
+      "part": "content",
+      "verdict": "DIFFER",
+      "status": "deliberate",
+      "reason": "Deliberate: the marker of a list item split over pages stays on its first line (Chrome); takumi moves it to the last fragment, so the content and the marker font's widths / CMap differ. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "list-marker-pagination",
+      "part": "fonts",
+      "verdict": "DIFFER",
+      "status": "deliberate",
+      "reason": "Deliberate: the marker of a list item split over pages stays on its first line (Chrome); takumi moves it to the last fragment, so the content and the marker font's widths / CMap differ. docs/PDF_AUDIT.md golden map."
+    },
+    {
+      "fixture": "paged-rotated-text",
+      "part": "content",
+      "verdict": "CLOSE",
+      "status": "noise",
+      "reason": "The last float step of a rotated fragment's cm; fragments, page counts and interchange trees identical. docs/PDF_AUDIT.md golden map."
+    }
+  ]
+}

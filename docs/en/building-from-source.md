@@ -58,6 +58,7 @@ loads any binary.
 | Feature probes per profile | `node bench/probe/profiles.mjs` | what each binary does with input of a missing feature; fails on any trap |
 | Real browser | `cd bench && npm run browser:quick` | headless Edge / Chrome via puppeteer-core; raw output must equal Node's |
 | Fuzzing (whole pipeline) | see below | run on a safety-checked build |
+| Fuzzing (parsers, decoders) | `zig build test -Dtest-filter="fuzz: png" --fuzz=200K` | coverage-guided; see [Fuzzing the parsers](#fuzzing-the-parsers) |
 
 Fuzzing the whole pipeline with random node trees on a ReleaseSafe build (a safety violation becomes a
 wasm trap instead of silent memory corruption):
@@ -67,6 +68,44 @@ zig build -Dwasm-optimize=safe -Dstrip=false -p /tmp/bmsafe
 cd bench
 BM_WASM=/tmp/bmsafe/bin/bm_render.wasm node probe/fuzz.mjs 1 3000   # seed, iterations
 ```
+
+### Fuzzing the parsers
+
+`src/fuzz.zig` has one `std.testing.fuzz` target per component that reads untrusted bytes: `png`,
+`jpeg`, `gif`, `webp` (decode + animation walk), `inflate`, `brotli`, `woff` (WOFF/WOFF2 + the font
+it decodes to), `font` (TrueType / CFF / collections: metrics, outlines, shaping), `html`, `css`
+(parser, selectors, cascade), `json`, `svg` (parse + render to 64x64), `render_html` and
+`render_json` (the whole renderer on a 64x64 canvas). Seeds come from the `testdata/` folders
+(plus `src/testdata/fuzz/`).
+
+A plain `zig build test` runs each target once per seed (well under a second in total). To
+fuzz one target with Zig's coverage-guided fuzzer (no CI runs this):
+
+```sh
+zig build test -Dtest-filter="fuzz: png" --fuzz=200K   # iterations; omit the number for the web UI
+```
+
+A failure is a panic, a safety check, a leak, or one input taking longer than 8 s (Debug build; the
+error is `SlowInput`). Errors returned by the parsers are expected and ignored. Memory per input is
+capped at 512 MiB (`error.OutOfMemory`, not a crash). The failing input is saved to
+`.zig-cache/f/crash`: its first 4 bytes are a length prefix, the rest is the input. Strip them,
+save the input under `src/testdata/fuzz/regress/` and add it to the `regressions` table in
+`src/fuzz.zig` together with the fix. The corpus a run builds is kept in `.zig-cache/f/` and
+reused by the next run. Run one target per command: two `--fuzz` runs in the same checkout share
+that cache.
+
+`zig build fuzz` is a deterministic mutation driver for the same targets (ReleaseSafe, no fuzzing
+runtime needed). Its mutations repeat spans up to thousands of times, which finds quadratic and
+allocation blow-ups that coverage guidance rarely reaches:
+
+```sh
+zig build fuzz -- all --seconds 60                  # every target, 60 s each (default seed 1)
+zig build fuzz -- font css --seconds 300 --slow-ms 200 --seed 7
+zig build fuzz -- font --replay path/to/input.bin   # re-run one input, prints its time
+```
+
+An input slower than `--slow-ms` (default 1000) is saved as `zig-out/fuzz/slow-<target>-<n>.bin`;
+on a panic or a hang (20 s) the input is saved as `zig-out/fuzz/crash-<target>.bin` (Linux).
 
 ## Checking output
 

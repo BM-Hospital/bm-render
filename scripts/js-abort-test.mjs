@@ -1,7 +1,7 @@
 // Regression tests for the JS wrapper's abort handling (`npm run test:js`):
 //   - a `signal` given to prepare() must not reject later renders of the handle
 //   - one caller aborting must not fail other callers sharing a `fetchCache` download
-//   - images.timeout + signal must work without AbortSignal.any (Node < 18.17)
+//   - images.timeout + signal must work without AbortSignal.any (Node 20.0-20.2; it is also exercised for older runtimes)
 import assert from "node:assert/strict";
 import { Renderer } from "../js/node.mjs";
 import { PdfRenderer } from "../js/node-pdf.mjs";

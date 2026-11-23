@@ -72,7 +72,7 @@ installed)`.
 "Structurally verified" means the build script checked each binary without running it (format, CPU,
 exported and imported symbols, glibc symbol versions, no math-library imports). Until a platform is
 executed, rely on the fallback: if its addon does not load, `bm-render` uses WebAssembly. The x64 builds
-need an x86-64-v2 CPU (SSE4.2, 2009 onwards); older CPUs get WebAssembly. Node.js 18 or newer.
+need an x86-64-v2 CPU (SSE4.2, 2009 onwards); older CPUs get WebAssembly. Node.js 20 or newer.
 
 ### Package managers, Docker, serverless
 

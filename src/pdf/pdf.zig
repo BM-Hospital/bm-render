@@ -33,7 +33,12 @@ pub fn needs(r: *Renderer, kind: SourceKind, source: []const u8, opts_json: []co
     const a = r.arena.allocator();
     var o = try parseOptions(r, opts_json);
     try poolStyles(a, &o, kind, source);
-    var collector: @import("needs.zig").Collector = .{ .a = a };
+    const listed = blk: {
+        if (opts_json.len == 0) break :blk &.{};
+        const v = json.parse(a, opts_json) catch break :blk &.{};
+        break :blk try @import("needs.zig").parseListed(a, v.get("listedFonts"));
+    };
+    var collector: @import("needs.zig").Collector = .{ .a = a, .listed = listed };
     const main = try buildFrameEx(r, a, o, kind, source, .needs, null, null);
     try collector.collect(&main);
     const p = o.pages;
@@ -182,12 +187,25 @@ fn parseOptions(r: *Renderer, opts_json: []const u8) Error!opt.PdfOptions {
     const blobs = try a.alloc(opt.Blob, r.images.items.len);
     for (r.images.items, 0..) |e, i| blobs[i] = .{ .id = e.src, .data = e.data };
     var diag: opt.Diag = .{};
-    var o = opt.parse(a, opts_json, blobs, &diag) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Invalid => {
-            r.setErr(diag.message(), "");
-            return error.Invalid;
-        },
+    r.limits = .{};
+    var o = blk: {
+        if (opts_json.len == 0) break :blk opt.PdfOptions{};
+        const v = json.parse(a, opts_json) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                r.setErr("invalid options JSON", "");
+                return error.Invalid;
+            },
+        };
+        // (`limits`: bm-render's own option, src/render.zig `Limits`)
+        if (v == .object) try r.parseLimits(v.get("limits"));
+        break :blk opt.fromValue(a, v, blobs, &diag) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Invalid => {
+                r.setErr(diag.message(), "");
+                return error.Invalid;
+            },
+        };
     };
     // takumi-pdf-js `decode_images`: every `images` entry is decoded before layout, and one in no image format
     // fails the render (bm-render decodes when an image is drawn: only bytes that are no image at all are
@@ -384,6 +402,56 @@ test "PDF needs uses computed styles and all bands before font loading or layout
     try std.testing.expect(std.mem.indexOf(u8, result, "hidden.png") == null);
     try std.testing.expect(std.mem.indexOf(u8, value.get("text").?.string, "Ж") != null);
     try std.testing.expect(value.get("faces").?.array.len > 0);
+}
+
+test "PDF needs: the listed font subsets font fallback reaches (takumi needs.rs)" {
+    if (comptime !@import("../config.zig").enable_pdf) return;
+    const r = Renderer.create(std.testing.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    const Case = struct { html: []const u8, opts: []const u8, fonts: []const u8 };
+    const latin = "\"ranges\":[[0,591]]";
+    const cyr = "\"ranges\":[[1024,1279]]";
+    const cases = [_]Case{
+        // only the first family that claims a character
+        .{ .html = "<p style='font-family:A,B'>Hello</p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"B\"," ++ latin ++ "}]}", .fonts = "[0]" },
+        // a later family for a character only it claims
+        .{ .html = "<p style='font-family:A,B'>HiЖ</p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"B\"," ++ cyr ++ "}]}", .fonts = "[0,1]" },
+        // the weight the text matches
+        .{ .html = "<p style='font-family:A'>a<b>b</b></p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\",\"weight\":[400,400]," ++ latin ++ "},{\"id\":1,\"name\":\"A\",\"weight\":[700,700]," ++ latin ++ "}]}", .fonts = "[0,1]" },
+        .{ .html = "<p style='font-family:A'>a</p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\",\"weight\":[400,400]," ++ latin ++ "},{\"id\":1,\"name\":\"A\",\"weight\":[700,700]," ++ latin ++ "}]}", .fonts = "[0]" },
+        // the unicode-range subsets the text falls in
+        .{ .html = "<p style='font-family:A'>Ж</p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"A\"," ++ cyr ++ "}]}", .fonts = "[1]" },
+        // the render's fontFamilies after the element's families; a family nothing uses: nothing
+        .{ .html = "<p style='font-family:Missing'>a</p>", .opts = "{\"fontFamilies\":[\"B\"],\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"B\"," ++ latin ++ "}]}", .fonts = "[1]" },
+        // in a band too
+        .{ .html = "<p style='font-family:A'>a</p>", .opts = "{\"footer\":\"<p style='font-family:A'>Ж</p>\",\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"A\"," ++ cyr ++ "},{\"id\":2,\"name\":\"A\",\"ranges\":[[1328,1423]]}]}", .fonts = "[0,1]" },
+        // a page counter hook draws its style's numerals, which no text of the document holds
+        // (takumi-pdf-js render.test.ts: keeps a face the page counter needs but the document never uses)
+        .{ .html = "<p style='font-family:A'>a</p>", .opts = "{\"footer\":\"<div style='font-family:A'><span class='totalPages trad-chinese-informal'></span></div>\",\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"A\",\"ranges\":[[19968,40959]]},{\"id\":2,\"name\":\"A\"," ++ cyr ++ "}]}", .fonts = "[0,1]" },
+        .{ .html = "<p style='font-family:A'>a <span class='pageNumber upper-roman'></span></p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\",\"ranges\":[[97,97]]},{\"id\":1,\"name\":\"A\",\"ranges\":[[65,90]]}]}", .fonts = "[0,1]" },
+    };
+    for (cases) |c| {
+        const result = try r.needsPdf(.html, c.html, c.opts);
+        const value = try json.parse(r.arena.allocator(), result);
+        var got: std.ArrayList(u8) = .empty;
+        try got.append(r.arena.allocator(), '[');
+        for (value.get("fonts").?.array, 0..) |id, k| {
+            if (k != 0) try got.append(r.arena.allocator(), ',');
+            try got.print(r.arena.allocator(), "{d}", .{@as(u32, @intFromFloat(id.asNumber().?))});
+        }
+        try got.append(r.arena.allocator(), ']');
+        std.testing.expectEqualStrings(c.fonts, got.items) catch |err| {
+            std.debug.print("case {s} {s}\n", .{ c.html, c.opts });
+            return err;
+        };
+    }
+    // a registered face that draws the character ends the walk
+    _ = try r.registerFont(try std.testing.allocator.dupe(u8, @embedFile("../font/testdata/Inter-Regular.ttf")), "A", 0, -1, null);
+    const drawn = try r.needsPdf(.html, "<p style='font-family:A,B'>a</p>", "{\"listedFonts\":[{\"id\":1,\"name\":\"B\"," ++ latin ++ "}]}");
+    try std.testing.expect(std.mem.indexOf(u8, drawn, "\"fonts\":[]") != null);
+    // ... unless it lacks the glyph: the walk moves on
+    const missing = try r.needsPdf(.html, "<p style='font-family:A,B'>\u{4e2d}</p>", "{\"listedFonts\":[{\"id\":1,\"name\":\"B\",\"ranges\":[[19968,40959]]}]}");
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"fonts\":[1]") != null);
 }
 
 test "renderPdf: not supported without the flag, a page of the requested size with it" {

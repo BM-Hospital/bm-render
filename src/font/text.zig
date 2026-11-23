@@ -33,6 +33,8 @@ const FontCollection = coll.FontCollection;
 pub const TextStyle = struct {
     unicode_bidi: BidiMode = .normal,
     rtl: bool = false,
+    /// `hyphens: none`: a soft hyphen in the run is no break opportunity.
+    no_hyphens: bool = false,
     /// Family names in priority order (ASCII case-insensitive). Unknown / empty lists fall back to
     /// every registered family in registration order.
     families: []const []const u8 = &.{},
@@ -464,6 +466,79 @@ pub const BoxFragment = struct {
     slot: u32 = 0,
 };
 
+/// Shaping segments longer than this many characters are split at the start of a word.
+/// Ligatures and multiple substitutions edit the shaping buffer in place (O(segment) each), so
+/// one 120k-character run cost seconds; real text never shapes across thousands of characters.
+const max_segment = 4096;
+
+/// Whether a long segment may end before `cp` (after `prev`): at a word start, or past 4 x
+/// `max_segment` between any two Latin-range characters (never a cluster continuation), or
+/// between two characters of a script written without spaces whose shaping never reaches across
+/// that boundary (CJK ideographs, kana, Hangul syllables, CJK punctuation and full-width forms;
+/// a Thai or Lao consonant after anything but a vowel written before it).
+fn longSegmentBreak(prev: u21, cp: u21, len: usize) bool {
+    if (prev == ' ' and cp != ' ') return true;
+    if (len < 4 * max_segment) return false;
+    if (prev < 0x300 and cp < 0x300) return true;
+    if (unspacedBase(prev) and unspacedBase(cp)) return true;
+    // Thai / Lao: a consonant starts a new grapheme; the preposed vowels (U+0E40-0E44,
+    // U+0EC0-0EC4) belong with the consonant after them
+    const thai_cons = (cp >= 0x0e01 and cp <= 0x0e2e) or (cp >= 0x0e81 and cp <= 0x0eae);
+    const same_block = (prev >> 7) == (cp >> 7);
+    const preposed = (prev >= 0x0e40 and prev <= 0x0e44) or (prev >= 0x0ec0 and prev <= 0x0ec4);
+    return thai_cons and same_block and !preposed;
+}
+
+/// A character of a script written without spaces that shapes on its own (no joining, no
+/// marks, no contextual forms in the fonts that cover it).
+fn unspacedBase(cp: u21) bool {
+    return (cp >= 0x3000 and cp <= 0x3029) or (cp >= 0x3030 and cp <= 0x303f) or (cp >= 0x3041 and cp <= 0x3096) or (cp >= 0x30a1 and cp <= 0x30fa) or
+        (cp >= 0x3400 and cp <= 0x4dbf) or (cp >= 0x4e00 and cp <= 0x9fff) or (cp >= 0xac00 and cp <= 0xd7a3) or
+        (cp >= 0xf900 and cp <= 0xfaff) or (cp >= 0xff01 and cp <= 0xff60) or (cp >= 0x20000 and cp <= 0x3134f);
+}
+
+/// Stable sort of fragments by box (paint order: box by box, each box line by line). A counting
+/// sort: an insertion sort here was quadratic when many lines each add fragments of several
+/// boxes (a 125 KB text run spent 0.6 s here).
+fn sortFragsByBox(alloc: std.mem.Allocator, fr: []BoxFragment) !void {
+    var max_box: u32 = 0;
+    var sorted = true;
+    for (fr, 0..) |f, i| {
+        max_box = @max(max_box, f.box);
+        if (i > 0 and fr[i - 1].box > f.box) sorted = false;
+    }
+    if (sorted) return;
+    const start = try alloc.alloc(u32, @as(usize, max_box) + 1);
+    defer alloc.free(start);
+    const tmp = try alloc.dupe(BoxFragment, fr);
+    defer alloc.free(tmp);
+    @memset(start, 0);
+    for (fr) |f| start[f.box] += 1;
+    var sum: u32 = 0;
+    for (start) |*s| {
+        const c = s.*;
+        s.* = sum;
+        sum += c;
+    }
+    for (tmp) |f| {
+        fr[start[f.box]] = f;
+        start[f.box] += 1;
+    }
+}
+
+test "sortFragsByBox is a stable sort by box" {
+    var fr = [_]BoxFragment{
+        .{ .box = 2, .line = 0, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 1, .line = 0, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 2, .line = 1, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 0, .line = 1, .x0 = 0, .x1 = 0, .baseline = 0 },
+        .{ .box = 1, .line = 1, .x0 = 0, .x1 = 0, .baseline = 0 },
+    };
+    try sortFragsByBox(std.testing.allocator, &fr);
+    const want = [_][2]u32{ .{ 0, 1 }, .{ 1, 0 }, .{ 1, 1 }, .{ 2, 0 }, .{ 2, 1 } };
+    for (fr, want) |f, w| try std.testing.expectEqual(w, [2]u32{ f.box, f.line });
+}
+
 /// A maximal sequence of glyphs of one run on one line (`glyphs[g0..g1]`), with its exact
 /// horizontal extent and its (possibly shifted) baseline.
 /// `box`: (internal) innermost inline box of the run, 0 = none.
@@ -717,6 +792,9 @@ pub const Paragraph = struct {
     multi_run: bool = false,
     /// Paragraph direction is right-to-left.
     rtl: bool = false,
+    /// `unicode-bidi: plaintext`: the direction of each bidi paragraph, when one differs from
+    /// `rtl` (a line's alignment, reordering and ellipsis side follow its paragraph's).
+    plain_paras: []PlainPara = &.{},
     /// Some glyph has a non-zero bidi level (lines need visual reordering).
     has_bidi: bool = false,
     /// Some run allows soft wraps.
@@ -851,12 +929,18 @@ pub const Paragraph = struct {
                 try markBreaksFull(tmp, chars[0..n_chars], opts);
             } else markBreaks(chars[0..n_chars], opts);
             if (info.any_nowrap or info.any_obj) fixBreaks(chars[0..n_chars]);
+            // `hyphens: none` (CSS Text 3 §5.4): not even a soft hyphen breaks a word
+            if (n_chars > 1) for (chars[1..n_chars], chars[0 .. n_chars - 1]) |*c, prev| {
+                if (c.brk and prev.cp == 0xad and prev.run < runs.len and runs[prev.run].style.no_hyphens) c.brk = false;
+            };
         }
+        var plain_paras: std.ArrayList(PlainPara) = .empty;
+        errdefer plain_paras.deinit(alloc);
         if (complex) {
             var css_bidi = if (opts.strut) |s| s.unicode_bidi != .normal else false;
             for (runs) |r| css_bidi = css_bidi or r.style.unicode_bidi != .normal;
             for (opts.boxes) |box| css_bidi = css_bidi or box.style.unicode_bidi != .normal;
-            if (css_bidi) try resolveCssBidi(tmp, chars[0..n_chars], runs, opts) else try resolveBidi(tmp, chars[0..n_chars], rtl_base);
+            if (css_bidi) try resolveCssBidi(tmp, chars[0..n_chars], runs, opts, &plain_paras, alloc) else try resolveBidi(tmp, chars[0..n_chars], rtl_base);
         }
 
         var local_cache = shp.Cache.init(tmp);
@@ -871,6 +955,7 @@ pub const Paragraph = struct {
             .tmp = tmp,
         };
         defer b.buf.deinit();
+        defer b.shy_glyphs.deinit(tmp);
         errdefer b.glyphs.deinit(alloc);
         errdefer b.metrics.deinit(alloc);
         errdefer b.objs.deinit(alloc);
@@ -924,6 +1009,11 @@ pub const Paragraph = struct {
         p.metrics = try b.metrics.toOwnedSlice(alloc);
         errdefer alloc.free(p.metrics);
         p.objs = try b.objs.toOwnedSlice(alloc);
+        errdefer alloc.free(p.objs);
+        // (one paragraph whose direction is the block's: nothing per line to look up)
+        if (plain_paras.items.len > 1 or (plain_paras.items.len == 1 and plain_paras.items[0].rtl != rtl_base)) {
+            p.plain_paras = try plain_paras.toOwnedSlice(alloc);
+        } else plain_paras.deinit(alloc);
         p.has_clone = b.cx and b.has_clone;
         p.has_rtl_box = b.cx and b.has_rtl_box;
         p.has_pct_edges = b.cx and b.has_pct;
@@ -941,7 +1031,20 @@ pub const Paragraph = struct {
         self.alloc.free(self.objs);
         self.alloc.free(self.boxes);
         self.alloc.free(self.run_box);
+        self.alloc.free(self.plain_paras);
         self.* = undefined;
+    }
+
+    /// The base direction of the line starting at glyph `start` (`plain_paras`).
+    fn lineRtl(self: *const Paragraph, start: u32) bool {
+        if (self.plain_paras.len == 0) return self.rtl;
+        const cluster = if (start < self.glyphs.len) self.glyphs[start].cluster else if (self.glyphs.len > 0) self.glyphs[self.glyphs.len - 1].cluster else 0;
+        var rtl = self.rtl;
+        for (self.plain_paras) |pp| {
+            if (pp.cluster > cluster) break;
+            rtl = pp.rtl;
+        }
+        return rtl;
     }
 
     fn wraps(self: *const Paragraph) bool {
@@ -981,6 +1084,10 @@ pub const Paragraph = struct {
         ellipsis: bool = false,
         /// The ellipsis is the line-clamp marker (`clamp_ell`), not the text-overflow one.
         ell_clamp: bool = false,
+        /// The line mixes directions: its content (`start .. end`, untruncated) is cut at its
+        /// visual end when it is placed, so that it and the ellipsis fit `vis_avail`.
+        vis_cut: bool = false,
+        vis_avail: f32 = 0,
         /// Paragraph-cumulative advance at `next`.
         cum: f64 = 0,
         ascent: f32 = 0,
@@ -1686,7 +1793,10 @@ pub const Paragraph = struct {
             }
             while (true) {
                 band = .{ .x0 = 0, .x1 = @max(full orelse 0, 0) };
-                if (full != null) if (flow.band_fn) |bf| {
+                // (the text before a cut is one line no page shows: it keeps its place, not moved
+                // below the floats it is too wide to sit beside, so the lines after it wrap where
+                // they did on the page before)
+                if (full != null and !cut_here) if (flow.band_fn) |bf| {
                     band = bf(flow, y, hq);
                     if (!std.math.isFinite(band.x0)) band.x0 = 0;
                     if (!(band.x1 >= band.x0) or !std.math.isFinite(band.x1)) band.x1 = band.x0;
@@ -1821,6 +1931,17 @@ pub const Paragraph = struct {
             return true;
         }
 
+        /// Some glyph of the line is not at the line's own level: truncating it in logical order
+        /// would not hide what lies at its visual end.
+        fn mixedLine(gs: []const ShapedGlyph, rtl: bool) bool {
+            const base: u8 = @intFromBool(rtl);
+            for (gs) |g| {
+                if (g.flags & ShapedGlyph.SPECIAL != 0) continue;
+                if (g.level != base) return true;
+            }
+            return false;
+        }
+
         /// text-overflow / line-clamp: truncates `li` (line number `it.index + 1`) so that its
         /// content and the ellipsis fit `avail_w`.
         fn clampLine(it: *const LineIter, li: *LineInfo, avail_w: ?f32) void {
@@ -1862,6 +1983,17 @@ pub const Paragraph = struct {
                             const nw = w + p.advanceOf(p.glyphs[k], w, it.mode.flow);
                             if (ceil64(nw + ell_w) > avail) break;
                             w = nw;
+                        }
+                        if (!p.complex and mixedLine(p.glyphs[li.start..li.end], p.lineRtl(li.start))) {
+                            // cut at the visual end when the line is placed (the width is the
+                            // logical cut's, as close as the measure needs)
+                            li.vis_cut = true;
+                            li.vis_avail = avail;
+                            li.width = w + ell_w;
+                            li.content_w = li.width;
+                            li.ellipsis = true;
+                            li.hyphen = false;
+                            return;
                         }
                         // keep clusters (marks, reordered syllable parts) whole
                         while (k > li.start and k < li.end and p.glyphs[k].flags & ShapedGlyph.NO_SPLIT != 0) {
@@ -2568,7 +2700,6 @@ pub const Paragraph = struct {
         }
 
         var container: f32 = if (m.avail) |a| a else size.width;
-        const base_level: u8 = @intFromBool(self.rtl);
         var it: LineIter = .{ .p = self, .mode = m, .cx = cx_ };
         var top: f32 = 0;
         var li_index: usize = 0;
@@ -2579,7 +2710,7 @@ pub const Paragraph = struct {
                 cx_.?.line = @intCast(lines.items.len);
                 cx_.?.frag_start = frag_start;
             }
-            const li = it.next() orelse break;
+            var li = it.next() orelse break;
             if (flow) {
                 if (li.empty) {
                     // (only floats / out-of-flow boxes: their static position is the line top)
@@ -2596,37 +2727,10 @@ pub const Paragraph = struct {
                 if (m.avail != null) container = li.band_w;
                 max_w = @max(max_w, li.width);
             } else if (li_index >= size.line_count) break;
-            // Blink aligns on the LayoutUnit grid: free space = available - snapped line width
-            const free_raw = floor64(container) - ceil64(li.content_w);
-            const free = @max(free_raw, 0);
-            var extra: f32 = 0;
-            // (the last line and a line before a forced break: `text-align-last`)
-            const al: TextAlign = if (!li.last) self.opts.text_align else self.opts.text_align_last orelse
-                (if (self.opts.text_align == .justify) TextAlign.start else self.opts.text_align);
-            if (al == .justify and !li.ellipsis and free > 0) {
-                var spaces: u32 = 0;
-                for (self.glyphs[li.start..li.end]) |g| {
-                    if (g.flags & ShapedGlyph.WORD_SPACE != 0) spaces += 1;
-                }
-                if (spaces > 0) extra = free / @as(f32, @floatFromInt(spaces));
-            }
-            var x: f32 = switch (al) {
-                .left => 0,
-                .right => free,
-                .center => floor64(free * 0.5),
-                .start => if (self.rtl) free else 0,
-                .end => if (self.rtl) 0 else free,
-                .justify => if (self.rtl and extra == 0) free else 0,
-            };
-            // an overflowing line keeps its start edge: in a right-to-left paragraph it sticks
-            // out on the left
-            if (free_raw < 0) x = if (self.rtl) free_raw else 0;
-            // (the indent is at the inline start of the line box: on the right in a right-to-left paragraph)
-            if (!self.rtl) x += li.indent;
-            if (flow) x += li.band_x;
-            const line_x = x;
-            const baseline = top + li.ascent;
-            const g_start = out.items.len;
+            // the line's base direction: its bidi paragraph's under `unicode-bidi: plaintext`
+            // (takumi / Blink `ComputeBaseDirection`), else the block's
+            const line_rtl = self.lineRtl(li.start);
+            const base_level: u8 = @intFromBool(line_rtl);
             const count: usize = li.end - li.start;
             const ell_cluster: u32 = if (li.end < self.glyphs.len) self.glyphs[li.end].cluster else if (li.end > 0) self.glyphs[li.end - 1].cluster else 0;
             // visual order of the line's glyphs (L1 + L2)
@@ -2657,6 +2761,76 @@ pub const Paragraph = struct {
                 }
                 if (visual) bidi.reorderVisual(lv, order[0..count]);
             }
+            // text-overflow in a line that mixes directions: what overflows is hidden at the line's
+            // visual end (CSS Overflow 3 §text-overflow; Blink `LineTruncator`, takumi), not after
+            // the logical end; `vis_lo .. vis_hi` are the visual positions kept
+            var vis_lo: usize = 0;
+            var vis_hi: usize = count;
+            if (li.vis_cut) {
+                const ell_w = if (li.ell_clamp) self.clamp_ell.w else self.ell.w;
+                const vpos = struct {
+                    fn at(p: *const Paragraph, l: *const LineInfo, ord: []const u32, vis: bool, rtl: bool, n: usize, kept: usize) *const ShapedGlyph {
+                        const v = if (rtl) n - 1 - kept else kept;
+                        return &p.glyphs[l.start + (if (vis) ord[v] else @as(u32, @intCast(v)))];
+                    }
+                }.at;
+                // (each item's width snapped up to the LayoutUnit grid, as the items are placed)
+                var w: f32 = li.indent;
+                var item_w: f32 = 0;
+                var item: u32 = 0xffff_ffff;
+                var kept: usize = 0;
+                while (kept < count) : (kept += 1) {
+                    const g = vpos(self, &li, order, visual, line_rtl, count, kept);
+                    if (self.multi_run and g.item != item) {
+                        w += ceil64(item_w);
+                        item_w = 0;
+                        item = g.item;
+                    }
+                    const nw = item_w + self.advanceOf(g.*, w + item_w, null);
+                    if (ceil64(w + nw + ell_w) > li.vis_avail) break;
+                    item_w = nw;
+                }
+                w += if (self.multi_run) ceil64(item_w) else item_w;
+                // keep clusters (marks, ligature parts) whole
+                while (kept > 0 and kept < count and vpos(self, &li, order, visual, line_rtl, count, kept).cluster == vpos(self, &li, order, visual, line_rtl, count, kept - 1).cluster) {
+                    kept -= 1;
+                    w -= self.advanceOf(vpos(self, &li, order, visual, line_rtl, count, kept).*, w, null);
+                }
+                if (line_rtl) vis_lo = count - kept else vis_hi = kept;
+                li.width = w + ell_w;
+                li.content_w = li.width;
+            }
+            // Blink aligns on the LayoutUnit grid: free space = available - snapped line width
+            const free_raw = floor64(container) - ceil64(li.content_w);
+            const free = @max(free_raw, 0);
+            var extra: f32 = 0;
+            // (the last line and a line before a forced break: `text-align-last`)
+            const al: TextAlign = if (!li.last) self.opts.text_align else self.opts.text_align_last orelse
+                (if (self.opts.text_align == .justify) TextAlign.start else self.opts.text_align);
+            if (al == .justify and !li.ellipsis and free > 0) {
+                var spaces: u32 = 0;
+                for (self.glyphs[li.start..li.end]) |g| {
+                    if (g.flags & ShapedGlyph.WORD_SPACE != 0) spaces += 1;
+                }
+                if (spaces > 0) extra = free / @as(f32, @floatFromInt(spaces));
+            }
+            var x: f32 = switch (al) {
+                .left => 0,
+                .right => free,
+                .center => floor64(free * 0.5),
+                .start => if (line_rtl) free else 0,
+                .end => if (line_rtl) 0 else free,
+                .justify => if (line_rtl and extra == 0) free else 0,
+            };
+            // an overflowing line keeps its start edge: in a right-to-left paragraph it sticks
+            // out on the left
+            if (free_raw < 0) x = if (line_rtl) free_raw else 0;
+            // (the indent is at the inline start of the line box: on the right in a right-to-left paragraph)
+            if (!line_rtl) x += li.indent;
+            if (flow) x += li.band_x;
+            const line_x = x;
+            const baseline = top + li.ascent;
+            const g_start = out.items.len;
             // complex lines: the spaces before a closing edge at the line end are collapsed
             var tail: u32 = li.end;
             // the open run segment: first output glyph, left edge, run, shift
@@ -2694,10 +2868,17 @@ pub const Paragraph = struct {
             // in a right-to-left paragraph the ellipsis sits at the left (end) edge
             var mk0: u32 = 0;
             var mk1: u32 = 0;
-            if (li.ellipsis and self.rtl) {
+            var rtl_marker_seg: ?usize = null;
+            if (li.ellipsis and line_rtl) {
                 mk0 = @intCast(out.items.len);
+                // (its brush is the last kept logical item's, as on the right of an LTR line)
                 var user = self.ell.user;
-                for (self.glyphs[li.start..li.end]) |g| {
+                var k = li.end;
+                // (cut at the visual end: the item the marker follows on the left)
+                if (li.vis_cut and vis_lo < vis_hi) k = li.start + 1 + (if (visual) order[vis_lo] else @as(u32, @intCast(vis_lo)));
+                while (k > li.start) {
+                    k -= 1;
+                    const g = self.glyphs[k];
                     if (g.flags & ShapedGlyph.SPECIAL == 0 and g.metric < self.metrics.len) {
                         user = self.metrics[g.metric].user;
                         break;
@@ -2705,6 +2886,7 @@ pub const Paragraph = struct {
                 }
                 x = self.putEllipsis(out, x, baseline, ell_cluster, li.ell_clamp, user);
                 mk1 = @intCast(out.items.len);
+                rtl_marker_seg = segs.items.len;
                 if (cplx) try self.pushSeg(segs, alloc, &.{}, no_stop, g_start, out.items.len, line_x, x, baseline, lines.items.len);
             }
             var prev_item: u32 = 0xffff_ffff;
@@ -2714,6 +2896,7 @@ pub const Paragraph = struct {
             _ = &ip;
             var v: usize = 0;
             while (v < count) : (v += 1) {
+                if (v < vis_lo or v >= vis_hi) continue;
                 if (ve and v > 0 and endsAt(cx_.?, @intCast(v - 1))) {
                     // line-right edges of the fragments that ended with the previous item
                     if (seg_run < 0xffff_fffe) try self.pushSeg(segs, alloc, &.{}, seg_run, seg_g0, out.items.len, seg_x0, x, baseline + seg_dy, lines.items.len);
@@ -2828,7 +3011,9 @@ pub const Paragraph = struct {
                     if (g.flags & ShapedGlyph.WORD_SPACE != 0) x += extra;
                 }
                 if (hyphen_here and g.level & 1 == 0) {
-                    out.appendAssumeCapacity(.{ .face = mt.face, .gid = mt.hyphen_gid, .x = x - g.kern, .y = baseline + dy, .size = mt.size, .user = mt.user, .cluster = g.cluster, .bidi_level = g.level, .generated = mt.hyphen_cp });
+                    // (item_origin: Blink places the hyphen after the item's snapped inline size)
+                    const hx = if (item_origin) ip.org + ceil64(@floatCast(ip.loc - g.kern)) else x - g.kern;
+                    out.appendAssumeCapacity(.{ .face = mt.face, .gid = mt.hyphen_gid, .x = hx, .y = baseline + dy, .size = mt.size, .user = mt.user, .cluster = g.cluster, .bidi_level = g.level, .generated = mt.hyphen_cp });
                     if (item_origin) {
                         x = ip.add(mt.hyphen_adv - g.kern);
                     } else x += mt.hyphen_adv - g.kern;
@@ -2864,7 +3049,13 @@ pub const Paragraph = struct {
                     f.line = @intCast(lines.items.len);
                 }
             }
-            if (li.ellipsis and !self.rtl) {
+            // (PDF builds) a right-to-left line's marker is visually first but its last logical
+            // item (takumi `LineTruncator`): its segment follows the line's other segments, so
+            // the content stream / extracted text has it after the content it stands in for
+            if (comptime item_origin_build) if (rtl_marker_seg) |k| if (cplx and k + 1 < segs.items.len and segs.items[k].g0 == mk0 and segs.items[k].g1 == mk1) {
+                std.mem.rotate(Segment, segs.items[k..], 1);
+            };
+            if (li.ellipsis and !line_rtl) {
                 const e0 = out.items.len;
                 // The marker is a new logical item: its origin follows the preceding item's
                 // snapped inline size, and its brush belongs to that item (font stays strut).
@@ -2886,7 +3077,7 @@ pub const Paragraph = struct {
                 .glyph_end = @intCast(out.items.len),
                 .ascent = li.ascent,
                 .descent = li.descent,
-                .rtl = self.rtl,
+                .rtl = line_rtl,
                 .marker0 = if (item_origin_build) mk0 else {},
                 .marker1 = if (item_origin_build) mk1 else {},
                 .start = if (item_origin_build) li.start else {},
@@ -2897,16 +3088,7 @@ pub const Paragraph = struct {
         if (self.has_rel) self.applyRel(&acc, rel_objs.items);
 
         // paint order: box by box (outer boxes first), each box line by line
-        {
-            const fr = frags.items;
-            var i: usize = 1;
-            while (i < fr.len) : (i += 1) {
-                const v = fr[i];
-                var j = i;
-                while (j > 0 and fr[j - 1].box > v.box) : (j -= 1) fr[j] = fr[j - 1];
-                fr[j] = v;
-            }
-        }
+        try sortFragsByBox(alloc, frags.items);
         var res: TextLayout = .{
             .width = if (flow) ceil64(max_w) else size.width,
             .height = if (flow) it.y else size.height,
@@ -3295,7 +3477,11 @@ fn resolveBidi(alloc: std.mem.Allocator, chars: []Char, rtl_base: bool) !void {
 
 /// CSS bidi contexts are virtual UAX #9 controls: never glyphs, never source clusters.
 /// Preserve the inline ancestry across runs, so an override also applies inside nested spans.
-fn resolveCssBidi(alloc: std.mem.Allocator, chars: []Char, runs: []const Run, opts: ParagraphOptions) !void {
+/// `unicode-bidi: plaintext` on the block: the base direction each bidi paragraph (forced-break
+/// separated) takes from its first strong character, by first cluster.
+const PlainPara = struct { cluster: u32, rtl: bool };
+
+fn resolveCssBidi(alloc: std.mem.Allocator, chars: []Char, runs: []const Run, opts: ParagraphOptions, plain: ?*std.ArrayList(PlainPara), plain_alloc: std.mem.Allocator) !void {
     const Scope = struct { key: u32, mode: BidiMode, rtl: bool };
     const Control = struct {
         fn open(a: std.mem.Allocator, out: *std.ArrayList(u21), scope: Scope) !void {
@@ -3374,19 +3560,22 @@ fn resolveCssBidi(alloc: std.mem.Allocator, chars: []Char, runs: []const Run, op
             try Control.close(alloc, &cps, active[n_active]);
         }
         var base: u8 = @intFromBool(opts.direction == .rtl);
-        if (opts.strut != null and opts.strut.?.unicode_bidi == .plaintext) for (chars[start..end]) |ch| {
-            switch (uni.bidiClass(ch.cp)) {
-                .l => {
-                    base = 0;
-                    break;
-                },
-                .r, .al => {
-                    base = 1;
-                    break;
-                },
-                else => {},
+        if (opts.strut != null and opts.strut.?.unicode_bidi == .plaintext) {
+            // UAX #9 P2 / P3: the first strong character, else left-to-right (takumi
+            // `BidiParagraph::new(text, None)`), whatever `direction` says.
+            base = 0;
+            for (chars[start..end]) |ch| {
+                switch (uni.bidiClass(ch.cp)) {
+                    .l => break,
+                    .r, .al => {
+                        base = 1;
+                        break;
+                    },
+                    else => {},
+                }
             }
-        };
+            if (plain) |list| if (start < chars.len) try list.append(plain_alloc, .{ .cluster = chars[start].cluster, .rtl = base == 1 });
+        }
         const levels = try alloc.alloc(u8, cps.items.len);
         defer alloc.free(levels);
         try bidi.resolve(alloc, cps.items, levels, base);
@@ -3403,7 +3592,7 @@ test "CSS bidi override contexts cover nested inline runs without source control
         .{ .style = .{ .unicode_bidi = .bidi_override, .rtl = true } },
         .{ .parent = 0, .style = .{ .unicode_bidi = .bidi_override, .rtl = false } },
     };
-    try resolveCssBidi(std.testing.allocator, &chars, &runs, .{ .boxes = &boxes });
+    try resolveCssBidi(std.testing.allocator, &chars, &runs, .{ .boxes = &boxes }, null, std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 1), chars[0].level & 1);
     try std.testing.expectEqual(@as(u8, 0), chars[1].level & 1);
     try std.testing.expectEqual(@as(u8, 1), chars[2].level & 1);
@@ -3456,6 +3645,9 @@ const Builder = struct {
     any_rtl: bool = false,
     /// Index of the first char whose break flag has not been attributed to a glyph yet.
     brk_from: usize = 0,
+    /// Soft hyphens that open another run than the character before them, waiting for the
+    /// segment they fall in to be shaped (`shapeOut` gives each an invisible glyph of its own).
+    shy_glyphs: std.ArrayList(u32) = .empty,
     // inline boxes / objects (see `Paragraph.complex`)
     cx: bool = false,
     boxes: []BoxInfo = &.{},
@@ -3700,6 +3892,7 @@ const Builder = struct {
             if (c.obj) {
                 if (!b.cx) continue;
                 try b.flush(complex, style);
+                b.shy_glyphs.clearRetainingCapacity();
                 const o = runs[c.run].object orelse continue;
                 const fl = b.takeBreak(ci);
                 try b.special(Special.atomic, o.id, 0, try b.objIndex(o), c.level, fl & ShapedGlyph.BREAK_BEFORE);
@@ -3708,6 +3901,7 @@ const Builder = struct {
             if (faces.len == 0) continue; // no fonts registered: nothing to shape
             if (c.cp == hard_break_cp) {
                 try b.flush(complex, style);
+                b.shy_glyphs.clearRetainingCapacity();
                 try b.lineOfIgnorables(&zw_only, line_start);
                 _ = b.takeBreak(ci);
                 try b.glyphs.append(b.alloc, .{ .face = faces[0], .gid = 0, .cluster = c.cluster, .x_advance = 0, .metric = primary_metric, .flags = ShapedGlyph.HARD_BREAK, .level = c.level, .item = b.item });
@@ -3721,10 +3915,18 @@ const Builder = struct {
                 // the spaces then being content), two places a dropped soft hyphen would merge. A line
                 // may then start with it and hold only its hyphen ("aaa" / "‐" / "bbb").
                 try b.flush(complex, style);
+                b.shy_glyphs.clearRetainingCapacity();
                 const pick = pickFace(b.fonts, faces, ' ');
                 const fl = b.takeBreak(ci);
                 try b.glyphs.append(b.alloc, .{ .face = pick.face, .gid = pick.gid, .cluster = c.cluster, .x_advance = 0, .metric = primary_metric, .flags = fl, .level = c.level, .item = b.item });
                 continue;
+            }
+            if (c.cp == 0xad and ci > 0 and b.chars[ci - 1].run != c.run) {
+                // A soft hyphen that opens a run (a span) keeps an invisible glyph of its own in
+                // that run: a line broken there ends in the span's item, whose style the hyphen
+                // takes (Blink, Firefox; takumi keeps the soft hyphen as a glyph of the span's
+                // run). Placed when its segment is shaped, without dividing the segment.
+                try b.shy_glyphs.append(b.tmp, @intCast(ci));
             }
             if (uni.isZeroWidth(c.cp)) {
                 // (a joiner is shaped, but alone it gives no glyph either)
@@ -3733,6 +3935,7 @@ const Builder = struct {
             }
             if (c.cp == '\t') {
                 try b.flush(complex, style);
+                b.shy_glyphs.clearRetainingCapacity();
                 const pick = pickFace(b.fonts, faces, ' ');
                 const f = b.fonts.font(pick.face);
                 const sp = scaleAdvance(f.advanceWidth(pick.gid), @as(f64, style.size) * 65536.0 / @as(f64, @floatFromInt(f.units_per_em))) + style.letter_spacing + style.word_spacing;
@@ -3864,6 +4067,8 @@ const Builder = struct {
                 } else if (script != b.seg_script) {
                     // a segment that has seen no strong character yet adopts the script
                     if (b.seg_script == 0) b.seg_script = script else try b.flush(complex, style);
+                } else if (b.buf.g().len >= max_segment and !joiner and longSegmentBreak(b.chars[ci - 1].cp, c.cp, b.buf.g().len)) {
+                    try b.flush(complex, style);
                 }
             }
             cur_script = script;
@@ -4097,13 +4302,32 @@ const Builder = struct {
         try b.glyphs.ensureUnusedCapacity(b.alloc, gs.len);
         const scale = @as(f64, size) * 65536.0 / @as(f64, @floatFromInt(f.units_per_em));
         const hang = b.hang;
-        const spacing: f32 = if (complex and shp.isCursiveScript(b.seg_script)) 0 else style.letter_spacing;
+        // CSS Text 4 §8.2.1: no letter-spacing inside a cursive script, but still at its word
+        // separators (Blink / takumi `ShapeResultSpacing::ComputeSpacing`)
+        const cursive = complex and shp.isCursiveScript(b.seg_script);
         var paint_run: u32 = 0xffff_ffff;
         for (gs, 0..) |g, j| {
             const first = j == 0 or gs[j - 1].cluster != g.cluster;
             const last = j + 1 == gs.len or gs[j + 1].cluster != g.cluster;
             const ci: usize = @min(g.cluster, b.chars.len - 1);
             const c = b.chars[ci];
+            while (first and b.shy_glyphs.items.len != 0 and b.shy_glyphs.items[0] < ci) {
+                // the invisible glyph of a soft hyphen that opens a run (see `build`)
+                const si = b.shy_glyphs.orderedRemove(0);
+                const sc = b.chars[si];
+                if (b.cx) try b.enterRuns(b.runs, sc.run, b.seg_level);
+                if (paint_run != sc.run) {
+                    if (j != 0) b.item +|= 1;
+                    paint_run = sc.run;
+                }
+                var st = b.runs[sc.run].style;
+                st.size = size;
+                const m = if (b.metrics.items[metric].run == sc.run) metric else try b.metricFor(sc.run, b.seg_face, st);
+                // (it sits after the kerning of the glyph before it with the glyph after it, as
+                // in HarfBuzz; a line that ends here keeps that kerning, as Blink keeps the shape
+                // of the item before the span's)
+                try b.glyphs.append(b.alloc, .{ .face = b.seg_face, .gid = f.glyphIndex(' '), .cluster = sc.cluster, .x_advance = 0, .metric = m, .flags = b.takeBreak(si), .level = b.seg_level, .item = b.item });
+            }
             if (b.cx) try b.enterRuns(b.runs, c.run, b.seg_level);
             if (paint_run != c.run) {
                 if (j != 0) b.item +|= 1;
@@ -4117,7 +4341,9 @@ const Builder = struct {
             const kern: f32 = if (g.kern != 0 and g.x_adv != 0) adv - scaleAdvance(g.x_adv - g.kern, scale) else 0;
             // letter-spacing goes after every cluster (on its last glyph; the first one in a
             // right-to-left run, where it is the visually last)
-            if (if (rtl) first else last) adv += spacing;
+            if (if (rtl) first else last) {
+                if (!cursive or c.cp == ' ' or c.cp == 0xa0 or c.cp == '\n') adv += style.letter_spacing;
+            }
             if (first) {
                 if (c.cp == ' ' or c.cp == 0xa0) {
                     adv += style.word_spacing;

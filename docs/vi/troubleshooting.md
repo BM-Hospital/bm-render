@@ -2,7 +2,7 @@
 
 [English](../en/troubleshooting.md) · [Tiếng Việt](troubleshooting.md)
 
-Những triệu chứng bạn dễ gặp với bm-render 0.1.0, nguyên nhân và cách khắc phục. Phần lớn xuất phát từ
+Những triệu chứng bạn dễ gặp với bm-render, nguyên nhân và cách khắc phục. Phần lớn xuất phát từ
 hai mặc định của thư viện (`display` mặc định là `inline`; đầu vào không bao giờ được tải
 về) và một quyết định riêng của bm-render (không kèm font).
 

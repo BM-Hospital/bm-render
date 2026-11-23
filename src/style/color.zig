@@ -114,7 +114,25 @@ const func_names = "rgb\x00rgba\x00hsl\x00hsla\x00hwb\x00lab\x00lch\x00oklab\x00
 pub fn isModernColorToken(t: Token) bool {
     if (t.kind != .function) return false;
     const i = tok.matchPacked(t.text, func_names) orelse return false;
-    return i >= 5 and i <= 10;
+    if (i >= 5 and i <= 10) return true;
+    // Relative syntax (`rgb(from ...)`) is modern whatever the function name (takumi
+    // `peeks_modern_color_function`; CSS Color 5: its result is not a legacy colour).
+    if (i <= 4) {
+        var args = Lexer.init(t.args);
+        return args.next().isIdent("from");
+    }
+    return false;
+}
+
+test "relative colour syntax counts as a modern colour for gradient interpolation" {
+    for ([_][]const u8{ "rgb(from red r g b)", "hsl(from red h s l)", "oklch(.5 .1 10)", "color-mix(in srgb, red, blue)" }) |src| {
+        var l = Lexer.init(src);
+        try std.testing.expect(isModernColorToken(l.next()));
+    }
+    for ([_][]const u8{ "rgb(1 2 3)", "hsla(10, 20%, 30%, .5)", "light-dark(red, blue)" }) |src| {
+        var l = Lexer.init(src);
+        try std.testing.expect(!isModernColorToken(l.next()));
+    }
 }
 
 /// Parses a whole string as one colour (whitespace allowed around it).

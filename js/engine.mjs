@@ -17,6 +17,8 @@ const FEATURE_NAMES = ["css", "tw", "html", "svg", "woff", "variableFonts", "cff
 const FEATURE_LABELS = { css: "stylesheet (`css` option)", html: "HTML input", woff: "WOFF/WOFF2 font", renderSvg: "renderSvg", pdf: "renderPdf",
   animation: "animation", extraCodecs: "ICO output" };
 
+import { WorkerPool } from "./worker-pool.mjs";
+
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const DISPOSE = typeof Symbol.dispose === "symbol" ? Symbol.dispose : Symbol.for("nodejs.dispose");
@@ -75,6 +77,8 @@ function unsupported(what) {
 }
 
 const PREPARED = Symbol.for("bm-render.prepared");
+/** @internal key of a binding's backend (js/worker.mjs runs serialised calls on it) */
+export const BACKEND = Symbol("bm-render.backend");
 
 /** Handle returned by `prepare` / `prepareAnimation` (opaque, like takumi's `Prepared`). */
 export class Prepared {
@@ -95,6 +99,39 @@ function unwrap(source, options, kind) {
 
 function throwIfAborted(signal) {
   if (signal && signal.aborted) throw signal.reason ?? new Error("bm-render: aborted");
+}
+
+/** `limits` names the engine reads (src/render.zig `Limits`). */
+const LIMIT_NAMES = ["maxImagePixels", "maxImageBytes", "maxAnimationFrames", "maxCanvasPixels", "maxNodeDepth"];
+
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Validates the `Renderer` constructor's `limits` (the call's own are checked by the engine). */
+function checkLimits(limits) {
+  if (limits == null) return null;
+  if (!isPlainObject(limits)) throw new TypeError("bm-render: limits must be an object");
+  for (const [k, v] of Object.entries(limits)) {
+    if (!LIMIT_NAMES.includes(k)) throw new TypeError(`bm-render: unknown limit: limits.${k}`);
+    if (v != null && !(typeof v === "number" && v >= 1)) throw new TypeError(`bm-render: limit must be a number >= 1: limits.${k}`);
+  }
+  return { ...limits };
+}
+
+/**
+ * A call's `limits` over the renderer's: each can only lower the other (the smaller number wins), and the
+ * engine clamps both to its built-in caps. Returns undefined when neither sets any.
+ */
+function mergeLimits(base, call) {
+  if (call == null) return base ?? undefined;
+  if (base == null || !isPlainObject(call)) return call;
+  const out = { ...base };
+  for (const [k, v] of Object.entries(call)) {
+    if (v == null) continue;
+    out[k] = typeof v === "number" && typeof out[k] === "number" ? Math.min(out[k], v) : v;
+  }
+  return out;
 }
 
 function imageList(images) {
@@ -142,6 +179,9 @@ export function createBinding(defaultWasm, external) {
   let wasm = null;
   /** in-flight `init()` (concurrent callers share it) */
   let pending = null;
+  /** the compiled module behind `wasm`, and the URL it was loaded from if any (for `workers`, js/worker-pool.mjs) */
+  let wasmModule = null;
+  let wasmSourceUrl = null;
 
   /**
    * Optional features of the loaded wasm binary (all false before init). Binaries older than the
@@ -194,8 +234,9 @@ export function createBinding(defaultWasm, external) {
     if (status !== 0) throw new Error("bm-render: " + (lastError() || "error " + status));
   }
 
-  function adopt(instance) {
+  function adopt(instance, module) {
     if (!wasm) {
+      wasmModule = module;
       wasm = instance.exports;
       setFeatures();
     }
@@ -318,7 +359,7 @@ export function createBinding(defaultWasm, external) {
     if (input && typeof input === "object" && "module" in input && !isWasmModule(input)) input = input.module;
     if (input == null) throw new Error(NEEDS_INPUT.replace("init()", "initSync()"));
     const mod = isWasmModule(input) ? input : new WebAssembly.Module(input);
-    return adopt(new WebAssembly.Instance(mod, {}));
+    return adopt(new WebAssembly.Instance(mod, {}), mod);
   }
 
   async function load(input) {
@@ -333,24 +374,26 @@ export function createBinding(defaultWasm, external) {
         throw new Error("bm-render: cannot locate the wasm file in this runtime (no usable import.meta.url); pass it to init() " +
           "explicitly, e.g. `import wasm from \"bm-render/core.wasm\"; await init(wasm)` (" + (e && e.message) + ")");
       }
+      wasmSourceUrl = url.href;
       input = url.protocol === "file:" ? await readFileUrl(url) : url;
     }
     if (typeof input === "string" || (typeof URL !== "undefined" && input instanceof URL) ||
         (typeof Request !== "undefined" && input instanceof Request)) {
+      try { wasmSourceUrl = new URL(input.url ?? String(input), globalThis.location?.href).href; } catch {}
       const res = await fetch(input);
       if (!res.ok) throw new Error(`bm-render: failed to fetch the wasm (${res.status} ${res.statusText || ""}): ${res.url || input}`);
       input = res;
     }
     if (typeof Response !== "undefined" && input instanceof Response) {
       if (WebAssembly.instantiateStreaming && (input.headers.get("content-type") || "").startsWith("application/wasm")) {
-        const { instance } = await WebAssembly.instantiateStreaming(input, {});
-        return adopt(instance);
+        const { instance, module } = await WebAssembly.instantiateStreaming(input, {});
+        return adopt(instance, module);
       }
       input = await input.arrayBuffer();
     }
-    if (isWasmModule(input)) return adopt(await WebAssembly.instantiate(input, {}));
-    const { instance } = await WebAssembly.instantiate(input, {});
-    return adopt(instance);
+    if (isWasmModule(input)) return adopt(await WebAssembly.instantiate(input, {}), input);
+    const { instance, module } = await WebAssembly.instantiate(input, {});
+    return adopt(instance, module);
   }
 
   /**
@@ -377,12 +420,33 @@ export function createBinding(defaultWasm, external) {
     #fontsGen = 0;
     /** attachments of the call being prepared: flat [key, bytes, flags, width, height] groups */
     #atts = [];
+    /** `workers` option on the wasm backend: the async API runs on these (js/worker-pool.mjs) */
+    #pool = null;
+    /** `limits` of every call (the constructor option), or null */
+    #limits = null;
 
     constructor(options = {}) {
       if (!backend.ready()) throw new Error("bm-render: call init()/initSync() before creating a Renderer");
+      const workers = options && options.workers;
+      if (workers != null && workers !== false && (!Number.isInteger(workers) || workers < 0)) {
+        throw new TypeError("bm-render: workers must be a non-negative integer");
+      }
+      const limits = checkLimits(options?.limits);
       this.#h = backend.create();
       if (!this.#h) throw new Error("bm-render: out of memory");
-      void options;
+      this.#limits = limits;
+      // (native: the async API already runs on the libuv thread pool, so `workers` is ignored)
+      if (workers > 0 && !backend.runAsync) this.#pool = new WorkerPool(workers, () => ({ module: wasmModule, url: wasmSourceUrl }));
+    }
+
+    /** `rest` (call options without the JS-only entries) with the effective `limits`. */
+    #withLimits(rest) {
+      const limits = mergeLimits(this.#limits, rest.limits);
+      if (limits === undefined) {
+        const { limits: _l, ...o } = rest;
+        return o;
+      }
+      return { ...rest, limits };
     }
 
     #handle() {
@@ -419,7 +483,11 @@ export function createBinding(defaultWasm, external) {
       const italic = details.style == null ? -1 : /italic|oblique/.test(String(details.style)) ? 1 : 0;
       const unicodeRange = normalizeUnicodeRange(details.unicodeRange);
       const fontOptions = unicodeRange == null ? null : JSON.stringify({ unicodeRange });
-      return JSON.parse(backend.run(h, "registerFont", (details.weight | 0) >>> 0, italic >>> 0, details.name || "", fontOptions, ["", bytes, 0, 0, 0], true));
+      const weight = (details.weight | 0) >>> 0;
+      const name = details.name || "";
+      const out = JSON.parse(backend.run(h, "registerFont", weight, italic >>> 0, name, fontOptions, ["", bytes, 0, 0, 0], true));
+      if (this.#pool) this.#pool.font("registerFont", weight, italic >>> 0, name, fontOptions, bytes);
+      return out;
     }
 
     /** takumi-compatible alias. */
@@ -431,12 +499,15 @@ export function createBinding(defaultWasm, external) {
     unregisterFont(family) {
       this.#fontsGen++;
       const name = family && typeof family === "object" ? family.name : family;
-      return backend.run(this.#handle(), "unregisterFont", 0, 0, String(name), null, null, false)[0] !== 0;
+      const removed = backend.run(this.#handle(), "unregisterFont", 0, 0, String(name), null, null, false)[0] !== 0;
+      if (removed && this.#pool) this.#pool.font("unregisterFont", 0, 0, String(name), null, null);
+      return removed;
     }
 
     clearFonts() {
       this.#fontsGen++;
       backend.run(this.#handle(), "clearFonts", 0, 0, null, null, null, false);
+      if (this.#pool) this.#pool.font("clearFonts", 0, 0, null, null, null);
     }
 
     /** Runs a prepared call (`#call` / `#animation`) on the calling thread; `text`: decode the result as UTF-8. */
@@ -444,8 +515,12 @@ export function createBinding(defaultWasm, external) {
       return backend.run(this.#handle(), job.op, job.kind, 0, job.text, job.opts, job.atts, text);
     }
 
-    /** Like #run for the async API: off the calling thread when the backend can (native), else the same call. */
+    /**
+     * Like #run for the async API: off the calling thread when the backend can (native) or on a worker
+     * (`workers` option), else the same call. `job.signal` (worker pool only) drops a queued job.
+     */
     #runAsync(job, text = false) {
+      if (this.#pool) return this.#pool.run(job, text, job.signal);
       return backend.runAsync ? backend.runAsync(this.#handle(), job.op, job.kind, job.rawBytes || 0, job.text, job.opts, job.atts, text) : this.#run(job, text);
     }
 
@@ -516,11 +591,12 @@ export function createBinding(defaultWasm, external) {
       if (which === "svg") requireFeature("renderSvg");
       const [json, kind] = this.#prepareSource(node, options);
       // `images` were attached above; `fonts`/`signal` are JS-side takumi options.
-      const { images: _i, fonts: _f, signal: _s, ...rest } = options;
+      const { images: _i, fonts: _f, signal: _s, ...given } = options;
+      const rest = this.#withLimits(given);
       // (native async: the byte size of a raw frame whose size is given, so its buffer can be made up front)
       const { width: w, height: h } = rest;
       const rawBytes = which === "render" && rest.format === "raw" && Number.isInteger(w) && Number.isInteger(h) && w > 0 && h > 0 && w * h <= 40e6 ? w * h * 4 : 0;
-      return { op: which, kind, text: json, opts: JSON.stringify(rest), atts: this.#atts, rawBytes };
+      return { op: which, kind, text: json, opts: JSON.stringify(rest), atts: this.#atts, rawBytes, signal: options.signal };
     }
 
     /** Async option extras (takumi `RenderExtras`): `fonts` loaders and lazy `images`. */
@@ -598,8 +674,8 @@ export function createBinding(defaultWasm, external) {
     }
 
     /**
-     * takumi-compatible async signature. On the wasm backend rendering itself is synchronous; the native
-     * backend renders on a thread-pool thread (the inputs are snapshotted when the call is made).
+     * takumi-compatible async signature. On the wasm backend rendering itself is synchronous (on a worker with
+     * the `workers` option); the native backend renders on a thread-pool thread (inputs snapshotted at the call).
      */
     async render(node, options = {}) {
       [node, options] = unwrap(node, options, "render");
@@ -637,7 +713,7 @@ export function createBinding(defaultWasm, external) {
     /** renderPdf / measurePdf options as JSON text; attachment bytes and band images become attachments of the call. */
     #pdfOptionsText(options) {
       const { images: _i, fonts: _f, signal: _s, attachments, ...rest } = options;
-      const o = { ...rest };
+      const o = this.#withLimits(rest);
       if (attachments != null) {
         if (!Array.isArray(attachments)) throw new TypeError("bm-render: attachments takes an array");
         o.attachments = attachments.map((a) => {
@@ -664,7 +740,7 @@ export function createBinding(defaultWasm, external) {
       if ((options.css != null && options.css.length !== 0) || (options.stylesheets != null && options.stylesheets.length !== 0)) requireFeature("css");
       let text;
       const [json, kind] = this.#prepareSource(node, options, () => (text = this.#pdfOptionsText(options)));
-      return { op: which === "render" ? "pdf" : which === "needs" ? "pdfNeeds" : "pdfMeasure", kind, text: json, opts: text, atts: this.#atts };
+      return { op: which === "render" ? "pdf" : which === "needs" ? "pdfNeeds" : "pdfMeasure", kind, text: json, opts: text, atts: this.#atts, signal: options.signal };
     }
 
     /**
@@ -692,6 +768,16 @@ export function createBinding(defaultWasm, external) {
     async measurePdf(node, options = {}) {
       [node, options] = unwrap(node, options, "render");
       return JSON.parse(await this.#runAsync(this.#callPdf("measure", node, await this.#extras(options)), true));
+    }
+
+    /**
+     * Internal (js/pdf-resources.mjs): registers `fonts` entries as a render's `fonts` option does, each once
+     * (a later render or prepare naming the same entry does not load it again); returns their family names.
+     */
+    async loadFontsOnce(fonts) {
+      const names = [];
+      for (const f of fonts) for (const fam of (await this.#registerOnce(f)) || []) if (!names.includes(fam.name)) names.push(fam.name);
+      return names;
     }
 
     /** Internal cascade-only resource discovery; no font loaders or image fetches run here. */
@@ -751,15 +837,15 @@ export function createBinding(defaultWasm, external) {
       this.#handle();
       this.#atts = [];
       const { images, fonts: _f, signal: _s, scenes: _sc, ...rest } = options;
-      const text = this.#stringify({ ...rest, scenes: scenes || [] });
+      const text = this.#stringify({ ...this.#withLimits(rest), scenes: scenes || [] });
       this.#putImages(images, text, true);
-      return { op: "animation", kind: 0, text, opts: null, atts: this.#atts };
+      return { op: "animation", kind: 0, text, opts: null, atts: this.#atts, signal: options.signal };
     }
 
     async renderAnimation(options, extra = {}) {
       if (options && options[PREPARED]) {
         throwIfAborted(extra.signal);
-        return this.#runAsync(this.#animation(options));
+        return this.#runAsync({ ...this.#animation(options), signal: extra.signal });
       }
       return this.#runAsync(this.#animation(await this.#extras(options)));
     }
@@ -776,7 +862,10 @@ export function createBinding(defaultWasm, external) {
       return backend.ready() ? backend.memoryBytes() : 0;
     }
 
+    /** Releases the renderer; with `workers`, terminates them and rejects the async calls still pending. */
     free() {
+      if (this.#pool) this.#pool.terminate();
+      this.#pool = null;
       if (this.#h) backend.destroy(this.#h);
       this.#h = 0;
     }
@@ -796,5 +885,5 @@ export function createBinding(defaultWasm, external) {
     return defaultWasm ? defaultWasm() : undefined;
   }
 
-  return { init, initSync, Renderer, Prepared, features, setGlyphCacheMaxBytes, wasmUrl, backend: backend.name };
+  return { init, initSync, Renderer, Prepared, features, setGlyphCacheMaxBytes, wasmUrl, backend: backend.name, [BACKEND]: backend };
 }

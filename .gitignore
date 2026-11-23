@@ -15,3 +15,5 @@ npm/*/*.node
 npm/*/LICENSE
 npm/*/NOTICE
 npm/*/THIRD-PARTY-NOTICES.md
+.agents/*.log
+.claude/worktrees/

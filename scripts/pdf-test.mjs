@@ -892,6 +892,14 @@ isPdf(rendererAfterErrors, "renderer still works after errors", [30, 30]);
   check(subsetCalls.join(",") === "1,1,0", "prepared render reuses loaded subsets");
   subsets.free();
 
+  // font fallback decides which listed subsets load (takumi needs.rs): the element's families, then the stack
+  const reached = [];
+  const family = (name, range) => ({ name, unicodeRange: [range], data: () => { reached.push(name); return inter; } });
+  const fallback = new PdfRenderer();
+  await fallback.prepare("<p style='font-family:B'>a</p><p>Ж</p>", { fonts: [family("A", [0, 0x24f]), family("B", [0, 0x24f]), family("C", [0x400, 0x4ff]), family("D", [0x400, 0x4ff])] });
+  check(reached.join(",") === "B,C", `prepare needs: only the subsets font fallback reaches load (${reached.join(",")})`);
+  fallback.free();
+
   const files = new PdfRenderer();
   const fontCalls = [];
   const fp = await files.prepare(`<style>@font-face{font-family:Remote;src:url(https://example.com/broken.woff2),url(https://example.com/font.ttf)}p{font-family:Remote}</style><p>Font fallback file</p>`, {
@@ -909,11 +917,15 @@ isPdf(rendererAfterErrors, "renderer still works after errors", [30, 30]);
   await cached.prepare('<img src="https://example.com/cache.png">', cachedOptions);
   check(downloads === 1, "prepare fetchCache: later preparation reuses cached bytes");
   let attempts = 0;
-  const retryOptions = { images: { fetchCache: cache, throwOnError: false, fetch: async () => new Response(++attempts === 1 ? "failed" : png, { status: attempts === 1 ? 500 : 200 }) } };
+  // (a 404: not retried within one download, as takumi helpers fetchOk retries only 408 / 429 / 5xx)
+  const retryOptions = { images: { fetchCache: cache, throwOnError: false, fetch: async () => new Response(++attempts === 1 ? "failed" : png, { status: attempts === 1 ? 404 : 200 }) } };
   await cached.prepare('<img src="https://example.com/retry.png">', retryOptions);
   check(!cache.has("https://example.com/retry.png"), "prepare fetchCache: failed download is evicted");
   await cached.prepare('<img src="https://example.com/retry.png">', retryOptions);
   check(attempts === 2, "prepare fetchCache: failed URL can be retried");
+  let flaky = 0;
+  await cached.prepare('<img src="https://example.com/flaky.png">', { images: { fetch: async () => new Response(++flaky < 3 ? "busy" : png, { status: flaky < 3 ? 503 : 200 }) } });
+  check(flaky === 3, "prepare fetch: a 503 is retried, at most three attempts (takumi helpers fetchOk)");
   const abort = new AbortController();
   const pending = cached.prepare('<img src="https://example.com/pending.png">', { signal: abort.signal, images: { fetch: () => new Promise(() => {}) } });
   abort.abort(new Error("resource preparation cancelled"));

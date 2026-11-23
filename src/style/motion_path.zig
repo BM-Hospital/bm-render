@@ -6,20 +6,51 @@ const data = @import("../svg/pathdata.zig");
 const measure = @import("../raster/path_measure.zig");
 const Env = @import("values.zig").Env;
 
+/// A shape whose reference box is only known per element: in paged output (takumi-pdf lays
+/// content out on a viewport of unbounded height) `offset-path` resolves against the viewport
+/// width and the element's own border-box height (takumi `local_transform`: the query
+/// container, else the viewport size, else the element). Each height is measured once.
+pub const Lazy = struct {
+    a: std.mem.Allocator,
+    shape: ?c.BasicShape,
+    dpr: f32,
+    width: f32,
+    entries: std.ArrayList(struct { h: f32, m: ?*const measure.Measure }) = .empty,
+
+    fn get(l: *Lazy, h: f32) ?*const measure.Measure {
+        for (l.entries.items) |e| if (e.h == h) return e.m;
+        const m = build(l.a, l.shape, l.dpr, l.width, h) catch return null;
+        l.entries.append(l.a, .{ .h = h, .m = m }) catch {};
+        return m;
+    }
+};
+
+/// Without a viewport height (`env.vh_unbounded`) the reference box takes the element's (see `Lazy`).
 pub fn compile(a: std.mem.Allocator, shape: ?c.BasicShape, ray: ?c.MotionRay, env: Env) !*const c.MotionPath {
+    const paged = env.vh_unbounded;
     const out = try a.create(c.MotionPath);
-    out.* = .{ .ray = ray, .reference = .{ env.vw, env.vh } };
+    out.* = .{ .ray = ray, .reference = .{ env.vw, if (paged) 0 else env.vh } };
     if (ray != null) return out;
-    const w = env.vw;
-    const h = env.vh;
+    const by_height = if (shape) |sh| sh != .path else true;
+    if (paged and by_height) {
+        const lazy = try a.create(Lazy);
+        lazy.* = .{ .a = a, .shape = shape, .dpr = env.dpr, .width = env.vw };
+        out.lazy = lazy;
+        return out;
+    }
+    out.measured = try build(a, shape, env.dpr, env.vw, env.vh);
+    return out;
+}
+
+fn build(a: std.mem.Allocator, shape: ?c.BasicShape, dpr: f32, w: f32, h: f32) !?*const measure.Measure {
     var p: raster.Path = .empty;
     defer p.deinit(a);
     if (shape) |sh| switch (sh) {
         .path => |v| {
             try data.parse(a, v.d, &p, null);
             for (p.points.items) |*point| {
-                point.x *= env.dpr;
-                point.y *= env.dpr;
+                point.x *= dpr;
+                point.y *= dpr;
             }
         },
         .polygon => |v| if (v.points.len > 0) {
@@ -50,8 +81,7 @@ pub fn compile(a: std.mem.Allocator, shape: ?c.BasicShape, ray: ?c.MotionRay, en
     } else try data.rect(a, &p, 0, 0, w, h, 0, 0);
     const m = try a.create(measure.Measure);
     m.* = .{};
-    if (try m.build(a, &p)) out.measured = m;
-    return out;
+    return if (try m.build(a, &p)) m else null;
 }
 
 fn radius(r: c.ShapeRadius, x: f32, full: f32) f32 {
@@ -64,7 +94,7 @@ fn radius(r: c.ShapeRadius, x: f32, full: f32) f32 {
 
 pub fn sample(cs: *const c.ComputedStyle, w: f32, h: f32) ?measure.Sample {
     const path = cs.offset_path orelse return null;
-    if (path.measured) |m| {
+    if (if (path.lazy) |lazy| lazy.get(h) else path.measured) |m| {
         const distance: f64 = cs.offset_distance.resolve(@floatCast(m.length));
         const at = if (m.closed) @mod(distance, m.length) else distance;
         return m.sampleCss(at);

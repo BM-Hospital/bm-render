@@ -103,7 +103,13 @@ pub const Prop = enum(u8) {
     font_size,
     font_family,
     font_weight,
+    font_style,
+    font_stretch,
+    font_variant,
+    letter_spacing,
+    word_spacing,
     text_anchor,
+    dominant_baseline,
     text_decoration,
     text_decoration_line,
     color_interpolation_filters,
@@ -124,6 +130,8 @@ pub const Prop = enum(u8) {
     image_rendering,
     mix_blend_mode,
     isolation,
+    alignment_baseline,
+    baseline_shift,
     // shorthand, expanded at parse time
     marker,
 

@@ -299,6 +299,64 @@ test "simple path (complex = false) equals the complex path for Latin" {
     }
 }
 
+test "text-overflow hides what overflows at the visual end of a line that mixes directions" {
+    // "abc <ar1> <ar2> def ghi" in a left-to-right line shows "abc <ar2> <ar1> def ghi": the
+    // right end goes first, so <ar1> (logically first, visually right) goes before <ar2>
+    // (CSS Overflow 3; Blink LineTruncator, takumi). A logical cut kept <ar1> instead.
+    var fc = try collection(t.allocator);
+    defer fc.deinit(t.allocator);
+    const st: font.TextStyle = .{ .families = &.{ "Inter", "Noto Naskh Arabic" }, .size = 20 };
+    const s = "abc \u{645}\u{631}\u{62d}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645} def ghi";
+    const ar1: [2]u32 = .{ 4, 14 };
+    const ar2: [2]u32 = .{ 15, 29 };
+    var inside = false;
+    var w: f32 = 40;
+    while (w < 260) : (w += 4) {
+        var l = try font.layoutText(t.allocator, &fc, &.{.{ .text = s, .style = st }}, .{ .max_width = w, .white_space = .nowrap, .ellipsis = true });
+        defer l.deinit(t.allocator);
+        var kept1 = false;
+        var kept2: usize = 0;
+        var n2: usize = 0;
+        // (the last glyph is the marker)
+        for (l.glyphs[0 .. l.glyphs.len - 1]) |g| {
+            if (g.cluster >= ar1[0] and g.cluster < ar1[1]) kept1 = true;
+            if (g.cluster >= ar2[0] and g.cluster < ar2[1]) kept2 += 1;
+        }
+        var full = try font.layoutText(t.allocator, &fc, &.{.{ .text = s, .style = st }}, .{ .white_space = .nowrap });
+        defer full.deinit(t.allocator);
+        for (full.glyphs) |g| if (g.cluster >= ar2[0] and g.cluster < ar2[1]) {
+            n2 += 1;
+        };
+        if (kept1) try t.expectEqual(n2, kept2);
+        if (kept2 != 0 and !kept1) inside = true;
+    }
+    try t.expect(inside);
+}
+
+test "letter-spacing in a cursive script still applies at its word separators" {
+    // CSS Text 4 §8.2.1 (Blink / takumi ShapeResultSpacing): none between Arabic letters, but
+    // the space (and a no-break space) between two Arabic words is spaced
+    var fc = try collection(t.allocator);
+    defer fc.deinit(t.allocator);
+    const st: font.TextStyle = .{ .families = &.{"Noto Naskh Arabic"}, .size = 36, .rtl = true };
+    var spaced = st;
+    spaced.letter_spacing = 10;
+    for ([_][]const u8{ "\u{645}\u{631}\u{62d}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}", "\u{645}\u{631}\u{62d}\u{628}\u{627}\u{a0}\u{628}\u{627}" }) |s| {
+        var a = try font.Paragraph.init(t.allocator, &fc, &.{.{ .text = s, .style = st }}, .{});
+        defer a.deinit();
+        var b = try font.Paragraph.init(t.allocator, &fc, &.{.{ .text = s, .style = spaced }}, .{});
+        defer b.deinit();
+        try t.expectEqual(a.glyphs.len, b.glyphs.len);
+        var spaces: usize = 0;
+        for (a.glyphs, b.glyphs) |x, y| {
+            const sep = s[x.cluster] == ' ' or std.mem.startsWith(u8, s[x.cluster..], "\u{a0}");
+            if (sep) spaces += 1;
+            try t.expectApproxEqAbs(x.x_advance + @as(f32, if (sep) 10 else 0), y.x_advance, 0.01);
+        }
+        try t.expectEqual(@as(usize, 1), spaces);
+    }
+}
+
 test "features: user settings, letter-spacing, language" {
     var fc = try collection(t.allocator);
     defer fc.deinit(t.allocator);

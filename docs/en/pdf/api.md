@@ -263,6 +263,7 @@ mutually exclusive. Every option is optional.
 | `tagged` | `boolean \| "ua1" \| "ua2"` | `true` | Structure tree; `"ua1"` / `"ua2"` also validate PDF/UA-1 / PDF/UA-2. | [Tagged PDF](accessibility.md#tagged-pdf), [PDF/UA](accessibility.md#pdfua) |
 | `pdfa` | `"2a" \| "2b" \| "2u" \| "3a" \| "3b" \| "3u" \| "4" \| "4f"` | none | PDF/A level, validated; a violation fails the render. | [PDF/A](accessibility.md#pdfa) |
 | `signal` | `AbortSignal` | none | Checked before the render reads and draws the document. | [Errors](#errors) |
+| `limits` | `Limits` | built-in caps | bm-render resource limits for untrusted input (`maxImagePixels`, `maxImageBytes`, `maxAnimationFrames`, `maxNodeDepth`; `maxCanvasPixels` does not apply to pages). Also a `PdfRenderer` constructor option; a call can only lower it. An image over a limit fails the render with `image exceeds limits.<name>`. | [Resource limits](../image/api.md#resource-limits-for-untrusted-input) |
 
 Combinations of `pdfa`, `tagged` and `attachments` that no PDF version allows are type errors and run
 time errors; the table is in [Versions and combinations](accessibility.md#versions-and-combinations).
@@ -271,7 +272,7 @@ An unknown option name is ignored, so check spelling: `{ sise: "a4" }` renders A
 ## Measure options
 
 `PdfMeasureOptions` takes `size` and `landscape`, or `viewport`, plus the layout resources `fonts`,
-`images`, `css`, `cssVariables`, `fontFamilies`, `lang` and `signal`. The types leave out `margin`,
+`images`, `css`, `cssVariables`, `fontFamilies`, `lang`, `limits` and `signal`. The types leave out `margin`,
 bands and every output option, since they do not change the measured size; at run time a `margin` is
 accepted and ignored, but `viewport` together with `size` or `landscape` throws the same "mutually
 exclusive" error as `render`.

@@ -132,7 +132,9 @@ fn synthOf(p: *Painter, rcs: *const CS, g: *const font.PositionedGlyph) Synth {
     const fc = p.f.r.fonts.face(g.face);
     var s: Synth = .{ .italic = rcs.font_style != .normal and !fc.italic, .bold = rcs.font_weight >= 600 and fc.weight < 600, .colored = false };
     if (comptime pm.enable_color_glyphs) {
-        const k = color.glyphKind(&fc.font, g.gid);
+        // (the face's colour tables are cached: reading the table directory for every glyph
+        // was a quarter of the render time of long text)
+        const k = p.color_tables.get(g.face, &fc.font).kind(g.gid);
         // (bitmap-only builds draw COLR glyphs from their plain outlines)
         if (k == .bitmap_png or (pm.enable_color_fonts and k != .none)) s = .{ .italic = false, .bold = false, .colored = true };
     }

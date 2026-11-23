@@ -108,6 +108,8 @@ pub const MotionRay = struct {
 pub const MotionPath = struct {
     ray: ?MotionRay = null,
     measured: ?*const @import("../raster/path_measure.zig").Measure = null,
+    /// (paged output) a shape measured per element height: motion_path.zig `Lazy`
+    lazy: ?*@import("motion_path.zig").Lazy = null,
     reference: [2]f32,
 };
 pub const OffsetRotate = struct { mode: enum { auto, reverse, fixed } = .auto, angle: f32 = 0 };

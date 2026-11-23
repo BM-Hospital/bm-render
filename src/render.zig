@@ -40,6 +40,79 @@ pub const none: u32 = std.math.maxInt(u32);
 /// line containers add layout levels: the layout engine's own 512-level limit then fails first.
 pub const max_node_depth = 512;
 
+/// Largest output canvas (pixels) of a raster frame; one side is at most `max_canvas_side`.
+pub const max_canvas_pixels: u64 = 40_000_000;
+pub const max_canvas_side = 16384;
+
+/// Per-call resource limits for untrusted inputs (the `limits` render option). Every field starts at
+/// the built-in hard cap; the option can only lower them (`Limits.parse` clamps). Held by the
+/// `Renderer` for the duration of one call: calls on one renderer are serialised (native.zig), and
+/// different renderers share no limits.
+pub const Limits = struct {
+    /// width*height of one decoded raster image source (also each frame of an animated one).
+    image_pixels: u64 = Renderer.max_image_pixels,
+    /// Encoded byte size of one image source (raster or SVG; no built-in cap).
+    image_bytes: u64 = std.math.maxInt(u64),
+    /// Frames of one animated image source (GIF / WebP / APNG).
+    animation_frames: u32 = codec.anim.Animator.max_frames,
+    /// width*height of the output canvas (raster outputs, every frame of `renderAnimation`).
+    canvas_pixels: u64 = max_canvas_pixels,
+    /// Node nesting levels of the source (JSON tree or HTML).
+    node_depth: u32 = max_node_depth,
+
+    pub const Field = enum { image_pixels, image_bytes, animation_frames, canvas_pixels, node_depth };
+    const keys = [_]struct { []const u8, Field }{
+        .{ "maxImagePixels", .image_pixels },
+        .{ "maxImageBytes", .image_bytes },
+        .{ "maxAnimationFrames", .animation_frames },
+        .{ "maxCanvasPixels", .canvas_pixels },
+        .{ "maxNodeDepth", .node_depth },
+    };
+
+    /// The option name of `field` (for error messages).
+    pub fn name(field: Field) []const u8 {
+        inline for (keys) |k| if (k[1] == field) return k[0];
+        unreachable;
+    }
+
+    /// Parses the `limits` option value (null / absent = the defaults). On error.Invalid `msg` and
+    /// `detail` describe the problem.
+    pub fn parse(v: ?json.Value, msg: *[]const u8, detail: *[]const u8) error{Invalid}!Limits {
+        var l: Limits = .{};
+        const obj = v orelse return l;
+        if (obj == .null) return l;
+        if (obj != .object) {
+            msg.* = "limits must be an object";
+            detail.* = "";
+            return error.Invalid;
+        }
+        for (obj.object) |m| {
+            if (m.value == .null) continue;
+            const field = for (keys) |k| {
+                if (std.mem.eql(u8, k[0], m.key)) break k[1];
+            } else {
+                msg.* = "unknown limit: limits.";
+                detail.* = m.key;
+                return error.Invalid;
+            };
+            const n: f64 = if (m.value == .number) m.value.number else std.math.nan(f64);
+            if (!(n >= 1)) {
+                msg.* = "limit must be a number >= 1: limits.";
+                detail.* = m.key;
+                return error.Invalid;
+            }
+            const x: u64 = if (n >= 1.0e18) std.math.maxInt(u64) else @intFromFloat(@floor(n));
+            switch (field) {
+                inline else => |t| {
+                    const f = &@field(l, @tagName(t));
+                    f.* = @intCast(@min(x, f.*));
+                },
+            }
+        }
+        return l;
+    }
+};
+
 /// The layout tree with the optional features selected in config.zig (tables / floats compile out;
 /// a disabled table display lays out as a block, a disabled float as an in-flow block).
 pub const LTree = layout.TreeWith(.{ .tables = config.enable_tables, .floats = config.enable_floats, .inline_row = true, .inline_fn = true });
@@ -128,8 +201,22 @@ pub const RunIter = struct {
     line: usize = 0,
     seg: usize = 0,
     gi: u32 = 0,
+    /// The line whose start was handled (lines without segments).
+    entered: usize = std.math.maxInt(usize),
+    /// A right-to-left line's overflow marker sits visually first but is the line's last
+    /// logical item (takumi `LineTruncator`): PDF builds yield it after the line's other runs
+    /// (`marker_pending`: the rest of the line is being yielded, the marker comes next).
+    marker_pending: bool = false,
 
     pub const Run = struct { g0: u32, g1: u32, x0: f32, x1: f32, baseline: f32 };
+
+    /// The marker range of line `li` when it starts the line, else an empty range.
+    fn leadingMarker(tl: *const font.TextLayout, li: usize) [2]u32 {
+        const line = tl.lines[li];
+        if (comptime @TypeOf(line.marker0) == void) return .{ 0, 0 };
+        if (line.rtl and line.marker1 > line.marker0 and line.marker0 == line.glyph_start and line.marker1 < line.glyph_end) return .{ line.marker0, line.marker1 };
+        return .{ 0, 0 };
+    }
 
     pub fn next(it: *RunIter) ?Run {
         const tl = it.tl;
@@ -154,9 +241,24 @@ pub const RunIter = struct {
         }
         while (it.line < tl.lines.len) {
             const line = tl.lines[it.line];
-            const end = @min(line.glyph_end, gs.len);
-            if (it.gi < line.glyph_start) it.gi = line.glyph_start;
+            const line_end = @min(line.glyph_end, gs.len);
+            const mk = leadingMarker(tl, it.line);
+            if (it.entered != it.line) {
+                it.entered = it.line;
+                if (it.gi < line.glyph_start) it.gi = line.glyph_start;
+                if (mk[1] > mk[0] and it.gi <= mk[0]) {
+                    it.gi = mk[1];
+                    it.marker_pending = true;
+                }
+            }
+            // (the marker's own pass ends where the content starts)
+            const end = if (!it.marker_pending and mk[1] > mk[0]) mk[1] else line_end;
             if (it.gi >= end) {
+                if (it.marker_pending) {
+                    it.marker_pending = false;
+                    it.gi = mk[0];
+                    continue;
+                }
                 it.line += 1;
                 continue;
             }
@@ -164,7 +266,7 @@ pub const RunIter = struct {
             var ge = g0 + 1;
             while (ge < end and gs[ge].user == gs[g0].user and gs[ge].face == gs[g0].face) ge += 1;
             it.gi = ge;
-            return .{ .g0 = g0, .g1 = ge, .x0 = gs[g0].x, .x1 = if (ge < end) gs[ge].x else @max(gs[g0].x, line.x + line.width), .baseline = line.baseline };
+            return .{ .g0 = g0, .g1 = ge, .x0 = gs[g0].x, .x1 = if (ge < line_end) gs[ge].x else @max(gs[g0].x, line.x + line.width), .baseline = line.baseline };
         }
         return null;
     }
@@ -240,6 +342,8 @@ pub const Renderer = struct {
     time_ms: f32 = 0,
     /// Shape-plan cache (long-lived; plans reference font data: cleared with the fonts).
     shape_cache: font.ShapeCache,
+    /// Resource limits of the current call (the `limits` option; set when its options are parsed).
+    limits: Limits = .{},
 
     pub const glyph_budget: usize = 8 << 20;
     pub const image_budget: usize = 96 << 20;
@@ -859,6 +963,7 @@ pub const Renderer = struct {
     }
 
     fn parseOptions(self: *Renderer, text: []const u8) Error!Options {
+        self.limits = .{};
         if (text.len == 0) return .{};
         const v = json.parse(self.arena.allocator(), text) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -874,7 +979,9 @@ pub const Renderer = struct {
     /// long as `v`).
     fn optionsFrom(self: *Renderer, a: Allocator, v: json.Value, anim: bool) Error!Options {
         var o: Options = .{};
+        self.limits = .{};
         if (v != .object) return o;
+        try self.parseLimits(v.get("limits"));
         if (v.get("width")) |w| if (w.asNumber()) |n| {
             o.width = dimOpt(n);
         };
@@ -932,6 +1039,47 @@ pub const Renderer = struct {
         // `lossless` (webp is always lossless, like takumi-wasm), `drawDebugBorder` and `dithering`
         // are accepted and ignored.
         return o;
+    }
+
+    /// Sets `self.limits` from the `limits` option value (absent / null = the built-in caps).
+    pub fn parseLimits(self: *Renderer, v: ?json.Value) Error!void {
+        var msg: []const u8 = "";
+        var detail: []const u8 = "";
+        self.limits = Limits.parse(v, &msg, &detail) catch {
+            self.limits = .{};
+            self.setErr(msg, detail);
+            return error.Invalid;
+        };
+    }
+
+    /// The decoder limits of image sources under `self.limits`.
+    pub fn codecLimits(self: *const Renderer) codec.Limits {
+        return .{ .max_pixels = self.limits.image_pixels, .max_frames = self.limits.animation_frames };
+    }
+
+    /// The limit an encoded image source exceeds, if any: `limits.maxImageBytes`, or, read from the
+    /// headers (no pixel decoding), a lowered `limits.maxImagePixels` / `limits.maxAnimationFrames`.
+    /// null = within the limits (the decoders still enforce the pixel limit).
+    pub fn imageOverLimit(self: *const Renderer, bytes: []const u8) ?Limits.Field {
+        const lim = self.limits;
+        if (bytes.len > lim.image_bytes) return .image_bytes;
+        if (lim.image_pixels < max_image_pixels) if (codec.dimensions(bytes)) |d| {
+            if (@as(u64, d.w) * d.h > lim.image_pixels) return .image_pixels;
+        };
+        if (comptime config.enable_animation and config.enable_extra_codecs) {
+            if (lim.animation_frames < codec.anim.Animator.max_frames and codec.frameCount(bytes) > lim.animation_frames) return .animation_frames;
+        }
+        return null;
+    }
+
+    /// `imageOverLimit` for image source `src` (`bytes`: its encoded bytes, when it has any), also
+    /// covering raw RGBA `images` entries.
+    pub fn sourceOverLimit(self: *Renderer, src: []const u8, bytes: ?[]const u8) ?Limits.Field {
+        if (bytes) |b| return self.imageOverLimit(b);
+        if (std.mem.startsWith(u8, src, "data:")) return null;
+        const e = self.findImage(src) orelse return null;
+        if (e.width != 0 and @as(u64, e.width) * e.height > self.limits.image_pixels) return .image_pixels;
+        return null;
     }
 
     // ---- images
@@ -997,6 +1145,12 @@ pub const Renderer = struct {
             if (e.width != 0) raw = e;
         } else return null;
 
+        // `limits` (a source over them paints nothing, like one that fails to decode)
+        const lim = self.limits;
+        if (raw) |e| {
+            if (@as(u64, e.width) * e.height > lim.image_pixels) return null;
+        } else if (self.imageOverLimit(bytes) != null) return null;
+
         // (XxHash64: 64-bit multiplies only; Wyhash's 128-bit products are emulated on wasm32)
         const key = self.contentHash(bytes);
         if (comptime config.enable_animation and config.enable_extra_codecs) {
@@ -1004,7 +1158,10 @@ pub const Renderer = struct {
                 if (self.animatedFrame(key, bytes)) |pm| return pm;
             }
         }
-        if (self.cacheLookup(key, 0, 0)) |pm| return pm;
+        if (self.cacheLookup(key, 0, 0)) |pm| {
+            // (decoded by an earlier call under looser limits)
+            return if (@as(u64, pm.width) * pm.height > lim.image_pixels) null else pm;
+        }
 
         var pm: raster.Pixmap = undefined;
         if (raw) |e| {
@@ -1014,9 +1171,10 @@ pub const Renderer = struct {
         } else {
             if (codec.sniff(bytes) == .unknown) return null; // SVG, text, unsupported formats
             if (std.mem.indexOfScalar(u64, self.img_failed.items, key) != null) return null;
-            const img = codec.decodeEx(self.gpa, bytes, .{ .max_pixels = max_image_pixels }, codec.build_decoders) catch |err| {
-                // (out of memory may pass: only a decoder's verdict on the bytes is remembered)
-                if (err != error.OutOfMemory) {
+            const img = codec.decodeEx(self.gpa, bytes, self.codecLimits(), codec.build_decoders) catch |err| {
+                // (out of memory may pass: only a decoder's verdict on the bytes is remembered; a size
+                // verdict under lowered limits is not the bytes' own)
+                if (err != error.OutOfMemory and !(err == error.ImageTooLarge and lim.image_pixels < max_image_pixels)) {
                     if (self.img_failed.items.len >= 1024) self.img_failed.clearRetainingCapacity();
                     self.img_failed.append(self.gpa, key) catch {};
                 }
@@ -1039,7 +1197,7 @@ pub const Renderer = struct {
     noinline fn animatedFrame(self: *Renderer, key: u64, bytes: []const u8) ?*const raster.Pixmap {
         const n = codec.frameCount(bytes);
         if (n <= 1) return null;
-        const limits: codec.Limits = .{ .max_pixels = max_image_pixels };
+        const limits = self.codecLimits();
         // pass 1: frame delays -> total loop duration -> frame index
         var delays: std.ArrayList(u32) = .empty;
         defer delays.deinit(self.gpa);
@@ -1063,7 +1221,7 @@ pub const Renderer = struct {
         }
         if (idx == 0) return null;
         const fkey = key ^ (@as(u64, idx) *% 0x9E3779B97F4A7C15);
-        if (self.cacheLookup(fkey, 0, 0)) |pm| return pm;
+        if (self.cacheLookup(fkey, 0, 0)) |pm| return if (@as(u64, pm.width) * pm.height > limits.max_pixels) null else pm;
         const fr = codec.decodeFrame(self.gpa, bytes, idx, limits) catch return null;
         premultiply(fr.image.data);
         var pm: raster.Pixmap = .{ .width = fr.image.width, .height = fr.image.height, .data = fr.image.data };
@@ -1077,16 +1235,18 @@ pub const Renderer = struct {
     /// `<svg`), a `data:` URI (base64 or percent-encoded, decoded into the per-render arena) or an
     /// `images` option entry, when the bytes sniff as SVG. null when SVG support is compiled out.
     /// The slice is valid for the current render.
+    /// Markup over `limits.maxImageBytes` paints nothing.
     pub fn resolveSvg(self: *Renderer, src: []const u8) ?[]const u8 {
         if (comptime !config.enable_svg) return null;
-        if (std.mem.startsWith(u8, src, "data:")) {
-            const b = decodeDataUri(self.arena.allocator(), src) orelse return null;
-            return if (svgm.looksLikeSvg(b)) b else null;
-        }
-        if (svgm.looksLikeSvg(src)) return src;
-        const e = self.findImage(src) orelse return null;
-        if (e.width != 0) return null;
-        return if (svgm.looksLikeSvg(e.data)) e.data else null;
+        const markup = blk: {
+            if (std.mem.startsWith(u8, src, "data:")) break :blk decodeDataUri(self.arena.allocator(), src) orelse return null;
+            if (svgm.looksLikeSvg(src)) return if (src.len > self.limits.image_bytes) null else src;
+            const e = self.findImage(src) orelse return null;
+            if (e.width != 0) return null;
+            break :blk e.data;
+        };
+        if (!svgm.looksLikeSvg(markup) or markup.len > self.limits.image_bytes) return null;
+        return markup;
     }
 
     /// Alias of `resolveSvg` (the name paint_svg.zig probes for).
@@ -1595,6 +1755,7 @@ pub const Frame = struct {
             .dpr = o.dpr,
             .viewport_w = if (o.width) |w| @floatFromInt(w) else 0,
             .viewport_h = if (o.height) |h| @floatFromInt(h) else 0,
+            .viewport_h_unbounded = o.height == null,
             .root_font_size = 16 * o.dpr,
         };
         // (the paged-output properties are computed for the frames a PDF is drawn from only)
@@ -1609,12 +1770,12 @@ pub const Frame = struct {
             f.ctx.viewport_w = u[0];
             f.ctx.viewport_h = u[1];
         };
-        f.dom = .{ .lang = o.lang, .max_depth = max_node_depth };
+        f.dom = .{ .lang = o.lang, .max_depth = @min(max_node_depth, f.r.limits.node_depth) };
         switch (kind) {
             .json => {
                 const v = f.pre orelse json.parse(f.a, source) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.JsonTooDeep => return f.fail("node tree is nested too deeply", ""),
+                    error.JsonTooDeep => return f.tooDeep(),
                     else => return f.fail("invalid node JSON", ""),
                 };
                 f.dom.fromJson(f.a, v) catch |e| return f.domError(e);
@@ -1623,7 +1784,7 @@ pub const Frame = struct {
                 if (comptime !config.enable_html) return f.fail("HTML input is not supported by this build", "");
                 const doc = html.parse(f.a, source) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.TooDeep => return f.fail("node tree is nested too deeply", ""),
+                    error.TooDeep => return f.tooDeep(),
                 };
                 f.dom.fromHtml(f.a, html, &doc) catch |e| return f.domError(e);
             },
@@ -1735,7 +1896,8 @@ pub const Frame = struct {
             f.canvas_h = @intFromFloat(@min(ch, 16384));
             return;
         };
-        if (cw > 16384 or ch > 16384 or cw * ch > 40.0e6) return f.fail("canvas too large", "");
+        if (cw > max_canvas_side or ch > max_canvas_side or cw * ch > @as(f32, @floatFromInt(max_canvas_pixels))) return f.fail("canvas too large", "");
+        if (@as(u64, @intFromFloat(cw)) * @as(u64, @intFromFloat(ch)) > f.r.limits.canvas_pixels) return f.fail("canvas exceeds limits.", Limits.name(.canvas_pixels));
         f.canvas_w = @intFromFloat(cw);
         f.canvas_h = @intFromFloat(ch);
     }
@@ -1818,8 +1980,16 @@ pub const Frame = struct {
     fn domError(f: *Frame, e: dom_mod.Error) Error {
         return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            error.Invalid => f.fail(f.dom.err_msg, f.dom.err_detail),
+            error.Invalid => if (std.mem.eql(u8, f.dom.err_msg, too_deep)) f.tooDeep() else f.fail(f.dom.err_msg, f.dom.err_detail),
         };
+    }
+
+    const too_deep = "node tree is nested too deeply";
+
+    /// The source nests deeper than the engine takes (or than a lowered `limits.maxNodeDepth`).
+    fn tooDeep(f: *Frame) Error {
+        if (f.r.limits.node_depth < max_node_depth) return f.fail("node tree exceeds limits.", Limits.name(.node_depth));
+        return f.fail(too_deep, "");
     }
 
     fn nonEmpty(v: ?json.Value) bool {
@@ -3258,6 +3428,12 @@ pub const Frame = struct {
                 st.breaks.page = @import("pdf/page_names.zig").idOf(f, n.el);
             };
         }
+        if (comptime config.enable_pdf) {
+            if (@import("pdf/markers.zig").besideBaseline(f, id)) {
+                st.position = .absolute;
+                st.list_marker = true;
+            }
+        }
         if (n.el != none) {
             if (comptime config.enable_tables) tableSpans(&f.dom, n.el, &st);
             if (n.parent != none and (st.grid_column.start == .auto or st.grid_column.end == .auto or st.grid_row.start == .auto or st.grid_row.end == .auto)) {
@@ -3590,7 +3766,8 @@ pub const Frame = struct {
             f.tree.paged.height_fn = o.page_height_fn;
             f.tree.paged.height_ctx = o.ctx;
             if (f.tree.has_floats) if (o.start) |start| if (o.start_top) |page_top| {
-                if (start.branches.len == 0 and start.node < f.lid_node.items.len) {
+                // (not a first line a float continuing above it pushed onto the page: it stays below the float)
+                if (start.branches.len == 0 and !(start.line == 0 and start.side_flows.len > 0) and start.node < f.lid_node.items.len) {
                     const id = f.lid_node.items[start.node];
                     if (id != none) {
                         const n = &f.nodes.items[id];
@@ -3619,8 +3796,15 @@ pub const Frame = struct {
             const reflow_floats = f.tree.has_floats and o.start == null;
             const previous_y: []f32 = if (reflow_floats) try f.a.alloc(f32, f.tree.nodes.items.len) else &.{};
             const previous_h: []f32 = if (reflow_floats) try f.a.alloc(f32, f.tree.nodes.items.len) else &.{};
+            // (the block offset of each paragraph's content box before the breaks move it)
+            const previous_text: []f32 = if (reflow_floats) try f.a.alloc(f32, f.tree.nodes.items.len) else &.{};
             var attempts: u32 = 0;
             while (true) {
+                if (reflow_floats) for (previous_text, 0..) |*y, lid| {
+                    y.* = std.math.nan(f32);
+                    const id = if (lid < f.lid_node.items.len) f.lid_node.items[lid] else none;
+                    if (id != none and f.nodes.items[id].para != null) y.* = f.contentTop(@intCast(lid));
+                };
                 if (reflow_floats) for (f.tree.nodes.items, 0..) |nd, lid| {
                     if (nd.style.float != .none) {
                         const before = f.tree.layout(@intCast(lid));
@@ -3680,6 +3864,14 @@ pub const Frame = struct {
                     f.tree.paged.float_shifts[lid] += delta;
                     changed = true;
                 };
+                // A paragraph moved down whole or in part (orphans / widows, a break between its
+                // lines) beside floats: its moved lines wrap against the floats where they land
+                // (takumi lays them out there), so they are laid out again with that offset
+                // (`PagedState.inline_resume`, one paragraph per document).
+                if (!changed and reflow_floats and f.tree.paged.inline_resume == null) if (try f.floatShiftedParagraph(&pages, previous_text)) |resumed| {
+                    f.tree.paged.inline_resume = resumed;
+                    changed = true;
+                };
                 if (changed) {
                     pages.deinit(f.a);
                     attempts += 1;
@@ -3693,6 +3885,76 @@ pub const Frame = struct {
                 return &f.tree.paged.pages.?;
             }
         } else return f.fail("paged layout is not supported by this build", "");
+    }
+
+    /// The first paragraph whose lines `pages` moves down (`Pages.line_shifts`) into or out of the
+    /// block range of a float beside it, as an `inline_resume` laying those lines out against the
+    /// floats where they land; null: none.
+    fn floatShiftedParagraph(f: *Frame, pages: *const layout.fragment.Pages, previous_text: []const f32) Error!?@TypeOf(f.tree.paged.inline_resume.?) {
+        if (comptime !layout.fragment.enabled) return null;
+        const eps = 1.0 / 64.0;
+        const t = &f.tree;
+        // (paragraphs the breaks moved whole: a box moved down with all its lines)
+        var moved: std.ArrayList(layout.fragment.LineShift) = .empty;
+        defer moved.deinit(f.a);
+        for (previous_text, 0..) |before, lid| {
+            if (!(before == before)) continue;
+            const dy = f.contentTop(@intCast(lid)) - before;
+            if (dy > eps) try moved.append(f.a, .{ .node = @intCast(lid), .first_line = 0, .dy = dy });
+        }
+        for ([_][]const layout.fragment.LineShift{ moved.items, pages.line_shifts }) |list| for (list) |sh| {
+            if (!(sh.dy > eps) or sh.node >= f.lid_node.items.len) continue;
+            const id = f.lid_node.items[sh.node];
+            if (id == none) continue;
+            const tl = f.nodes.items[id].tl orelse continue;
+            if (sh.first_line >= tl.lines.len) continue;
+            // (floats among the paragraph's own lines move with them)
+            var own_float = false;
+            var child = t.nodes.items[sh.node].first_child;
+            while (child < t.nodes.items.len) : (child = t.nodes.items[child].next_sibling) {
+                if (t.nodes.items[child].style.float != .none) own_float = true;
+            }
+            if (own_float) continue;
+            const box = t.layout(sh.node);
+            // (where the lines were laid out: before the breaks moved the box)
+            const top = if (list.ptr == moved.items.ptr) previous_text[sh.node] else f.contentTop(sh.node);
+            var left = box.x + box.border.left + box.padding.left;
+            var parent = t.nodes.items[sh.node].parent;
+            while (parent < t.nodes.items.len) : (parent = t.nodes.items[parent].parent) left += t.layout(parent).x;
+            const right = left + box.w - box.border.left - box.border.right - box.padding.left - box.padding.right;
+            for (t.nodes.items, 0..) |nd, lid| {
+                if (nd.style.float == .none or nd.style.display == .none) continue;
+                const fb = t.layout(@intCast(lid));
+                var fy = fb.y - @max(fb.margin.top, 0);
+                var fx = fb.x;
+                var anc = nd.parent;
+                while (anc < t.nodes.items.len) : (anc = t.nodes.items[anc].parent) {
+                    fy += t.layout(anc).y;
+                    fx += t.layout(anc).x;
+                }
+                const fy1 = fy + @max(fb.margin.top, 0) + fb.h + @max(fb.margin.bottom, 0);
+                // (beside the paragraph: its inline range meets the float's)
+                if (fx + fb.w <= left + eps or fx >= right - eps) continue;
+                for (tl.lines[sh.first_line..]) |ln| {
+                    const y0 = top + ln.top;
+                    const y1 = y0 + @max(ln.height, eps);
+                    const before = y1 > fy + eps and y0 < fy1 - eps;
+                    const after = y1 + sh.dy > fy + eps and y0 + sh.dy < fy1 - eps;
+                    if (before != after) return .{ .node = sh.node, .from_y = tl.lines[sh.first_line].top, .dy = sh.dy };
+                }
+            }
+        };
+        return null;
+    }
+
+    /// Block offset of the content box of layout node `lid` in the frame.
+    fn contentTop(f: *const Frame, lid: u32) f32 {
+        const t = &f.tree;
+        const box = t.layout(lid);
+        var top = box.y + box.border.top + box.padding.top;
+        var parent = t.nodes.items[lid].parent;
+        while (parent < t.nodes.items.len) : (parent = t.nodes.items[parent].parent) top += t.layout(parent).y;
+        return top;
     }
 
     fn recomputePaged(f: *Frame) Error!void {
@@ -4227,6 +4489,7 @@ pub fn textStyle(cs: *const CS, user: u32) font.TextStyle {
     var ts: font.TextStyle = .{
         .unicode_bidi = @fromBackingInt(@intCast(@backingInt(cs.unicode_bidi))),
         .rtl = cs.direction == .rtl,
+        .no_hyphens = cs.hyphens == .none,
         .families = cs.font_family,
         .weight = cs.font_weight,
         .italic = cs.font_style != .normal,
@@ -5235,6 +5498,184 @@ test "renderAnimation: frame schedule, formats, errors; ico output" {
     const ico = try r.render(scene, "{\"width\":8,\"height\":8,\"format\":\"ico\"}");
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 1, 0, 1, 0, 8, 8 }, ico[0..8]);
     try std.testing.expectError(error.Invalid, r.render(scene, "{\"width\":300,\"height\":8,\"format\":\"ico\"}"));
+}
+
+// ---- limits option
+
+test "limits: parsing clamps to the built-in caps; bad values and unknown names fail" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var msg: []const u8 = "";
+    var detail: []const u8 = "";
+    const d = try Limits.parse(null, &msg, &detail);
+    try std.testing.expectEqual(Renderer.max_image_pixels, d.image_pixels);
+    try std.testing.expectEqual(@as(u32, 10000), d.animation_frames);
+    try std.testing.expectEqual(@as(u64, 40_000_000), d.canvas_pixels);
+    try std.testing.expectEqual(@as(u32, 512), d.node_depth);
+    const l = try Limits.parse(try json.parse(a,
+        \\{"maxImagePixels":1000.7,"maxImageBytes":5000,"maxAnimationFrames":1e12,"maxCanvasPixels":1e30,"maxNodeDepth":32,"maxImagePixels":2000}
+    ), &msg, &detail);
+    // (every member applies and can only lower: a duplicate keeps the lowest value)
+    try std.testing.expectEqual(@as(u64, 1000), l.image_pixels);
+    try std.testing.expectEqual(@as(u64, 5000), l.image_bytes);
+    try std.testing.expectEqual(@as(u32, 10000), l.animation_frames);
+    try std.testing.expectEqual(@as(u64, 40_000_000), l.canvas_pixels);
+    try std.testing.expectEqual(@as(u32, 32), l.node_depth);
+    const null_member = try Limits.parse(try json.parse(a, "{\"maxNodeDepth\":null}"), &msg, &detail);
+    try std.testing.expectEqual(@as(u32, 512), null_member.node_depth);
+    for ([_][2][]const u8{
+        .{ "{\"maxPixels\":5}", "unknown limit: limits.maxPixels" },
+        .{ "{\"maxNodeDepth\":0}", "limit must be a number >= 1: limits.maxNodeDepth" },
+        .{ "{\"maxNodeDepth\":\"5\"}", "limit must be a number >= 1: limits.maxNodeDepth" },
+        .{ "[1]", "limits must be an object" },
+    }) |c| {
+        try std.testing.expectError(error.Invalid, Limits.parse(try json.parse(a, c[0]), &msg, &detail));
+        var buf: [96]u8 = undefined;
+        try std.testing.expectEqualStrings(c[1], try std.fmt.bufPrint(&buf, "{s}{s}", .{ msg, detail }));
+    }
+    // through the render options: an invalid `limits` fails the call
+    const r = Renderer.create(gpa).?;
+    defer r.destroy();
+    const node = "{\"type\":\"container\",\"style\":{\"width\":4,\"height\":4}}";
+    try std.testing.expectError(error.Invalid, r.render(node, "{\"limits\":{\"maxWidth\":4}}"));
+    try std.testing.expectEqualStrings("unknown limit: limits.maxWidth", r.err);
+    _ = try r.render(node, "{\"limits\":{\"maxNodeDepth\":4}}");
+    try std.testing.expectEqual(@as(u32, 4), r.limits.node_depth);
+    // a call without `limits` is back at the built-in caps
+    _ = try r.render(node, "{}");
+    try std.testing.expectEqual(@as(u32, 512), r.limits.node_depth);
+    _ = try r.render(node, "");
+    try std.testing.expectEqual(@as(u32, 512), r.limits.node_depth);
+}
+
+test "limits: image sources over maxImagePixels / maxImageBytes are skipped; the cache does not leak them" {
+    const gpa = std.testing.allocator;
+    const r = Renderer.create(gpa).?;
+    defer r.destroy();
+    var rgba: [10 * 10 * 4]u8 = undefined;
+    for (0..100) |i| rgba[i * 4 ..][0..4].* = .{ 255, 0, 0, 255 };
+    const png = try codec.encodePng(gpa, &rgba, 10, 10, .{});
+    defer gpa.free(png);
+    try r.putImage("img", png, 0, 0, false);
+    try r.putImage("raw", &rgba, 10, 10, false);
+    const Case = struct { opts: []const u8, img: bool, raw: bool };
+    for ([_]Case{
+        .{ .opts = "{}", .img = true, .raw = true },
+        // decoded and cached by the call above: still refused under the lower limit
+        .{ .opts = "{\"limits\":{\"maxImagePixels\":99}}", .img = false, .raw = false },
+        .{ .opts = "{\"limits\":{\"maxImagePixels\":100}}", .img = true, .raw = true },
+        .{ .opts = "{\"limits\":{\"maxImageBytes\":10}}", .img = false, .raw = true },
+        .{ .opts = "{}", .img = true, .raw = true },
+    }) |c| {
+        r.beginCall();
+        _ = try r.parseOptions(c.opts);
+        try std.testing.expectEqual(c.img, r.resolveImage("img") != null);
+        try std.testing.expectEqual(c.raw, r.resolveImage("raw") != null);
+    }
+    // never decoded before: refused by the decoder (header check) and not remembered as broken
+    const r2 = Renderer.create(gpa).?;
+    defer r2.destroy();
+    try r2.putImage("img", png, 0, 0, false);
+    r2.beginCall();
+    _ = try r2.parseOptions("{\"limits\":{\"maxImagePixels\":50}}");
+    try std.testing.expect(r2.resolveImage("img") == null);
+    try std.testing.expectEqual(@as(usize, 0), r2.img_failed.items.len);
+    r2.beginCall();
+    _ = try r2.parseOptions("{}");
+    try std.testing.expect(r2.resolveImage("img") != null);
+    // the image box of a skipped source stays empty, the render succeeds
+    const out = try r.render("{\"type\":\"image\",\"src\":\"img\",\"style\":{\"width\":10,\"height\":10}}", "{\"width\":10,\"height\":10,\"format\":\"raw\",\"limits\":{\"maxImagePixels\":64}}");
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, out[0..4]);
+    const ok = try r.render("{\"type\":\"image\",\"src\":\"img\",\"style\":{\"width\":10,\"height\":10}}", "{\"width\":10,\"height\":10,\"format\":\"raw\"}");
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, ok[0..4]);
+}
+
+test "limits: maxImageBytes applies to SVG sources" {
+    if (comptime !config.enable_svg) return error.SkipZigTest;
+    const r = Renderer.create(std.testing.allocator).?;
+    defer r.destroy();
+    const svg = "<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
+    r.beginCall();
+    _ = try r.parseOptions("{}");
+    try std.testing.expect(r.resolveSvg(svg) != null);
+    _ = try r.parseOptions("{\"limits\":{\"maxImageBytes\":20}}");
+    try std.testing.expect(r.resolveSvg(svg) == null);
+    try std.testing.expect(r.resolveSvg("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='4'%20height='4'/%3E") == null);
+}
+
+test "limits: maxAnimationFrames (header frame count)" {
+    if (comptime !(config.enable_animation and config.enable_extra_codecs)) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const r = Renderer.create(gpa).?;
+    defer r.destroy();
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(gpa);
+    try file.appendSlice(gpa, "GIF89a\x01\x00\x01\x00\x00\x00\x00");
+    for (0..5) |_| try file.appendSlice(gpa, &.{ 0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 1, 0x05, 0 });
+    try file.append(gpa, 0x3b);
+    r.beginCall();
+    _ = try r.parseOptions("{\"limits\":{\"maxAnimationFrames\":5}}");
+    try std.testing.expectEqual(@as(?Limits.Field, null), r.imageOverLimit(file.items));
+    _ = try r.parseOptions("{\"limits\":{\"maxAnimationFrames\":4}}");
+    try std.testing.expectEqual(@as(?Limits.Field, .animation_frames), r.imageOverLimit(file.items));
+    try std.testing.expectEqual(@as(u32, 4), r.codecLimits().max_frames);
+}
+
+test "limits: maxCanvasPixels and maxNodeDepth fail the render with a clear error" {
+    const r = Renderer.create(std.testing.allocator).?;
+    defer r.destroy();
+    const node = "{\"type\":\"container\",\"style\":{\"width\":100,\"height\":100}}";
+    _ = try r.render(node, "{\"limits\":{\"maxCanvasPixels\":10000}}");
+    try std.testing.expectError(error.Invalid, r.render(node, "{\"limits\":{\"maxCanvasPixels\":9999}}"));
+    try std.testing.expectEqualStrings("canvas exceeds limits.maxCanvasPixels", r.err);
+    try std.testing.expectError(error.Invalid, r.render(node, "{\"width\":200,\"height\":100,\"limits\":{\"maxCanvasPixels\":10000}}"));
+    try std.testing.expectEqualStrings("canvas exceeds limits.maxCanvasPixels", r.err);
+    // 3 levels pass a limit of 3; 4 do not
+    const deep = "{\"type\":\"container\",\"style\":{\"width\":4,\"height\":4},\"children\":[{\"type\":\"container\",\"children\":[{\"type\":\"container\"}]}]}";
+    _ = try r.render(deep, "{\"limits\":{\"maxNodeDepth\":3}}");
+    try std.testing.expectError(error.Invalid, r.render(deep, "{\"limits\":{\"maxNodeDepth\":2}}"));
+    try std.testing.expectEqualStrings("node tree exceeds limits.maxNodeDepth", r.err);
+    if (comptime config.enable_html) {
+        try std.testing.expectError(error.Invalid, r.renderSource(.html, "<div style='width:4px;height:4px'><p><b>x</b></p></div>", "{\"limits\":{\"maxNodeDepth\":2}}"));
+        try std.testing.expectEqualStrings("node tree exceeds limits.maxNodeDepth", r.err);
+    }
+    // (the built-in cap keeps its message)
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    for (0..max_node_depth + 1) |_| try buf.appendSlice(std.testing.allocator, "{\"type\":\"container\",\"children\":[");
+    for (0..max_node_depth + 1) |_| try buf.appendSlice(std.testing.allocator, "]}");
+    try std.testing.expectError(error.Invalid, r.render(buf.items, "{\"width\":4,\"height\":4}"));
+    try std.testing.expectEqualStrings("node tree is nested too deeply", r.err);
+}
+
+test "limits: renderAnimation frames obey maxCanvasPixels" {
+    if (comptime !config.enable_animation) return error.SkipZigTest;
+    const r = Renderer.create(std.testing.allocator).?;
+    defer r.destroy();
+    const j = "{\"scenes\":[{\"node\":{\"type\":\"container\"},\"durationMs\":100}],\"width\":8,\"height\":8,\"fps\":10,\"limits\":{\"maxCanvasPixels\":63}}";
+    try std.testing.expectError(error.Invalid, r.renderAnimation(j));
+    try std.testing.expectEqualStrings("canvas exceeds limits.maxCanvasPixels", r.err);
+}
+
+test "limits: renderPdf fails on an image source over the limits" {
+    if (comptime !config.enable_pdf) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const r = Renderer.create(gpa).?;
+    defer r.destroy();
+    var rgba: [10 * 10 * 4]u8 = @splat(255);
+    const png = try codec.encodePng(gpa, &rgba, 10, 10, .{});
+    defer gpa.free(png);
+    try r.putImage("img", png, 0, 0, false);
+    const node = "{\"type\":\"image\",\"src\":\"img\",\"style\":{\"width\":10,\"height\":10}}";
+    _ = try r.renderPdf(.json, node, "{\"viewport\":{\"width\":20,\"height\":20}}");
+    try std.testing.expectError(error.Invalid, r.renderPdf(.json, node, "{\"viewport\":{\"width\":20,\"height\":20},\"limits\":{\"maxImagePixels\":99}}"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "image exceeds limits.maxImagePixels") != null);
+    try std.testing.expectError(error.Invalid, r.renderPdf(.json, node, "{\"viewport\":{\"width\":20,\"height\":20},\"limits\":{\"maxImageBytes\":8}}"));
+    try std.testing.expect(std.mem.indexOf(u8, r.err, "image exceeds limits.maxImageBytes") != null);
+    try std.testing.expectError(error.Invalid, r.renderPdf(.json, node, "{\"viewport\":{\"width\":20,\"height\":20},\"limits\":{\"maxNodeDepth\":-1}}"));
+    try std.testing.expectEqualStrings("limit must be a number >= 1: limits.maxNodeDepth", r.err);
 }
 
 // ---- phase 2 layout integration (tables, floats, inline rows, grid names)

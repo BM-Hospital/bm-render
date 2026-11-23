@@ -374,7 +374,7 @@ npm layout (napi-rs style; maintainer procedure: [docs/en/publishing.md](en/publ
 * `engines.node` of the platform packages is the Node-API 6 range `>=10.20.0 <11 || >=12.17.0 <13 || >=14.0.0`:
   every function in the `Api` struct of `src/native/napi.zig` is Node-API 1 except `napi_set_instance_data`
   (Node-API 6), and registration is by the `napi_register_module_v1` symbol. The main package requires
-  Node 18 (`engines`), which is the effective floor; only Node 26 was executed.
+  Node 20 (`engines`), which is the effective floor; only Node 26 was executed.
 * Loading (`js/native.mjs`): `BM_RENDER_NATIVE_PATH` and the checkout path are opened with `process.dlopen` (no
   module request for bundlers to see). The platform package is `require("@hunghg255/bm-render-<name>")` with one literal
   name per platform on `createRequire(import.meta.url)` in the same function, the form `@vercel/nft` traces

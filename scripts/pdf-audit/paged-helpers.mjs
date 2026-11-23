@@ -90,7 +90,15 @@ export async function cmp(t, label, html, options = {}, { geom = false, paint = 
   if (!r.ref) { t.note(`${label}: bm ${a.slice(0, 200)}`); t.same(label, 0, 0); return r; }
   const b = summary(r.ref);
   const bothReject = expect === "error" && a.startsWith("ERROR ") && b.startsWith("ERROR ");
-  t.ok(bothReject || a === b, `${label}: bm ${a.slice(0, 700)} | takumi ${b.slice(0, 700)}`);
+  if (r.bm.error || r.ref.error) t.ok(bothReject || a === b, `${label}: outcome: bm ${a.slice(0, 700)} | takumi ${b.slice(0, 700)}`);
+  else {
+    // page count, page boxes and text are separate assertions (and kinds of the strict gate)
+    const boxes = (x) => [...new Set(x.pages.map((p) => p.media.slice(2).join("x")))].join(",");
+    t.ok(r.bm.pages.length === r.ref.pages.length, `${label}: page count: bm ${r.bm.pages.length} | takumi ${r.ref.pages.length} (${a.slice(0, 500)} | ${b.slice(0, 500)})`);
+    t.ok(boxes(r.bm) === boxes(r.ref), `${label}: page boxes: bm ${boxes(r.bm)} | takumi ${boxes(r.ref)}`);
+    const ta = JSON.stringify(pagesOf(r.bm)); const tb = JSON.stringify(pagesOf(r.ref));
+    t.ok(ta === tb, `${label}: text per page: bm ${ta.slice(0, 600)} | takumi ${tb.slice(0, 600)}`);
+  }
   if (bothReject && a !== b) t.note(`${label}: both reject; error wording differs (bm ${a.slice(0, 180)} | takumi ${b.slice(0, 180)})`);
   if (expect === "error") t.ok(!!r.ref.error, `${label}: expected an error from takumi, got ${b.slice(0, 120)}`);
   if (expect === "render") t.ok(!r.ref.error, `${label}: expected takumi to render, got ${b.slice(0, 200)}`);

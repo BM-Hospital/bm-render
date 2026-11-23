@@ -66,7 +66,14 @@ pub const Style = struct {
     font_size: f32 = 16,
     font_family: []const u8 = "",
     font_weight: []const u8 = "",
+    font_style: []const u8 = "",
+    font_stretch: []const u8 = "",
+    font_variant: []const u8 = "",
     text_anchor: []const u8 = "",
+    /// `letter-spacing` / `word-spacing` in user units, resolved where declared (`normal` = 0).
+    letter_spacing: f32 = 0,
+    word_spacing: f32 = 0,
+    dominant_baseline: []const u8 = "",
     /// Decoration paint belongs to its declaring element, even when a child changes fill.
     decorations: [3]?DecorationPaint = @splat(null),
     linear_rgb_filters: bool = true,
@@ -132,7 +139,16 @@ pub const Style = struct {
             },
             .font_family => st.font_family = v,
             .font_weight => st.font_weight = v,
+            .font_style => st.font_style = v,
+            .font_stretch => st.font_stretch = v,
+            .font_variant => st.font_variant = v,
             .text_anchor => st.text_anchor = v,
+            .letter_spacing => st.letter_spacing = spacing(v, st.font_size) orelse return,
+            .word_spacing => st.word_spacing = spacing(v, st.font_size) orelse return,
+            // `no-change` keeps the parent's value, which is what inheriting it already gives
+            .dominant_baseline => if (!std.mem.eql(u8, v, "no-change")) {
+                st.dominant_baseline = v;
+            },
             .color_interpolation_filters => {
                 if (std.mem.eql(u8, v, "sRGB")) st.linear_rgb_filters = false else if (std.mem.eql(u8, v, "linearRGB") or std.mem.eql(u8, v, "auto")) st.linear_rgb_filters = true;
             },
@@ -140,6 +156,16 @@ pub const Style = struct {
         }
     }
 };
+
+/// A `letter-spacing` / `word-spacing` value in user units; `normal` is 0, `em` takes the
+/// font size of the element that declares it.
+fn spacing(v: []const u8, font_size: f32) ?f32 {
+    if (std.mem.eql(u8, v, "normal")) return 0;
+    const l = num.parseLength(v) orelse return null;
+    if (l.unit == .percent) return null;
+    const px = num.resolve(l, 0, font_size);
+    return if (std.math.isFinite(px)) px else null;
+}
 
 pub fn opacity(v: []const u8) ?f32 {
     const f = num.parseFraction(v) orelse return null;

@@ -1,7 +1,7 @@
 // PDF option types of bm-render (takumi-pdf `PdfRenderOptions` and friends; names and shapes follow
 // takumi-pdf-js 's dts-header.d.ts / export.ts). Re-exported by bm-render/pdf (pdf.d.mts); the `Renderer`
 // methods `renderPdf` / `measurePdf` of every entry use them (they throw on builds without the `pdf` feature).
-import type { ByteBuf, CssInput, FontLoader, ImageSource, ImagesInput, Node, Prepared } from "./index.mjs";
+import type { ByteBuf, CssInput, FontLoader, ImageSource, ImagesInput, Limits, Node, Prepared } from "./index.mjs";
 
 /** Image entries and the fetch policy used by PDF resource preparation. */
 export type PdfImagesInput = ImagesInput | {
@@ -193,13 +193,15 @@ export type PdfRenderOptions = (PagedOptions | ViewportOptions) &
     uncoveredText?: UncoveredText;
     /** Stops the render before it reads the document or draws it. */
     signal?: AbortSignal;
+    /** bm-render resource limits (see `Limits`): an image source over them fails the render. */
+    limits?: Limits;
   };
 
 /** Options for `measurePdf` / `PdfRenderer.measure`: page geometry (or a viewport) plus layout resources. Margins do not affect the result. */
 export type PdfMeasureOptions = (
   | { size?: PageSize; landscape?: boolean; viewport?: never }
   | { viewport: ViewportInput; size?: never; landscape?: never }
-) & Pick<PdfRenderOptions, "fonts" | "images" | "css" | "cssVariables" | "fontFamilies" | "lang"> & {
+) & Pick<PdfRenderOptions, "fonts" | "images" | "css" | "cssVariables" | "fontFamilies" | "lang" | "limits"> & {
     /** `Renderer.measurePdf` stops on an aborted one; `PdfRenderer.measure` does not read it (as takumi-pdf's `measure`). */
     signal?: AbortSignal;
   };

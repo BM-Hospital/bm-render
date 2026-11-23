@@ -184,6 +184,7 @@ pub noinline fn paintSvg(p: *Painter, ctx: *const Ctx, src: []const u8, dest: Re
     const opts: svg.RenderOptions = .{
         .current_color = .{ .r = current.r, .g = current.g, .b = current.b, .a = current.a },
         .text = .{ .ctx = &hook, .draw = Hook.draw },
+        .max_image_pixels = p.f.r.limits.image_pixels,
     };
     if (ctx.plain()) {
         svg.render(p.a, p.rast(), &doc, ctx.dst, dest, ctx.clip, opts) catch |e| switch (e) {

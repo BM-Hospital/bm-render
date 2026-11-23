@@ -85,10 +85,10 @@ pub const Cut = @import("../layout/fragment.zig").ParagraphCut;
 
 /// `buildFrame`, the paragraph `cut` names broken there.
 pub fn buildFrameCut(r: *rt.Renderer, a: Allocator, o: opt.PdfOptions, css: ?json.Value, kind: rt.SourceKind, source: []const u8, pre: ?json.Value, area: ?[2]f32, subst: ?*counters.Subst, cut: ?Cut) Error!*Frame {
-    return buildFrameCuts(r, a, o, css, kind, source, pre, area, subst, if (cut) |c| &.{c} else &.{}, &.{}, &.{}, &.{});
+    return buildFrameCuts(r, a, o, css, kind, source, pre, area, subst, if (cut) |c| &.{c} else &.{}, &.{}, &.{}, &.{}, &.{});
 }
 
-pub fn buildFrameCuts(r: *rt.Renderer, a: Allocator, o: opt.PdfOptions, css: ?json.Value, kind: rt.SourceKind, source: []const u8, pre: ?json.Value, area: ?[2]f32, subst: ?*counters.Subst, cuts: []const Cut, rows: []const @import("../layout/fragment.zig").RowMinimum, float_shifts: []const f32, float_extents: []const f32) Error!*Frame {
+pub fn buildFrameCuts(r: *rt.Renderer, a: Allocator, o: opt.PdfOptions, css: ?json.Value, kind: rt.SourceKind, source: []const u8, pre: ?json.Value, area: ?[2]f32, subst: ?*counters.Subst, cuts: []const Cut, rows: []const @import("../layout/fragment.zig").RowMinimum, float_shifts: []const f32, float_extents: []const f32, frozen: []const @import("../layout/fragment.zig").FrozenWidth) Error!*Frame {
     var ro: rt.Options = .{ .lang = o.lang, .font_families = o.font_families };
     switch (o.geometry) {
         .viewport => |v| {
@@ -110,6 +110,7 @@ pub fn buildFrameCuts(r: *rt.Renderer, a: Allocator, o: opt.PdfOptions, css: ?js
     if (area) |ar| f.setPaged(ar[0], ar[1]);
     f.tree.paged.cuts = try a.dupe(Cut, cuts);
     f.tree.paged.row_minimums = rows;
+    f.tree.paged.frozen_widths = frozen;
     f.tree.paged.float_shifts = try a.dupe(f32, float_shifts);
     f.tree.paged.float_extents = try a.dupe(f32, float_extents);
     if (subst) |s| s.install(f);

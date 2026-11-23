@@ -556,7 +556,8 @@ pub fn paintGlyphRun(reg: *FontRegistry, s: *sf.Surface, run_in: Run, origin_in:
     var sil: std.ArrayList(type3.Silhouette) = .empty;
     var opaque_sil: Path = .empty;
     var bitmaps: std.ArrayList(Glyph) = .empty;
-    if (shadow != null) {
+    const colored = coloredFace(font);
+    if (shadow != null and colored) {
         var kept: std.ArrayList(Glyph) = .empty;
         for (run.glyphs) |g| {
             if (!isColorGlyph(font, g.gid)) {
@@ -625,7 +626,7 @@ pub fn paintGlyphRun(reg: *FontRegistry, s: *sf.Surface, run_in: Run, origin_in:
                     try drawGlyphs(reg, s, origin[0], origin[1], run, !p.owned);
                 } else {
                     var outl: std.ArrayList(Glyph) = .empty;
-                    for (run.glyphs) |g| if (!isColorGlyph(font, g.gid)) try outl.append(a, g);
+                    for (run.glyphs) |g| if (!colored or !isColorGlyph(font, g.gid)) try outl.append(a, g);
                     var r2 = run;
                     r2.glyphs = outl.items;
                     s.setFill(null);
@@ -846,9 +847,9 @@ fn clusterEnd(text: []const u8, starts: []const u32, start: u32) u32 {
 /// The paragraph text with the white space the text engine turns into spaces (segment breaks,
 /// tabs, form feeds) written as U+0020, so a space glyph maps to " " as in takumi's collapsed
 /// text (same byte offsets; cached per text).
-fn sanitizedText(reg: *FontRegistry, text: []const u8) ![]const u8 {
+fn sanitizedText(reg: *FontRegistry, a: Allocator, text: []const u8) ![]const u8 {
     if (reg.text_src.ptr == text.ptr and reg.text_src.len == text.len) return reg.text_clean;
-    const t = try reg.a.dupe(u8, text);
+    const t = try a.dupe(u8, text);
     for (t) |*ch| switch (ch.*) {
         '\n', '\r', '\t', 0x0c => ch.* = ' ',
         else => {},
@@ -858,12 +859,12 @@ fn sanitizedText(reg: *FontRegistry, text: []const u8) ![]const u8 {
     return t;
 }
 
-fn clusterStarts(reg: *FontRegistry, para: *const font_mod.Paragraph) ![]const u32 {
+fn clusterStarts(reg: *FontRegistry, a: Allocator, para: *const font_mod.Paragraph) ![]const u32 {
     if (reg.cluster_para == @as(?*const anyopaque, para)) return reg.cluster_starts;
     var list: std.ArrayList(u32) = .empty;
     for (para.glyphs) |g| {
         if (g.flags & font_mod.ShapedGlyph.SPECIAL != 0) continue;
-        try list.append(reg.a, g.cluster);
+        try list.append(a, g.cluster);
     }
     std.mem.sort(u32, list.items, {}, std.sort.asc(u32));
     var n: usize = 0;
@@ -924,7 +925,9 @@ fn ignorableContinues(cp: u32) bool {
 /// before it. bm-render's shaper drops the character and leaves its bytes at the end of the
 /// cluster before it, which would give that cluster's glyph the character as text (ToUnicode
 /// `a` -> `a` + U+200B, an /ActualText span around every plain `a`). This puts the invisible
-/// glyphs back (left-to-right runs; a font without a space glyph gets none, as in HarfBuzz).
+/// glyphs back (a font without a space glyph gets none, as in HarfBuzz). In a right-to-left run
+/// (glyphs in visual order) they go before the cluster, at its left edge: Persian `پ` + ZWNJ
+/// maps `<067E>` and `<200C>` apart, so pdftotext extracts the ZWNJ after its letter.
 fn hideIgnorables(a: Allocator, font: *const ttf.Font, size: f32, gs: []const font_mod.PositionedGlyph, shaped: []ShapedGlyph, text: []const u8) ![]ShapedGlyph {
     var any = false;
     for (shaped) |g| {
@@ -936,7 +939,7 @@ fn hideIgnorables(a: Allocator, font: *const ttf.Font, size: f32, gs: []const fo
         }
     }
     if (!any) return shaped;
-    for (gs) |g| if (g.bidi_level & 1 != 0) return shaped;
+    const rtl = gs.len != 0 and gs[0].bidi_level & 1 != 0;
     const space = font.glyphIndex(' ');
     const hyphen = font.glyphIndex('-');
     const hyphen2 = font.glyphIndex(0x2010);
@@ -966,10 +969,25 @@ fn hideIgnorables(a: Allocator, font: *const ttf.Font, size: f32, gs: []const fo
         var base_end = j;
         const soft_break = j - i >= 2 and (shaped[j - 1].gid == hyphen or shaped[j - 1].gid == hyphen2) and shaped[j - 1].gid != 0 and uni.decodeUtf8(text, tail).cp == 0xAD;
         if (soft_break) base_end = j - 1;
-        // the pen after the cluster: where the next glyph of the run starts
+        if (rtl and soft_break) {
+            // (a right-to-left soft break keeps its hyphen glyph's mapping)
+            try out.appendSlice(a, shaped[i..j]);
+            i = j;
+            continue;
+        }
+        // the pen after the cluster: where the next glyph of the run starts (right-to-left: the
+        // cluster's left edge, the pen of its base glyph, the last one with an advance)
         const last = shaped[base_end - 1];
-        const pen_x = if (base_end < shaped.len) shaped[base_end].x else last.x + @as(f32, @floatFromInt(font.advanceWidth(last.gid))) * size / upm;
+        const pen_x = if (rtl) blk: {
+            var k = j;
+            while (k > i) {
+                k -= 1;
+                if (font.advanceWidth(shaped[k].gid) != 0) break :blk shaped[k].x;
+            }
+            break :blk shaped[i].x;
+        } else if (base_end < shaped.len) shaped[base_end].x else last.x + @as(f32, @floatFromInt(font.advanceWidth(last.gid))) * size / upm;
         const pen_y = shaped[i].y;
+        const group0 = out.items.len;
         var first = out.items.len;
         try out.appendSlice(a, shaped[i..base_end]);
         var cur: [2]u32 = .{ st, tail };
@@ -993,6 +1011,12 @@ fn hideIgnorables(a: Allocator, font: *const ttf.Font, size: f32, gs: []const fo
         for (out.items[first..]) |*g| {
             g.start = cur[0];
             g.end = cur[1];
+        }
+        if (rtl) {
+            // visual order: the invisible glyphs (last character first), then the cluster's own
+            const added = out.items[group0 + (j - i) ..];
+            std.mem.reverse(ShapedGlyph, added);
+            std.mem.rotate(ShapedGlyph, out.items[group0..], j - i);
         }
         if (soft_break) {
             var h = shaped[j - 1];
@@ -1047,8 +1071,8 @@ fn buildRun(reg: *FontRegistry, a: Allocator, f: *rt.Frame, para: ?*const font_m
         }
         text = t.items;
     } else {
-        const starts: []const u32 = if (para) |p| try clusterStarts(reg, p) else &.{};
-        text = try sanitizedText(reg, text);
+        const starts: []const u32 = if (para) |p| try clusterStarts(reg, a, p) else &.{};
+        text = try sanitizedText(reg, a, text);
         for (gs, shaped) |g, *sg| {
             const st: u32 = @min(g.cluster, @as(u32, @intCast(text.len)));
             sg.* = .{ .gid = g.gid, .x = g.x, .y = g.y, .start = st, .end = clusterEnd(text, starts, st) };

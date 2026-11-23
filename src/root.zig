@@ -49,4 +49,5 @@ test {
     _ = @import("pdf/markers.zig");
     _ = @import("pdf/page_names.zig");
     _ = @import("pdf/filelayer_tests.zig");
+    _ = @import("fuzz.zig");
 }

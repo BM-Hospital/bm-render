@@ -26,14 +26,33 @@ const List = struct {
     }
 };
 
+/// Whether every entry of a list parses: lengths for x / y / dx / dy, plain numbers for rotate.
+/// A list with an entry that does not parse is dropped whole (Blink's
+/// `SVGLengthList::SetValueAsString`, takumi `length_list` / `number_list`).
+fn validList(text: []const u8, numbers_only: bool) bool {
+    var r: num.Reader = .{ .s = text };
+    while (true) {
+        r.skipWs();
+        if (r.i >= r.s.len) return true;
+        const start = r.i;
+        _ = r.number() orelse return false;
+        const unit = r.ident();
+        if (numbers_only and unit.len > 0) return false;
+        _ = num.parseLength(r.s[start..r.i]) orelse return false;
+        r.skipSep();
+    }
+}
+
 pub const Scope = struct {
     lists: [5]List,
     last_rotate: ?f32 = null,
     fs: f32,
     pub fn init(n: *const dom.Node, fs: f32) Scope {
         var s: Scope = .{ .lists = undefined, .fs = fs };
-        for ([_][]const u8{ "x", "y", "dx", "dy", "rotate" }, 0..) |name, i|
-            s.lists[i] = .{ .reader = .{ .s = if (n.tag == .textPath) "" else n.attr(name) orelse "" } };
+        for ([_][]const u8{ "x", "y", "dx", "dy", "rotate" }, 0..) |name, i| {
+            const text = if (n.tag == .textPath) "" else n.attr(name) orelse "";
+            s.lists[i] = .{ .reader = .{ .s = if (validList(text, i == 4)) text else "" } };
+        }
         return s;
     }
 };
@@ -85,4 +104,18 @@ test "SVG text position scopes advance ancestors and repeat rotation" {
     try std.testing.expectEqual(@as(f32, 15), c.rotate);
     const d = next(scopes[0..1], 200, 100);
     try std.testing.expectEqual(@as(?f32, 40), d.x);
+}
+
+test "SVG text position lists with an invalid entry are dropped whole" {
+    var text: dom.Node = .{ .tag = .text, .attrs = &.{
+        .{ .name = "x", .value = "2 junk 30" },
+        .{ .name = "dy", .value = "1, 2 3" },
+        .{ .name = "rotate", .value = "10 20deg" },
+    } };
+    var scopes = [_]Scope{Scope.init(&text, 10)};
+    const a = next(&scopes, 100, 100);
+    try std.testing.expectEqual(@as(?f32, null), a.x);
+    try std.testing.expectEqual(@as(f32, 1), a.dy);
+    try std.testing.expectEqual(@as(f32, 0), a.rotate);
+    try std.testing.expectEqual(@as(f32, 2), next(&scopes, 100, 100).dy);
 }

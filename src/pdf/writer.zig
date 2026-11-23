@@ -974,6 +974,19 @@ pub const Doc = struct {
         const rows = try a.alloc(Row, num + n_streams + 4);
         @memset(rows, .{});
 
+        // (the file at once: a list grown as it is written holds an old and a new copy of a long
+        // document's file at its last growth; its objects are about their bodies and streams with
+        // a header, a trailer and an xref row each)
+        {
+            var size: usize = out.items.len + 65536;
+            // (structure elements packed into compressed object streams: their compressed size
+            // grows the list)
+            for (d.objs.items) |ob| {
+                if (pack and ob.cat == .struct_elements) continue;
+                size += 48 + (ob.end - ob.start) + (if (ob.data) |x| x.len else 0);
+            }
+            try out.ensureTotalCapacity(a, size);
+        }
         var w: Out = .{ .a = a, .o = out };
         const start = out.items.len;
         try w.raw("%PDF-");

@@ -6,7 +6,7 @@ import { inspect, renderPage } from '../../bench/pdf/lib/pdfjs.mjs';
 for (const [id, css, value, expected, maxChannelDifference] of [
   ['tab-size', 'white-space:pre;tab-size:4', 'a\tb\tc', 'a b c', 0],
   ['pre-wrap', 'white-space:pre-wrap', 'a   b\n  c', 'a b c', 0],
-  ['soft-hyphen', 'width:60px;hyphens:manual', 'extra&shy;ordinary', 'extra‐ ordinary', 2],
+  ['soft-hyphen', 'width:60px;hyphens:manual', 'extra&shy;ordinary', 'extra‐ ordinary', 0],
 ]) {
   probe(`text.spacing.${id}`, 'whitespace and generated hyphen viewer semantics', async t => {
     const r = await t.both(`<p style="margin:10px;font:20px Inter;${css}">${value}</p>`, vp(260, 120));
@@ -31,9 +31,9 @@ for (const [id, css, value, expected, maxChannelDifference] of [
       max = Math.max(max, d);
       changed += Number(d !== 0);
     }
-    // A discretionary hyphen's fractional origin is rounded differently by the two
-    // shapers. This bound applies only to this source/font/scale, not to other cases.
-    t.ok(max <= maxChannelDifference && (id !== 'soft-hyphen' || changed <= 6), `raster: ${changed} changed pixels, largest channel difference ${max}`);
+    // (the generated hyphen starts at the item's width snapped to the LayoutUnit grid, as in
+    // takumi: the rasters are identical)
+    t.ok(max <= maxChannelDifference, `raster: ${changed} changed pixels, largest channel difference ${max}`);
     t.note('Compared with pdf.js extraction and raster output; equivalent TJ run grouping is not required.');
   });
 }

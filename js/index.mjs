@@ -20,7 +20,8 @@
 //   takumi                         bm-render
 //   ----------------------------   ---------------------------------------------------------------------------
 //   new Renderer(options)          works; `cacheMaxBytes` / `fontCacheMaxBytes` accepted and ignored (fixed
-//                                  budgets: 96 MiB decoded images, 8 MiB glyph masks)
+//                                  budgets: 96 MiB decoded images, 8 MiB glyph masks); bm-render adds
+//                                  `workers: N` (async methods on Web Workers / worker_threads, js/worker-pool.mjs)
 //   registerFont(font)             works for bytes, `{ name, data, weight, style }` (data may be a function /
 //                                  promise -> async) and URL strings (fetched); `unicodeRange`, `subsetOf`,
 //                                  `generic` ignored (every face is registered eagerly)

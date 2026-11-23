@@ -7,6 +7,7 @@ const style = @import("style/style.zig");
 const font = @import("font/font.zig");
 
 const CS = render.CS;
+const LP = style.LP;
 const none = render.none;
 const spaces = " \t\r\n\x0c";
 
@@ -90,6 +91,31 @@ fn areaValue(f: *render.Frame, id: u32) ![]const u8 {
     return out.items;
 }
 
+/// Blink's kFontFamiliesWithInvalidCharWidth (takumi text_control.rs): families whose average
+/// character width does not size a text field. Only the first family is consulted.
+const invalid_char_width_families = [_][]const u8{
+    "American Typewriter", "Arial Hebrew",   "Chalkboard",    "Cochin",        "Corsiva Hebrew", "Courier",
+    "Euphemia UCAS",       "Geneva",         "Gill Sans",     "Hei",           "Helvetica",      "Hoefler Text",
+    "InaiMathi",           "Kai",            "Lucida Grande", "Marker Felt",   "Monaco",         "Mshtakan",
+    "New Peninim MT",      "Osaka",          "Raanana",       "STHeiti",       "Symbol",         "Times",
+    "Apple Braille",       "Apple LiGothic", "Apple LiSung",  "Apple Symbols", "AppleGothic",    "AppleMyungjo",
+    "#GungSeo",            "#HeadLineA",     "#PCMyungjo",    "#PilGi",
+};
+
+fn validCharWidthFamily(families: []const []const u8) bool {
+    if (families.len == 0 or families[0].len == 0) return false;
+    for (invalid_char_width_families) |name| if (std.mem.eql(u8, families[0], name)) return false;
+    return true;
+}
+
+/// The border and padding of `cs` along the block (`axis` 0) or inline (1) axis; percentages as 0.
+fn borderPadding(cs: *const CS, axis: u1) f32 {
+    const bw = cs.usedBorderWidths();
+    const a: usize = if (axis == 0) 0 else 1;
+    const b: usize = a + 2;
+    return bw[a] + bw[b] + cs.padding[a].resolve(0) + cs.padding[b].resolve(0);
+}
+
 const Metrics = struct { char: f32, max_char: f32, line: f32 };
 fn metrics(f: *render.Frame, cs: *const CS) Metrics {
     var out: Metrics = .{ .char = cs.font_size / 2, .max_char = 0, .line = cs.font_size * 1.2 };
@@ -98,11 +124,22 @@ fn metrics(f: *render.Frame, cs: *const CS) Metrics {
     if (matched.len > 0) {
         const ft = f.r.fonts.font(matched[0]);
         const scale = cs.font_size / @as(f32, @floatFromInt(@max(1, ft.unitsPerEm())));
-        const zero = @as(f32, @floatFromInt(ft.advanceWidth(ft.glyphIndex('0')))) * scale;
-        const avg = if (ft.os2.len >= 4) @as(f32, @floatFromInt(std.mem.readInt(i16, ft.os2[2..4], .big))) * scale else 0;
-        if (avg > 0 and !(zero > 0 and avg > zero * 1.7)) {
+        const zero_gid = ft.glyphIndex('0');
+        const zero = if (zero_gid != 0) @as(f32, @floatFromInt(ft.advanceWidth(zero_gid))) * scale else cs.font_size / 2;
+        // takumi PrimaryFontMetrics: OS/2 xAvgCharWidth, else the `x` advance, else the x-height.
+        var avg = if (ft.os2.len >= 4) @as(f32, @floatFromInt(std.mem.readInt(i16, ft.os2[2..4], .big))) * scale else 0;
+        if (avg == 0) {
+            const x = ft.glyphIndex('x');
+            avg = if (x != 0) @as(f32, @floatFromInt(ft.advanceWidth(x))) * scale else @as(f32, @floatFromInt(ft.xHeight())) * scale;
+        }
+        if (!(zero_gid != 0 and avg > zero * 1.7) and validCharWidthFamily(cs.font_family)) {
             out.char = @max(avg, @round(avg));
-            if (ft.hhea.len >= 12) out.max_char = @as(f32, @floatFromInt(std.mem.readInt(u16, ft.hhea[10..12], .big))) * scale;
+            // Blink's MaxCharWidth outside Windows/Apple: the `head` bounding box width, whole pixels.
+            if (ft.head.len >= 44) {
+                const x_min = std.mem.readInt(i16, ft.head[36..38], .big);
+                const x_max = std.mem.readInt(i16, ft.head[40..42], .big);
+                out.max_char = @round(@as(f32, @floatFromInt(@as(i32, x_max) - x_min)) * scale);
+            }
         } else out.char = zero;
         const lm = ft.lineMetrics();
         out.line = @round(@as(f32, @floatFromInt(lm.ascent)) * scale) + @round(@as(f32, @floatFromInt(lm.descent)) * scale) + @round(@as(f32, @floatFromInt(lm.leading)) * scale);
@@ -141,9 +178,13 @@ pub fn generate(f: *render.Frame) render.Error!void {
         const columns = positive(f.dom.attr(id, if (area) "cols" else "size"), 20);
         // The document root's auto inline size is supplied by its initial containing block.
         // Inner controls instead contribute their character-based preferred inline size.
-        if (host.width == .auto and id != f.dom.root) host.width = .{ .lp = .{ .px = @ceil(m.char * @as(f32, @floatFromInt(if (!area and eq(typ, "number")) @as(u32, 20) else columns)) + (if (area) scrollbar else @max(0, m.max_char - m.char))) } };
+        // The default sizes are content sizes: a border-box host (`input[type=search]`) adds its
+        // border and padding, as takumi's min-max and intrinsic block sizes do.
+        const border_box = host.box_sizing == .border_box;
+        if (host.width == .auto and id != f.dom.root) host.width = .{ .lp = .{ .px = @ceil(m.char * @as(f32, @floatFromInt(if (!area and eq(typ, "number")) @as(u32, 20) else columns)) + (if (area) scrollbar else @max(0, m.max_char - m.char))) + (if (border_box) borderPadding(host, 1) else 0) } };
         const rows = if (area) positive(f.dom.attr(id, "rows"), 2) else 1;
-        if (host.height == .auto) host.height = .{ .lp = .{ .px = m.line * @as(f32, @floatFromInt(rows)) } };
+        const auto_height = host.height == .auto;
+        if (auto_height) host.height = .{ .lp = .{ .px = m.line * @as(f32, @floatFromInt(rows)) + (if (border_box) borderPadding(host, 0) else 0) } };
         var diag: style.Diagnostics = .{};
         const editor = try f.a.create(CS);
         editor.* = style.compute(f.a, &f.ctx, host, null, null, &diag) catch return error.OutOfMemory;
@@ -158,11 +199,17 @@ pub fn generate(f: *render.Frame) render.Error!void {
             editor.text_wrap_mode = .nowrap;
             editor.overflow_wrap = .normal;
             editor.text_overflow = host.text_overflow;
-            const height = if (host.height == .lp) host.height.lp.resolve(0) else m.line;
-            if (host.font_size >= @trunc(m.line) or height > @trunc(m.line)) editor.line_height = .normal;
+            // takumi `removes_line_height`: the authored height (a percentage always, calc never)
+            // against the host's truncated line height.
+            const authored: ?LP = if (!auto_height and host.height == .lp) host.height.lp else null;
+            const removes = if (authored) |h| (!h.isCalc() and (h.pct != 0 or h.px > @trunc(m.line))) else false;
+            if (host.font_size >= @trunc(m.line) or removes) editor.line_height = .normal;
             const editor_line = metrics(f, editor).line;
             editor.min_height = .{ .lp = .{ .px = editor_line } };
-            editor.margin[0] = .{ .lp = .{ .px = @floor((height - editor_line) / 2) } };
+            // AlignContentBlockCenter: half the content box's free space in LayoutUnits (1/64 px,
+            // truncated toward zero), whatever overflows.
+            const content_height = if (authored) |h| (if (h.isCalc() or h.pct != 0) m.line else h.px - (if (border_box) borderPadding(host, 0) else 0)) else m.line;
+            editor.margin[0] = .{ .lp = .{ .px = @trunc((@max(0, content_height) - editor_line) * 32) / 64 } };
         }
         // Placeholder text is not painted by pinned Takumi's text_control.value either.
         // Keep it out of the value and PDF text layer until an authored placeholder pseudo exists.

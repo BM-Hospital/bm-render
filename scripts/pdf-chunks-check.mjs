@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Checks that a document drawn a part at a time (src/pdf/chunks.zig, paged.zig `writeChunked`) is the document
 // drawn whole: every case renders with `chunks: false` and in parts (`chunks: 1`, the smallest parts, unless the case
-// names a size), and the two files must show the same
+// names a size; a document without forced breaks is cut at any page boundary, `flow-*` cases), and the two
+// files must show the same
 // pages (count, boxes), the same marks on each page (the audit's device-space draw lists: paths, text, images, paints,
 // clips, transparency, marked content, numbers within 0.011), the same extracted text, structure tree, parent tree,
 // link annotations, destinations and outline. Coordinates inside the content streams may differ (a part's frame has
@@ -45,6 +46,8 @@ const LOREM = "Paged output flows content across pages the way a browser prints:
 const para = (n) => Array.from({ length: n }, () => `<p>${LOREM}</p>`).join("");
 const sections = (n, body = (k) => `<h2>Part ${k + 1}</h2>${para(3)}`, attrs = (k) => `style="break-after:page"`) =>
   `<div style="font:12px Inter">${Array.from({ length: n }, (_, k) => `<section ${attrs(k)}>${body(k)}</section>`).join("")}</div>`;
+// takumi-pdf `memory_tests.rs` (scripts/pdf-memory.mjs)
+const takumiSections = (n) => `<div style="font-size: 12px">${Array.from({ length: n }, (_, i) => `<section><h2>Section ${i}</h2><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p></section>`).join("")}</div>`;
 const table = (rows) => `<table style="width:100%;border-collapse:collapse"><thead><tr><th style="border:1px solid #333">A</th><th style="border:1px solid #333">B</th></tr></thead><tbody>${Array.from({ length: rows }, (_, i) => `<tr><td style="border:1px solid #999">r${i}</td><td style="border:1px solid #999">${i * 7}</td></tr>`).join("")}</tbody></table>`;
 
 const CASES = [
@@ -80,7 +83,54 @@ const CASES = [
   { id: "shadow-at-top", source: sections(4, (k) => `<div style="box-shadow:0 -20px 10px #000;height:30px;margin-top:0">s</div>${para(2)}`), options: { size: "A5" } },
   { id: "full-html-body-margin", source: `<!doctype html><html><body>${sections(4)}</body></html>`, options: { size: "A5" } },
   { id: "full-html-body-zero", source: `<!doctype html><html><body style="margin:0">${sections(4)}</body></html>`, options: { size: "A5" }, parts: true },
-  { id: "no-forced-breaks", source: sections(6, undefined, () => ""), options: { size: "A5" } },
+  { id: "no-forced-breaks", source: sections(20, undefined, () => ""), options: { size: "A5" }, parts: true },
+  // cut at any page boundary (paged.zig `writeFlowing`): no forced break, parts of `chunks` / 4 elements at least
+  { id: "flow-takumi-memory", source: takumiSections(120), options: { size: { width: 320, height: 240 }, margin: 24, header: `<div style="font:10px Inter">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>` }, chunks: 64, parts: true },
+  { id: "flow-takumi-default", source: takumiSections(700), options: { size: { width: 320, height: 240 }, margin: 24, header: `<div style="font:10px Inter">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>` }, chunks: 2048, parts: true },
+  { id: "flow-long-paragraphs", source: sections(20, (k) => `<h2>Part ${k + 1}</h2>${para(9)}`, () => ""), options: { size: "A5", margin: 30 }, parts: true },
+  { id: "flow-one-long-child", source: `<div style="font:12px Inter"><section><h2>Long</h2>${para(40)}</section><section>${para(3)}</section><section>${para(3)}</section><section>${para(30)}</section></div>`, options: { size: "A5" }, parts: true },
+  { id: "flow-outline-ua1", source: sections(20, (k) => `<h1>Chapter ${k}</h1><h2>Sub</h2>${para(4)}<h3>Deep</h3>`, () => ""), options: { size: "A5", tagged: "ua1", outline: true, lang: "en", metadata: { title: "T" } }, parts: true },
+  { id: "flow-ua2-dests", source: sections(20, (k) => `<h1 id="c${k}">Chapter ${k}</h1>${k ? `<a href="#c${k - 1}">prev</a> <a href="#c0">first</a>` : ""}${para(4)}`, () => ""), options: { size: "A5", tagged: "ua2", outline: true, lang: "en", metadata: { title: "T" } }, parts: true },
+  { id: "flow-forward-links", source: sections(24, (k) => `<h2 id="p${k}">Part ${k + 1}</h2>${k === 1 ? `<a href="#p4">ahead</a>` : ""}${para(4)}`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-toc-first", source: `<div style="font:12px Inter"><nav>${[0, 1, 2, 3, 4, 5].map((k) => `<a href="#p${k}">p${k}</a>`).join(" ")}</nav>${[0, 1, 2, 3, 4, 5].map((k) => `<section><h2 id="p${k}">P${k}</h2>${para(5)}</section>`).join("")}</div>` },
+  { id: "flow-inline-links", source: sections(16, (k) => `<h2>P${k}</h2><p>${LOREM} <a href="https://example.com/${k}">a link that runs ${LOREM}</a> ${LOREM} ${LOREM}</p>${para(4)}`, () => ""), options: { size: "A5", tagged: "ua1", lang: "en", metadata: { title: "T" } }, parts: true },
+  { id: "flow-tables", source: sections(10, (k) => `<h3>T${k}</h3>${table(12)}${para(4)}`, () => ""), options: { size: "A5", margin: 30 }, parts: true },
+  { id: "flow-lists", source: sections(20, (k) => `<ol start="${k * 3 + 1}"><li>one ${LOREM}</li><li>two</li><li>three ${LOREM}</li></ol>${para(3)}<ul><li>x</li></ul>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-counters", source: `<style>body{counter-reset:s} section{counter-increment:s} h2::before{content:counter(s) ". "}</style>` + sections(20, (k) => `<h2>P${k}</h2>${para(4)}`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-page-ranges", source: sections(20, (k) => `<h2 id="p${k}">P${k}</h2>${k ? `<a href="#p0">first</a>` : ""}${para(4)}`, () => ""), options: { size: "A5", outline: true, pageRanges: [1, { from: 3, to: 4 }, 7] }, parts: true },
+  { id: "flow-first-page-rule", source: `<style>@page:first{margin-top:120px} @page:left{margin-bottom:80px}</style>` + sections(20, (k) => `<h2>P${k}</h2>${para(5)}`, () => ""), options: { size: "A5", margin: 30 }, parts: true },
+  { id: "flow-bands", source: sections(20, (k) => `<h2>P${k}</h2>${para(5)}`, () => ""), options: { size: "A5", header: `<div style="font:9px Inter">H <span class="pageNumber"></span>/<span class="totalPages"></span></div>`, footer: `<div style="font:9px Inter">F</div>`, pages: { last: { footer: `<div style="font:9px Inter">last</div>` } } }, parts: true },
+  { id: "flow-margins", source: `<div style="font:12px Inter">${Array.from({ length: 30 }, (_, k) => `<section style="margin:${k * 3}px 0 ${20 - k}px"><h2 style="margin:14px 0">P${k}</h2>${para(3)}</section>`).join("")}</div>`, options: { size: "A5" }, parts: true },
+  { id: "flow-decorated", source: `<div style="font:12px Inter">${Array.from({ length: 20 }, (_, k) => `<section style="border:2px solid #345;background:#eef;padding:6px;border-radius:6px"><h2>P${k}</h2>${para(4)}</section>`).join("")}</div>`, options: { size: "A5" }, parts: true },
+  { id: "flow-transforms", source: sections(20, (k) => k % 3 ? para(4) : `<div style="transform:translate(${k * 10}px, 4px);width:100px;height:40px;background:#cde"></div><div style="position:relative;top:10px"><span style="position:absolute;left:5px">abs</span>rel</div>${para(3)}`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-images", source: sections(20, (k) => `<img src="icon.png" style="width:${40 + k * 10}px">${para(3)}`, () => ""), options: { size: "A5", images: stressOpts.images }, parts: true },
+  { id: "flow-widows", source: `<style>p{orphans:3;widows:3} h2{break-after:avoid}</style>` + sections(24, (k) => `<h2>P${k}</h2>${para(3)}`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-body-zero", source: `<!doctype html><html><body style="margin:0">${sections(20, undefined, () => "")}</body></html>`, options: { size: "A5" }, parts: true },
+  // cut inside a table (between its rows), a flex container or a grid (between its lines / rows, or inside a
+  // single-column one): every page of these documents starts inside one
+  { id: "flow-table-rows", source: sections(12, (k) => `<h3>T${k}</h3>${table(50)}${para(1)}`, () => ""), options: { size: "A5", margin: 30 }, parts: true },
+  { id: "flow-table-rows-ua1", source: sections(12, (k) => `<h3>T${k}</h3>${table(50)}${para(1)}`, () => ""), options: { size: "A5", margin: 30, tagged: "ua1", lang: "en", metadata: { title: "T" } }, parts: true },
+  { id: "flow-one-long-table", source: `<div style="font:12px Inter"><p>${LOREM}</p>${table(400)}<p>${LOREM}</p><p>end</p></div>`, options: { size: "A5" }, parts: true },
+  { id: "flow-table-tall-rows", source: sections(10, (k) => `<table style="width:100%;border-collapse:collapse">${Array.from({ length: 12 }, (_, i) => `<tr><td style="border:1px solid #999;width:30%">r${k}.${i}</td><td style="border:1px solid #999">${i % 3 ? LOREM : "x"}</td></tr>`).join("")}</table>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-table-separate", source: sections(10, (k) => `<table style="width:100%;border-spacing:4px;border:2px solid #333;background:#f4f4ff"><caption>Cap ${k}</caption><tfoot><tr><td>foot</td><td>${k}</td></tr></tfoot><tbody>${Array.from({ length: 40 }, (_, i) => `<tr><td style="background:#dde">c${i}</td><td>${i}</td></tr>`).join("")}</tbody></table>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-flex-column", source: sections(12, (k) => `<h3>F${k}</h3><div style="display:flex;flex-direction:column;gap:6px;border:1px solid #889;padding:4px">${para(6)}</div>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-flex-wrap", source: sections(8, (k) => `<h3>W${k}</h3><div style="display:flex;flex-wrap:wrap;gap:6px">${Array.from({ length: 40 }, (_, i) => `<div style="width:110px;height:46px;border:1px solid #567;background:#eef">${k}.${i}</div>`).join("")}</div>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-grid-rows", source: sections(8, (k) => `<h3>G${k}</h3><div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px">${Array.from({ length: 60 }, (_, i) => `<div style="border:1px solid #765;padding:3px">${k}.${i} ${i % 4 ? "" : "two words"}</div>`).join("")}</div>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-grid-one-column", source: sections(12, (k) => `<h3>C${k}</h3><div style="display:grid;gap:8px">${para(5)}</div>`, () => ""), options: { size: "A5" }, parts: true },
+  // children of the flow holding positioned / transformed boxes
+  { id: "flow-relative-long", source: sections(14, (k) => `<div style="position:relative;padding-right:40px">${para(7)}<span style="position:absolute;right:0;top:0">tag ${k}</span></div>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-relative-items", source: sections(14, (k) => `<h3>R${k}</h3>${para(3)}<p style="position:relative;left:6px">${LOREM}</p>${para(3)}`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-translated-long", source: sections(14, (k) => `<div style="transform:translateX(4px)">${para(7)}</div>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-abs-in-table", source: sections(10, (k) => `<table style="width:100%;position:relative">${Array.from({ length: 30 }, (_, i) => `<tr><td>${k}.${i}</td><td style="position:relative">v<span style="position:absolute;left:30px">a</span></td></tr>`).join("")}</table>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-positioned-mix", source: sections(14, (k) => `<div style="position:relative">${para(3)}<div style="transform:translate(${k * 3}px, 6px);background:#cde">${para(2)}</div><div style="position:relative;top:${k % 3 * 9}px;z-index:${k % 2}">${LOREM}<span style="position:absolute;left:4px;top:${k * 5}px">abs ${k}</span></div>${para(2)}</div>`, () => ""), options: { size: "A5" }, parts: true },
+  { id: "flow-rotated-long", source: sections(14, (k) => `<div>${para(3)}<div style="transform:rotate(${k * 4 - 20}deg);background:#cde;width:60%">${para(2)}</div>${para(3)}</div>`, () => ""), options: { size: "A5" } },
+  { id: "flow-abs-far", source: sections(12, (k) => `<div style="position:relative">${para(6)}<span style="position:absolute;left:10px;top:${k % 2 ? 700 : -300}px;background:#fdd">far ${k}</span></div>`, () => ""), options: { size: "A5" } },
+  { id: "flow-relative-tables", source: sections(10, (k) => `<div style="position:relative;left:3px">${table(40)}</div><p style="position:sticky;top:0">${LOREM}</p>`, () => ""), options: { size: "A5" }, parts: true },
+  // (orders a part's start cannot be told from: equivalent whether cut or laid out whole)
+  { id: "flow-flex-reversed", source: sections(8, (k) => `<div style="display:flex;flex-direction:column-reverse;gap:4px">${para(6)}</div><div style="display:flex;flex-wrap:wrap-reverse;gap:4px">${Array.from({ length: 20 }, (_, i) => `<div style="width:120px;height:40px;order:${(i * 7) % 5};border:1px solid #567">${k}.${i}</div>`).join("")}</div>`, () => ""), options: { size: "A5" } },
+  { id: "flow-grid-placed", source: sections(8, (k) => `<div style="display:grid;grid-template-columns:1fr 1fr;grid-auto-flow:dense;gap:4px">${Array.from({ length: 30 }, (_, i) => `<div style="${i % 5 === 0 ? "grid-column:span 2;" : ""}${i % 7 === 3 ? `grid-row:${30 - i};` : ""}border:1px solid #765;padding:4px">${k}.${i}</div>`).join("")}</div>`, () => ""), options: { size: "A5" } },
+  { id: "flow-table-rowspan", source: sections(8, (k) => `<table style="width:100%;border-collapse:collapse">${Array.from({ length: 30 }, (_, i) => `<tr>${i % 6 === 0 ? `<td rowspan="4" style="border:1px solid #999">span ${k}.${i}</td>` : i % 6 >= 4 ? "<td>-</td>" : ""}<td style="border:1px solid #999">${k}.${i}</td></tr>`).join("")}</table>`, () => ""), options: { size: "A5" } },
+  { id: "flow-stress-no-breaks", source: stressHtml(30).replaceAll("break-after:page", ""), options: stressOpts, chunks: 256 },
 ];
 
 const round = (v, k = 100) => Math.round(v * k) / k;

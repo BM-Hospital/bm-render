@@ -158,6 +158,8 @@
     "js/index.mjs",
     "js/index.d.mts",
     "js/engine.mjs",
+    "js/worker-pool.mjs",
+    "js/worker.mjs",
     "js/node.mjs",
     "js/native.mjs",
     "js/node-native.mjs",
@@ -194,7 +196,7 @@
     "THIRD-PARTY-NOTICES.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
@@ -206,9 +208,14 @@
     "verify": "node scripts/npm-platform-packages.mjs --check && node scripts/build.mjs --verify",
     "test": "node scripts/build.mjs --test",
     "test:js": "node scripts/js-abort-test.mjs",
+    "test:workers": "node scripts/worker-test.mjs",
+    "test:limits": "node scripts/limits-test.mjs",
     "test:pdf": "node scripts/pdf-test.mjs",
     "test:pdf:chunks": "node scripts/pdf-chunks-check.mjs",
+    "test:pdf:memory": "node scripts/pdf-memory.mjs",
     "test:pdf:takumi": "node scripts/pdf-compare.mjs",
+    "test:pdf:coverage": "node scripts/pdf-coverage.mjs --strict",
+    "test:pdf:gate": "node --test scripts/pdf-audit/gates.test.mjs",
     "test:pdf:takumi:fetch": "node scripts/fetch-takumi-tests.mjs",
     "test:takumi:verify": "node scripts/takumi-test-corpus.mjs",
     "pdf:setup": "node bench/pdf/setup.mjs",

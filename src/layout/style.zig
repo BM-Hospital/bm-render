@@ -295,6 +295,12 @@ pub const Style = struct {
     clear: Clear = .none,
     /// `display: flow-root` (and anything else that makes a block container establish a formatting context)
     flow_root: bool = false,
+    /// An absolutely positioned outside list marker whose item has no line of its own to join (its
+    /// first content is a flex / grid / table / replaced box): placed at its static position in
+    /// the inline axis and with its baseline on the item's first baseline (Blink
+    /// `PositionListMarkerBesideChild`: the first in-flow child with one), else at the item's
+    /// content-box top (`PositionListMarkerWithoutLineBoxes`). block.zig only.
+    list_marker: bool = false,
     /// The node is the inline content of a block container (a measured text leaf or an `inline_row`): with
     /// `Config.inline_fn` it keeps its full width next to floats and its lines are shortened instead of
     /// the whole box avoiding them (flow.zig).

@@ -23,11 +23,15 @@
 //!   strokes the shape (`paintSymbol`, Blink's `PaintSymbol`).
 //!
 //! An outside marker of an item whose first content is a block joins that block's first line (takumi
-//! aligns it with that block's first baseline, still hung off the item). URL marker images use
-//! their intrinsic dimensions; missing/gradient images fall back to counters. Not covered: `::marker`
-//! rules (takumi matches none), an
-//! outside marker of an item whose first content is a flex / grid / table / replaced box (no
-//! marker), floats intruding on the marker (`list_marker_intruded_float_offset`).
+//! aligns it with that block's first baseline, still hung off the item). An item whose first content
+//! is a flex / grid / table / replaced box has no line for it to join: the marker is then a
+//! block-level box of the item that the layout takes out of flow and places with its baseline on
+//! the item's first baseline (the first in-flow child with one; at the content top when none has
+//! one: Blink's `PositionListMarkerBesideChild` / `PositionListMarkerWithoutLineBoxes`,
+//! `layout.Style.list_marker`); it paints and is tagged in tree order, before the item's content.
+//! URL marker images use their intrinsic dimensions; missing/gradient images fall back to counters.
+//! Not covered: `::marker` rules (takumi matches none), floats intruding on the marker
+//! (`list_marker_intruded_float_offset`).
 const std = @import("std");
 const render = @import("../render.zig");
 const style = @import("../style/style.zig");
@@ -75,7 +79,17 @@ pub const Info = struct {
     inset: f32 = 0,
     /// the marker's render node (none until built)
     node: u32 = none,
+    /// outside, with no line to join (the item starts with a flex / grid / table / replaced box):
+    /// an absolutely positioned box of the item that the layout places with its baseline on the
+    /// item's first baseline (`layout.Style.list_marker`)
+    beside: bool = false,
 };
+
+/// Whether render node `id` is an outside marker placed beside its item's first baseline.
+pub fn besideBaseline(f: *const Frame, id: u32) bool {
+    const info = ofNode(f, id) orelse return false;
+    return info.beside;
+}
 
 pub const State = struct {
     infos: std.ArrayList(Info) = .empty,
@@ -132,8 +146,17 @@ pub fn hasMarker(f: *const Frame, el: u32) bool {
 /// The render node of the list item whose marker node `id` is (takumi `marker_tag_target`: its
 /// `Lbl` holds the marker), null when `id` is no marker.
 pub fn labelOwner(f: *const Frame, id: u32) ?u32 {
-    const info = ofNode(f, id) orelse return null;
-    var cur = f.nodes.items[id].parent;
+    if (stateOf(f) == null) return null;
+    // (an image marker's content is the replaced box inside the marker box)
+    var mk = id;
+    var up: u32 = 0;
+    const info = while (true) : (up += 1) {
+        if (ofNode(f, mk)) |i| break i;
+        if (up == 2 or (up == 0 and f.nodes.items[mk].kind != .image)) return null;
+        mk = f.nodes.items[mk].parent;
+        if (mk == none) return null;
+    };
+    var cur = f.nodes.items[mk].parent;
     var guard: u32 = 0;
     while (cur != none and guard < 4096) : (guard += 1) {
         const n = &f.nodes.items[cur];
@@ -508,7 +531,9 @@ fn attach(f: *Frame, item: u32, ordinal: i32) Error!void {
         if (f.r.resolveSvg(url)) |source| {
             const doc = @import("../svg/svg.zig").parse(a, source) catch break :blk null;
             const sz = render.svgIntrinsic(&doc, f.opts.dpr);
-            break :blk .{ .url = url, .width = if (sz.w > 0) sz.w else 300 * f.opts.dpr };
+            // (no natural width: takumi's outside marker box shrinks to nothing around it; the
+            // line's text keeps its place)
+            break :blk .{ .url = url, .width = @max(sz.w, 0) };
         }
         break :blk null;
     };
@@ -518,7 +543,11 @@ fn attach(f: *Frame, item: u32, ordinal: i32) Error!void {
     // declaration), not a render failed for characters the document never wrote.
     if (k == .other and !covered(f, ics, text)) text = try std.fmt.allocPrint(a, "{d}. ", .{ordinal});
     const outside = ics.list_style_position == .outside;
-    const hp: Host = if (outside) (outsideHost(f, item, rtl) orelse return) else .{ .el = item, .inset = 0 };
+    // (no line to join: the marker is the item's own out-of-flow box, placed beside the item's
+    // first baseline by the layout, `layout.Style.list_marker`)
+    const hosted = if (outside) outsideHost(f, item, rtl) else null;
+    const beside = outside and hosted == null;
+    const hp: Host = if (!outside) .{ .el = item, .inset = 0 } else hosted orelse .{ .el = item, .inset = startEdges(ics, rtl) };
     const host = hp.el;
 
     var diag: style.Diagnostics = .{};
@@ -527,7 +556,7 @@ fn attach(f: *Frame, item: u32, ordinal: i32) Error!void {
         error.OutOfMemory => return error.OutOfMemory,
         else => return,
     };
-    var info: Info = .{ .item = item, .host = host, .outside = outside, .inset = hp.inset };
+    var info: Info = .{ .item = item, .host = host, .outside = outside, .inset = hp.inset, .beside = beside };
     const symbolic = image == null and isSymbolic(k);
     var box_text = text;
     if (image) |im| info.image_width = im.width;
@@ -567,6 +596,10 @@ fn attach(f: *Frame, item: u32, ordinal: i32) Error!void {
         cs.white_space_collapse = .preserve;
         cs.text_wrap_mode = .nowrap;
         if (symbolic) cs.width = .{ .lp = .{ .px = info.symbol_w } };
+        // (block-level, so no anonymous line wraps it among the item's block children; the layout
+        // takes it out of flow: render.zig `layoutNode`. It paints and tags in tree order, before
+        // the item's content, as takumi paints a marker)
+        if (beside) cs.display = .block;
     } else if (image != null) {
         cs.display = .@"inline";
         cs.margin[if (rtl) 3 else 1] = .{ .lp = .{ .px = marker_gap_px } };
@@ -755,4 +788,56 @@ test "list markers: ordinals, texts, and boxes hung outside the line" {
     const last = st.infos.items[st.infos.items.len - 1];
     try T.expect(last.host != last.item);
     try T.expectApproxEqAbs(@as(f32, 5), last.inset, 0.01);
+}
+
+test "list markers: an item starting with a flex, grid or table box hangs its marker beside the first baseline" {
+    if (comptime !@import("../config.zig").enable_pdf) return;
+    const T = std.testing;
+    const gpa = T.allocator;
+    const r = render.Renderer.create(gpa) orelse return error.OutOfMemory;
+    defer r.destroy();
+    _ = try r.registerFont(try gpa.dupe(u8, @embedFile("../font/testdata/Inter-Regular.ttf")), "", 0, -1, null);
+    r.beginCall();
+    const a = r.arena.allocator();
+    var f: Frame = .{ .r = r, .a = a, .opts = .{}, .tree = render.LTree.init(a), .ctx = undefined };
+    f.tree.paged.pdf = true;
+    f.setPaged(400, 600);
+    const src =
+        \\<ol style="font-size:16px;line-height:20px;padding-left:40px">
+        \\<li><div style="display:flex;padding-top:7px"><span>flex</span></div></li>
+        \\<li><div style="display:grid;font-size:24px;line-height:30px"><span>grid</span></div></li>
+        \\<li><table><tr><td style="padding:5px">cell</td></tr></table></li>
+        \\</ol>
+    ;
+    try f.prepare(.html, src);
+    const st = stateOf(&f) orelse return error.TestUnexpectedResult;
+    try T.expectEqual(@as(usize, 3), st.infos.items.len);
+    // each marker's baseline is the baseline of the text its item starts with, and it hangs left
+    // of the item's content box
+    const texts = [_][]const u8{ "flex", "grid", "cell" };
+    for (st.infos.items, texts) |info, text| {
+        try T.expect(info.beside and info.node != none);
+        const mn = &f.nodes.items[info.node];
+        const ml = f.tree.layout(mn.lid);
+        try T.expect(std.math.isFinite(ml.baseline));
+        const marker_bl = testAbs(&f, mn.lid)[1] + ml.baseline;
+        var found = false;
+        for (f.nodes.items) |*n| {
+            const p = n.para orelse continue;
+            if (!std.mem.eql(u8, render.Frame.paragraphText(p), text)) continue;
+            if (n.lid == none) continue;
+            const l = f.tree.layout(n.lid);
+            try T.expect(std.math.isFinite(l.baseline));
+            const text_bl = testAbs(&f, n.lid)[1] + l.baseline;
+            // (a table's first baseline is its first row's, as the layout reports it: takumi's and
+            // Chrome's markers sit a few px below the cell text too)
+            if (std.mem.eql(u8, text, "cell")) {
+                try T.expect(marker_bl >= text_bl and marker_bl < text_bl + 8);
+            } else try T.expectApproxEqAbs(text_bl, marker_bl, 0.02);
+            const item_left = testAbs(&f, f.nodes.items[mn.parent].lid)[0];
+            try T.expect(testAbs(&f, mn.lid)[0] + ml.w <= item_left + 0.01);
+            found = true;
+        }
+        try T.expect(found);
+    }
 }

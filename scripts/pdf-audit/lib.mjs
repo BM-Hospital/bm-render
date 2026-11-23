@@ -19,6 +19,7 @@ import { structureParts } from "../pdf-structure.mjs";
 import { interchangeParts } from "../pdf-interchange.mjs";
 import { REVISION } from "../takumi-test-corpus.mjs";
 import { findBin } from "../../bench/pdf/lib/tools.mjs";
+import { kindOf } from "./gate.mjs";
 
 export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const takumiSrc = path.join(root, "tests", "upstream", "takumi");
@@ -41,15 +42,28 @@ if (pinnedProvenance) for (const [file, expected] of [["wasm/takumi_pdf_wasm_bg.
 export const refMod = refEntry && existsSync(refEntry) ? await import(pathToFileURL(refEntry).href) : null;
 export const refVersion = refMod ? pinnedProvenance ? `${pinnedProvenance.version} source ${pinnedProvenance.revision}` : JSON.parse(readFileSync(path.join(refDir, "node_modules", "takumi-pdf", "package.json"), "utf8")).version : null;
 
+/** What the probes compare against: the pinned source build (with its hashes) or the published package. */
+export const oracle = !refMod ? null : pinnedProvenance
+  ? { kind: pinnedProvenance.kind, revision: pinnedProvenance.revision, version: pinnedProvenance.version, entry: path.relative(root, refEntry), wasmSha256: pinnedProvenance.wasmSha256, wrapperSha256: pinnedProvenance.wrapperSha256, cargoLockSha256: pinnedProvenance.cargoLockSha256, wasmBindgen: pinnedProvenance.wasmBindgen }
+  : { kind: "published-npm (not the pinned revision)", version: refVersion, entry: refEntry };
+
 const fontCache = new Map();
+const fontFiles = new Map();
 /** Font bytes by a path relative to the repo root or to tests/upstream/takumi. */
 export function font(rel) {
   if (!fontCache.has(rel)) {
     const a = path.join(root, rel); const b = path.join(takumiSrc, rel);
-    fontCache.set(rel, new Uint8Array(readFileSync(existsSync(a) ? a : b)));
+    const file = existsSync(a) ? a : b;
+    const bytes = new Uint8Array(readFileSync(file));
+    fontCache.set(rel, bytes);
+    fontFiles.set(rel, { file: path.relative(root, file).replaceAll(path.sep, "/"), sha256: createHash("sha256").update(bytes).digest("hex") });
   }
   return fontCache.get(rel);
 }
+/** The font files the probes that ran loaded through `font()`, with their hashes. */
+export const fontsUsed = () => [...fontFiles.values()].sort((x, y) => x.file.localeCompare(y.file));
+/** The pdftotext executable the probes run, or null. */
+export const popplerBin = () => findBin("poppler", "pdftotext") || "pdftotext";
 export const INTER = "assets/fonts/Inter-Regular.ttf";
 export const INTER_BOLD = "assets/fonts/Inter-Bold.ttf";
 export const ARCHIVO = "assets/fonts/archivo/Archivo-VariableFont_wdth,wght.ttf";
@@ -275,6 +289,8 @@ const probes = [];
  * `t.note(text)`, and `t.both(source, options, extra)`.
  */
 export function probe(id, feature, fn) { probes.push({ id, feature, fn }); }
+/** The registered probes' ids and features, in registration order (nothing is run). */
+export const listProbes = () => probes.map(({ id, feature }) => ({ id, feature }));
 
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -283,17 +299,20 @@ export async function runProbes(filter = []) {
   const rows = [];
   for (const p of probes) {
     if (filter.length && !filter.some((f) => p.id.includes(f))) continue;
-    const row = { id: p.id, feature: p.feature, pass: 0, fail: 0, unverified: 0, notes: [], failures: [] };
+    const row = { id: p.id, feature: p.feature, pass: 0, fail: 0, unverified: 0, notes: [], failures: [], kinds: {} };
+    /** assertions per kind (scripts/pdf-audit/gate.mjs kindOf) */
+    const count = (what, good) => { const k = kindOf(what); const c = (row.kinds[k] ??= { pass: 0, fail: 0 }); if (good) c.pass++; else c.fail++; };
     const t = {
       both,
       bm: bmRender,
       ref: refRender,
       hasRef: !!refMod,
-      ok(cond, what) { if (cond) row.pass++; else { row.fail++; row.failures.push(what); } return !!cond; },
+      ok(cond, what) { count(what, !!cond); if (cond) row.pass++; else { row.fail++; row.failures.push(what); } return !!cond; },
       /** bm value must equal the reference value; without the reference: unverified. */
       same(what, a, b) {
         if (!refMod) { row.unverified++; return false; }
         const good = eq(a, b);
+        count(what, good);
         if (good) row.pass++; else { row.fail++; row.failures.push(`${what}: bm ${JSON.stringify(a)?.slice(0, 300)} vs takumi ${JSON.stringify(b)?.slice(0, 300)}`); }
         return good;
       },

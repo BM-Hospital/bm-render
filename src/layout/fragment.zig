@@ -108,7 +108,8 @@ pub const Start = struct {
     node: u32 = no_node,
     line: u32 = no_node,
     forced: bool = false,
-    /// Independent cell flows of a table row. Flex/grid keep their established track width.
+    /// Independent flows of a table row, a flex line or a grid row (whose items keep the width of
+    /// their first fragment on a page of another width: `FrozenWidth`).
     branches: []const ResumePoint = &.{},
     row_height: f32 = 0,
     /// Rowspanning cell paragraphs continue independently of the current row.
@@ -116,6 +117,10 @@ pub const Start = struct {
 };
 pub const ParagraphCut = struct { node: u32, glyph: u32 };
 pub const RowMinimum = struct { node: u32, height: f32, top: ?f32 = null };
+/// A flex or grid container continued on a page of another width keeps laying its items out at the
+/// border-box width `w` of its first fragment (takumi: the container's box takes the page's width,
+/// its items keep the sizes and offsets the flex / grid algorithm gave them).
+pub const FrozenWidth = struct { node: u32, w: f32 };
 
 pub const Page = struct { top: f32, height: f32 };
 /// Lines `first_line..` of `node` (up to the next entry of the same node) are painted `dy` lower.
@@ -257,6 +262,9 @@ pub const PagedState = struct {
     cut_glyph: u32 = 0,
     cuts: []const ParagraphCut = &.{},
     row_minimums: []const RowMinimum = &.{},
+    /// Flex / grid containers whose items lay out at another width than the container's own
+    /// (src/pdf/paged.zig, tree.zig).
+    frozen_widths: []const FrozenWidth = &.{},
     /// Placement shifts of whole floats deferred to another fragmentainer.
     /// Recomputed inline layout consumes these through the BFC exclusion space.
     float_shifts: []f32 = &.{},
@@ -499,7 +507,8 @@ fn Engine(comptime T: type) type {
                 errdefer e.a.free(token.branches);
                 try e.starts.append(e.a, token);
             }
-            if (page == 0) if (e.start_h) |h0| return h0;
+            // (page 0 ends at the start: `Options.origin` is where it starts)
+            if (page == 0) if (e.start_h) |h0| return h0 - e.opts.origin;
             const h = if (e.opts.page_height_fn) |f| f(e.opts.ctx, page, name) else e.opts.page_height;
             if (!(h >= 1) or !(h < 16_777_216)) return error.InvalidPageSize;
             return h;
@@ -510,7 +519,8 @@ fn Engine(comptime T: type) type {
             while (e.tops.items.len < @as(usize, page) + 2) {
                 const k: u32 = @intCast(e.tops.items.len - 1);
                 const h = try e.pageHeight(k);
-                try e.tops.append(e.a, e.tops.items[k] + h);
+                // (page 1 of `Options.start` starts exactly at `start_top`)
+                try e.tops.append(e.a, if (k == 0 and e.start_h != null) e.start_h.? else e.tops.items[k] + h);
             }
         }
         fn window(e: *Self, page: u32) Error!Pg {
@@ -683,17 +693,26 @@ fn Engine(comptime T: type) type {
             while (guard < tr.max_depth + 8) : (guard += 1) {
                 const st = &e.st[cur];
                 if (!st.started) return .{};
-                const k = e.kindOf(cur);
+                var k = e.kindOf(cur);
                 if (st.spanned) {
+                    // (a cell whose content ended while its row goes on: the row resumes with
+                    // every cell finished, as a row whose cells all ended does)
+                    if (k != .row and cur != e.t.root and e.kindOf(e.t.nodes.items[cur].parent) == .row) {
+                        cur = e.t.nodes.items[cur].parent;
+                        k = .row;
+                    }
                     if (k != .row) return .{};
+                    const row_st = &e.st[cur];
                     var points: std.ArrayList(ResumePoint) = .empty;
                     defer points.deinit(e.a);
                     var child = e.t.nodes.items[cur].first_child;
                     while (child != no_node) : (child = e.t.nodes.items[child].next_sibling) {
                         if (e.style(child).display == .none or e.style(child).position.isOut()) continue;
+                        // (a cell that spans rows is a side flow of its own, as in `seqOf`)
+                        if (e.t.layouts.items[child].h > e.lay(cur).h + eps) continue;
                         if (!try e.finishedPoints(child, &points, 0)) return .{};
                     }
-                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = if (st.seq != no_node) e.seqs.items[st.seq].h0 else e.lay(cur).h };
+                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = if (row_st.seq != no_node) e.seqs.items[row_st.seq].h0 else e.lay(cur).h };
                 }
                 if (k == .text) return .{ .node = cur, .line = st.@"resume" };
                 if (st.seq == no_node) return .{};
@@ -704,14 +723,14 @@ fn Engine(comptime T: type) type {
                 if (!st.child_inside) return .{ .node = c, .forced = st.forced_resume };
                 // (parallel flows broken inside resume at more than one point)
                 if ((k == .row or k == .bands) and bandEnd(sq, st.@"resume") != st.@"resume" + 1) {
-                    if (k != .row) return .{};
+                    // (a flex line or grid row: its items keep their layout on the next page, `FrozenWidth`)
                     var points: std.ArrayList(ResumePoint) = .empty;
                     defer points.deinit(e.a);
                     const end = bandEnd(sq, st.@"resume");
                     for (sq.items[st.@"resume"..end]) |item| {
                         if (!item.flow or !try e.resumePoints(item.node, &points, 0)) return .{};
                     }
-                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = sq.h0 };
+                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = if (k == .row) sq.h0 else 0 };
                 }
                 cur = c;
             }
@@ -802,19 +821,38 @@ fn Engine(comptime T: type) type {
             }
             return e.start_h != null and e.page == 0 and s.line == no_node and s.node == c;
         }
+        /// Whether `Options.start` says the parallel flow `c` (or a box in it) ended before the
+        /// start: on page 0 it stays where the pages laid out before had it, not pushed past it.
+        fn startFinished(e: *const Self, c: u32) bool {
+            const s = e.opts.start orelse return false;
+            if (e.start_h == null or e.page != 0) return false;
+            for ([_][]const ResumePoint{ s.branches, s.side_flows }) |points| for (points) |p| {
+                if (!p.finished) continue;
+                var n = p.node;
+                var guard: u32 = 0;
+                while (n < e.t.nodes.items.len and guard < tr.max_depth + 8) : (guard += 1) {
+                    if (n == c) return true;
+                    if (n == e.t.root) break;
+                    n = e.t.nodes.items[n].parent;
+                }
+            };
+            return false;
+        }
         fn startForced(e: *const Self, c: u32) bool {
             const s = e.opts.start orelse return false;
             for (s.side_flows) |p| if (!p.finished and p.node == c) return p.forced;
             for (s.branches) |p| if (!p.finished and p.node == c) return p.forced;
             return s.forced;
         }
-        /// The block offset `Options.start` names (null: no point to break at).
+        /// The block offset `Options.start` names (null: no point to break at): the earliest of its
+        /// flows' points, where the page starts (a float continued above a paragraph line it pushed
+        /// onto the page: the page starts at the float, the line stays below it).
         fn startY(e: *Self, s: Start) ?f32 {
             var y = e.mainStartY(s);
             for (s.side_flows) |p| {
                 if (p.finished) continue;
                 const side = e.mainStartY(.{ .node = p.node, .line = p.line, .forced = p.forced }) orelse return null;
-                y = if (y) |main| @max(main, side) else side;
+                y = if (y) |main| @min(main, side) else side;
             }
             return y;
         }
@@ -833,7 +871,7 @@ fn Engine(comptime T: type) type {
             const top = e.absTopOf(s.node);
             if (s.line != no_node) {
                 const lines = e.linesOf(s.node);
-                if (s.line == 0 or s.line >= lines.len) return null;
+                if (s.line >= lines.len) return null;
                 return top + lines[s.line].top;
             }
             return top - (if (s.forced) @max(e.lay(s.node).margin.top, 0) else 0);
@@ -945,6 +983,48 @@ fn Engine(comptime T: type) type {
         }
 
         /// Monolithic content without line boxes (a replaced element, a `line-clamp` box).
+        /// Whether an overflow clip of an ancestor (below `root`) cuts `n` away: a clipping box on
+        /// its containing block chain. An absolutely positioned box escapes the clipping boxes
+        /// between it and its containing block (CSS Overflow 3: the clip applies to the descendants
+        /// it contains), and so does what it holds; a fixed box escapes them all. `started`: a
+        /// clipping box that broke on an earlier page counts too (else it clips nothing here).
+        fn clippedOut(e: *Self, n: u32, root: u32, started: bool) bool {
+            const ns = e.t.nodes.items;
+            var abs = ns[n].style.position == .absolute;
+            if (ns[n].style.position == .fixed) return false;
+            var p = ns[n].parent;
+            var guard: u32 = 0;
+            while (p != no_node and p != root and guard < tr.max_depth + 8) : (guard += 1) {
+                const ps = ns[p].style;
+                const clips = clipsY(ps) and (started or !e.st[p].started);
+                if (abs) {
+                    if (ps.position != .static) {
+                        if (clips) return true;
+                        if (ps.position == .fixed) return false;
+                        abs = ps.position == .absolute;
+                    }
+                } else {
+                    if (clips) return true;
+                    if (ps.position == .fixed) return false;
+                    if (ps.position == .absolute) abs = true;
+                }
+                p = ns[p].parent;
+            }
+            return false;
+        }
+
+        /// Whether `n` is inside a clipping box (below `root`) that did not break on an earlier page.
+        fn insideClip(e: *Self, n: u32, root: u32) bool {
+            const ns = e.t.nodes.items;
+            var p = ns[n].parent;
+            var guard: u32 = 0;
+            while (p != no_node and p != root and guard < tr.max_depth + 8) : (guard += 1) {
+                if (clipsY(ns[p].style) and !e.st[p].started) return true;
+                p = ns[p].parent;
+            }
+            return false;
+        }
+
         fn monoLeaf(e: *Self, n: u32) bool {
             return switch (e.kindOf(n)) {
                 .mono => true,
@@ -1321,7 +1401,9 @@ fn Engine(comptime T: type) type {
                 agg.last = join(agg.last, join(rc.last, cb.after));
                 var end = rc.end;
                 const sep0 = ct > band_top + eps;
-                if (rc.brk and !rc.par and !rc.forced and sep0 and ct > pg.start + eps and e.breaksAtStart(c)) {
+                // (an item the pages before ended stays on page 0 of `Options.start`)
+                const kept = e.startFinished(c);
+                if (!kept and rc.brk and !rc.par and !rc.forced and sep0 and ct > pg.start + eps and e.breaksAtStart(c)) {
                     // it breaks before all its content and sits lower than its row: the break before
                     // it is as good as one before a monolithic item (Blink's flex / grid items are
                     // parallel flows, whose block-start breakpoint is a class A one)
@@ -1338,7 +1420,7 @@ fn Engine(comptime T: type) type {
                     // unbreakable and too tall: it stays where a break before it makes no progress, else
                     // it goes to the next page alone (a last resort unless it sits lower than its row)
                     const sep = ct > band_top + eps;
-                    if (!(ct <= pg.start + eps or (requires and !sep))) {
+                    if (!(kept or ct <= pg.start + eps or (requires and !sep))) {
                         e.slot[c] = .{ .stamp = e.stamp, .kind = .push, .brk = true };
                         agg.brk = true;
                         agg.appeal = worse(agg.appeal, if (sep) .perfect else .last_resort);
@@ -1479,6 +1561,11 @@ fn Engine(comptime T: type) type {
                 } else if (lt <= lpg.start + eps or lb <= lpg.end + eps) {
                     mp = true;
                 } else mp = appeal_before == .last_resort and requires;
+                // (the paragraph's first line placed below a float that reaches past the page end,
+                // on a later page whole: the empty space before it breaks, nothing moves; takumi lays
+                // the line out on the page the float leaves room on)
+                if (!mp and lc == 0 and i == start and !stt.started and lines[i].top > eps and lt >= pg.next - eps)
+                    return try e.setBreak(n, .line, i, false, .perfect, false, bottom, pg.end);
                 if (!mp) {
                     var go_on = false;
                     if (lc != 0) {
@@ -1669,7 +1756,16 @@ fn Engine(comptime T: type) type {
                 // item down to the page start only when it began before it, so an item that the gap
                 // carried past the page end keeps its distance; takumi golden paged-header-footer)
                 const ns = e.style(n);
-                if (k == .bands and ns.display == .flex and (ns.flex_direction == .column or ns.flex_direction == .column_reverse)) gap = 0;
+                if (k == .bands and ns.display == .flex and (ns.flex_direction == .column or ns.flex_direction == .column_reverse)) {
+                    // (but the block-end margin of the item before, where it reaches past the page
+                    // start, is truncated there: the item's own margin and the gap stay; takumi
+                    // window_scenes.rs report.html on 90 px pages, Chrome likewise)
+                    gap = 0;
+                    if (p > 0 and reach < next) {
+                        const mb = @max(e.lay(sq.items[p - 1].node).margin.bottom, 0);
+                        gap = std.math.clamp(reach + mb - next, 0, mb);
+                    }
+                }
                 var target = @max(@max(next, reach), band_top - gap);
                 // (content that overflows the page and is left behind: what follows starts the next page)
                 const stays = k == .block and e.overflowStays(sq, i, top, pg_in.end);
@@ -1775,6 +1871,9 @@ fn Engine(comptime T: type) type {
                     const c = sq.items[k].node;
                     if (!e.st[c].full or e.heightDefinite(c)) continue;
                     const cl = e.lay(c);
+                    // (a grid item spanning more than one row keeps the block size the grid gave
+                    // it: takumi / Blink grow only the rows a break moves content down in)
+                    if (comptime @TypeOf(cl.grid_row_span) != void) if (cl.grid_row_span > 1) continue;
                     cl.h = @max(cl.h, new_bottom - e.itemTop(sq, k, top));
                 }
             }
@@ -1915,6 +2014,8 @@ fn Engine(comptime T: type) type {
             for (ns) |*nd| {
                 if (nd.style.breaks.page != 0) e.any_names = true;
             }
+            // (the root moves first: a start is where the moved content has it)
+            if (e.opts.root_shift != 0) e.lay(root).y += e.opts.root_shift;
             if (e.opts.start) |s| if (e.startY(s)) |y| {
                 const h = e.opts.start_top orelse y;
                 if (h >= 1 and h < 16_777_216) {
@@ -1925,7 +2026,6 @@ fn Engine(comptime T: type) type {
                     e.lay(root).y += e.shift;
                 }
             };
-            if (e.opts.root_shift != 0) e.lay(root).y += e.opts.root_shift;
             try e.tops.append(e.a, e.opts.origin);
             try e.need(0);
             // (a fixed box keeps where it was laid out against the first page, whatever moves its
@@ -1952,10 +2052,12 @@ fn Engine(comptime T: type) type {
                     const parent_seq = e.st[ns[cur].parent].seq;
                     const row_height = if (parent_seq != no_node) e.seqs.items[parent_seq].h0 else e.lay(ns[cur].parent).h;
                     const is_rowspan = pk == .row and e.lay(cur).h > row_height + eps;
-                    var descend = s.display != .none and !ns[cur].measured and e.kindOf(cur) != .mono and (!clipsY(s) or e.st[cur].started);
+                    // (a clipping box is walked for the absolutely positioned boxes escaping it)
+                    var descend = s.display != .none and !ns[cur].measured and e.kindOf(cur) != .mono;
                     // (an atomic inline box is monolithic)
                     if (pk == .text and !is_abs and !is_float) descend = false;
-                    if (s.display != .none) {
+                    const clipped = if (s.position == .fixed) e.insideClip(cur, root) else (is_abs or is_float or is_rowspan) and e.clippedOut(cur, root, false);
+                    if (s.display != .none and !clipped) {
                         if (s.position == .fixed) {
                             try e.fixed.append(e.a, cur);
                             // where it was laid out, or, with no block offsets (its static position),
@@ -2072,8 +2174,10 @@ fn Engine(comptime T: type) type {
                 const early_mono = cur != root and base + l.y < last_top - eps and e.monoLeaf(cur);
                 if (s.display != .none and (s.position != .fixed or cur == root) and !early_mono) {
                     const y = base + l.y;
-                    extent.* = @max(extent.*, y + l.h);
-                    descend = !ns[cur].measured and (!clipsY(s) or cur == root) and ns[cur].first_child != no_node and sp < stack.len;
+                    // (the content of a clipping box adds nothing, but the absolutely positioned
+                    // boxes escaping it do)
+                    if (cur == root or !e.clippedOut(cur, root, true)) extent.* = @max(extent.*, y + l.h);
+                    descend = !ns[cur].measured and ns[cur].first_child != no_node and sp < stack.len;
                     if (descend) {
                         stack[sp] = base;
                         sp += 1;

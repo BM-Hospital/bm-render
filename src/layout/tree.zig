@@ -134,6 +134,8 @@ pub const Out = struct {
 pub const Layout = struct {
     /// Unaligned grid-area block start, relative to the grid, for PDF continuation.
     grid_block_start: if (st.frag_enabled) f32 else void = if (st.frag_enabled) NONE else {},
+    /// Grid rows the item's area spans (0: not a grid item), for PDF continuation.
+    grid_row_span: if (st.frag_enabled) u16 else void = if (st.frag_enabled) 0 else {},
     /// border-box position relative to the parent's border-box origin
     x: f32 = 0,
     y: f32 = 0,
@@ -472,7 +474,8 @@ fn algoOf(d: st.Display) Algo {
 pub const StaticPos = struct {
     /// static-position rectangle relative to the container's border-box origin: x, y, w, h
     rect: [4]f32,
-    /// alignment inside the rectangle per axis: 0 = start, 1 = center, 2 = end
+    /// alignment inside the rectangle per axis: 0 = start, 1 = center, 2 = end, 3 = the box's first
+    /// baseline at the rectangle's start (block axis; `Style.list_marker`)
     al: [2]u8 = .{ 0, 0 },
     /// stretch to the rectangle when size is auto and insets are auto (grid areas)
     stretch: [2]bool = .{ false, false },
@@ -1102,19 +1105,33 @@ pub fn TreeWith(comptime cfg: Config) type {
             defer self.depth -= 1;
             self.node_computes += 1;
 
+            // (a flex / grid container continued at another page width: its items keep the layout
+            // they had at its first fragment's width, its own box takes the new one)
+            var frozen_in: In = undefined;
+            const frozen_w: ?f32 = if (comptime st.frag_enabled) blk: {
+                if (algo != .flex and algo != .grid or as_flow or leaf or !has(in.known[0])) break :blk null;
+                for (self.paged.frozen_widths) |fw| if (fw.node == node) break :blk fw.w;
+                break :blk null;
+            } else null;
+            const in_used: *const In = if (frozen_w) |w| blk: {
+                frozen_in = in.*;
+                frozen_in.known[0] = w;
+                break :blk &frozen_in;
+            } else in;
             if (as_flow) {
                 try flow.compute(self, node, in, out, ictx);
             } else if (leaf) {
                 self.computeLeaf(node, in, out);
             } else switch (algo) {
-                .flex => try flex.compute(self, node, in, out),
+                .flex => try flex.compute(self, node, in_used, out),
                 .block => try block.compute(self, node, in, out),
-                .grid => try grid.compute(self, node, in, out),
+                .grid => try grid.compute(self, node, in_used, out),
                 .table => if (cfg.tables) try table.compute(self, node, in, out) else try block.compute(self, node, in, out),
                 .inline_row => if (cfg.inline_row and !cfg.inline_fn) try inline_row.compute(self, node, in, out) else try block.compute(self, node, in, out),
                 .none => out.* = .{ .size = .{ 0, 0 } },
             }
             if (in.layout and n.style.rtl and !leaf and !as_flow and mirrors(self.nodes.items[node].style)) self.flipChildren(node, out.size[0]);
+            if (frozen_w != null) out.size[0] = in.known[0];
 
             if (fctx) return;
             var e: *Entry = &c.final;
@@ -1344,6 +1361,8 @@ pub fn TreeWith(comptime cfg: Config) type {
                     pos[a] = switch (sp.al[a]) {
                         0 => r0 + b.margin[a],
                         1 => r0 + self.div(rs - size[a] + b.margin[a] - b.margin[e], 2),
+                        // (no baseline: its block-end margin edge, as an atomic inline's)
+                        3 => r0 - orElse(c.out.baseline, size[a] + b.margin[e]),
                         else => r0 + rs - size[a] - b.margin[e],
                     };
                 }
@@ -1366,6 +1385,7 @@ pub fn TreeWith(comptime cfg: Config) type {
                 const ry = rnd(o[1], k);
                 const r: Layout = .{
                     .grid_block_start = if (comptime st.frag_enabled) (if (has(l.grid_block_start)) rnd(cum[1] + l.grid_block_start, k) - rnd(cum[1], k) else NONE) else {},
+                    .grid_row_span = l.grid_row_span,
                     .x = rx - rnd(cum[0], k),
                     .y = ry - rnd(cum[1], k),
                     .w = rnd(o[0] + l.w, k) - rx,
