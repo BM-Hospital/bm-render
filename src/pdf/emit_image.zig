@@ -435,6 +435,15 @@ pub fn draw(cx: *Ctx, bytes: ?[]const u8, bytes_hash: u64, pmx: ?*const raster.P
                 .arg = std.fmt.allocPrint(cx.a, "{s}: {s}An error occurred while decoding the image data: the image format is not supported", .{ label, if (filter != null) "a filter needs the image's pixels: " else "" }) catch "",
             } },
             .gif => return .none,
+            // takumi-pdf `rasterized_image`: a filter needs the pixels, so a PNG whose pixels do not
+            // decode stops the render (UndrawableImage) instead of leaving the image out
+            .png => if (filter != null and pmx == null) switch (pk.decode(cx.a, b, render.Renderer.max_image_pixels)) {
+                .fail => |m| return .{ .fail = .{
+                    .msg = "Image could not be decoded: ",
+                    .arg = std.fmt.allocPrint(cx.a, "{s}: a filter needs the image's pixels: An error occurred while decoding the image data: {s}", .{ label, m }) catch "",
+                } },
+                else => {},
+            },
             else => {},
         }
         key = bh | 1;

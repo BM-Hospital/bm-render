@@ -1,153 +1,184 @@
 # PDF fragments and page lifetime
 
-Implementation checkpoint for `.agents/plans/pdf-takumi-parity`, tasks 02–03 and 16–21.
-Reference: Takumi `ff9a5d411310c8cdd1ac76a4f106c123d309e0a4`.
+Design record for `.agents/plans/pdf-takumi-parity` task 02, written against the code as it is on
+2026-11-23 (`src/layout/fragment.zig`, `src/pdf/paged.zig`, `src/pdf/chunks.zig`, `src/pdf/emit.zig`).
+Reference: Takumi `ff9a5d411310c8cdd1ac76a4f106c123d309e0a4` (`takumi-pdf/src/streaming_tests.rs`,
+`tests/window_scenes.rs`, `src/memory_tests.rs`). The implementation history is in
+`.agents/plans/pdf-takumi-parity/streaming-chunks.md`; this file describes the model and its limits.
 
-## Coordinates and decoration fragments
+## 1. Coordinates: one stitched space, page windows
 
-The current layout produces stitched document coordinates. A page owns a half-open
-vertical window. Layout coordinates, a fragment's local coordinates, and the final
-paint transform must remain separate: painting must never temporarily rewrite a
-shared layout node.
+Layout runs once per frame at the page-area width with an unbounded height. `fragment.paginate`
+then chooses breaks (Blink LayoutNG rules as ported by takumi-core: break classes and appeal,
+forced and avoid breaks, orphans/widows, monolithic content, parallel flows) by probing one page at
+a time on the finished layout and applying the break: content after a break moves down to the next
+page by rewriting `Layout.y` / `Layout.h`. The result is one coordinate space where page `i` is the
+half-open window `[pages[i].top, pages[i].top + pages[i].height)` (takumi's `PageSizes` /
+`PageWindows`).
 
-For a transformed box spanning pages, `Emitter.BoxFragment` records the box ID and
-the active fragment window. The local transform origin resolves against that
-fragment's dimensions. The border/background use the fragment window, while child
-content retains its stitched offset. Deferred paint queues and lifted stacking
-contexts capture the fragment state along with CTM, clips and page ownership.
+What boxes alone cannot express is returned in `fragment.Pages` and never patched into shared
+nodes by the painter:
 
-Text ownership uses the paragraph border-box span, transformed together with the
-line. A visible line whose baseline was clipped uses its visible vertical extent.
-Its owning page emits selectable text; neighbouring pages reached by its geometry
-emit outlines. This avoids duplicate extracted text when a rotated line reaches a
-previous page.
+| Field | Meaning |
+|:--|:--|
+| `pages: []Page` | the windows (`top`, `height`), per page the page name (`@page` named pages) |
+| `line_shifts: []LineShift` | lines `first_line..` of a text node painted `dy` lower (a line never splits) |
+| `repeats: []Repeat` | subtrees painted again on another page (repeated `thead`/`tfoot`, `position: fixed`) |
+| `starts` | where each page's content starts (`Start`, below), for continuation at another width |
+| `Extend` | a fragment reaching past the page end (a cell keeps its block-end border/padding, takumi) |
+| `BoxFragment` | per box: `y`, `h`, `from_prev`, `to_next` (clone / slice decoration) |
 
-Inline slice backgrounds have a separate image strip: the sum of a span's line
-fragment widths. Each line clips that same strip at its cumulative offset.
-`box-decoration-break:clone` instead positions the image within each fragment.
+A page is painted by translating the whole tree by `-pages[i].top` and clipping to the window
+(`box-decoration-break: slice`); `clone` re-applies the decorations per fragment.
 
-Remaining verification includes nested non-translation transforms, clone borders,
-links under transformed fragments and intersecting clip paths. Passing the two
-transform goldens does not establish those cases.
+## 2. Fragments under transforms and clips (tasks 03–07, 25)
 
-## Continuation tokens
+Painting never moves a layout node. `emit.BoxFragment { id, window, tf, first, last }` is the
+fragment of a box being painted: its window in stitched space, the transform of that fragment
+(origin resolved against the fragment's own size), and whether it is the first / last fragment.
+Rules, each with probes in `scripts/pdf-audit/page-fragments.probe.mjs`:
 
-`layout.fragment.Start` represents one box/text line, or parallel table-cell
-resume points. Each cell point records its stable layout node, paragraph line,
-forced-break state and whether its content is complete. `paged.laySegments`
-translates the paragraph positions to shaped-glyph cuts when rebuilding at a new
-width. Intrinsic widths still measure the original paragraph; completed content
-has no new line height. The table carries its assigned, unfragmented row size so
-an early-finishing cell retains the row's empty content regions. Row stretch is
-not treated as a trailing child margin and truncated at the fake prefix page.
+- The content of a transformed box is painted in the pass of the fragment that contains it
+  (`Emitter.ownsContent`, `tpage` in the transformed space), not in the pass of the page being
+  drawn: a box laid out on page 2 whose rotated corner reaches page 1 paints its background on
+  page 1 and its text after it, on the page that owns the line.
+- Lines, links (`inOtherFragment`), child boxes (`windowSlice`) and nested transformed boxes are
+  painted only in the fragment holding them; a fragment that reaches no page paints nothing and
+  opens no structure region (`tfExcludes`, `tfRegionShows`).
+- Text ownership: the page owning a line emits selectable text; neighbouring pages reached by its
+  geometry emit outlines only (no duplicated extraction). A line whose baseline a clip removed but
+  whose ink shows keeps its visible extent.
+- Positioned / lifted boxes are ordered as takumi's scene: z-index, then page pass, then tree order.
+- Inline span backgrounds use one image strip (sum of the span's line fragments); each line clips
+  the strip at its cumulative offset; `clone` places the image per fragment. Neighbouring pages
+  reached by a span's ink open their marked-content regions (`prev_win` / `next_win`).
 
-Pinned-reference probes cover alternating widths, unequal cell lengths, empty
-continuation regions and links. Trailing cell decorations follow Takumi's cell
-rule: a cell never breaks before its block-end border and padding, so a cell whose
-content ends at a page end keeps them in that fragment, past the page
-(`paged.cellOverflow`). The row, its cells and the boxes around it record that
-fragment (`fragment.Extend`). The next run's row is shorter by the overflow, but
-still holds the finished cells' trailing decorations on its last page. The page
-after a run boundary paints the previous run's overflowing decorations and opens
-their cells' empty content regions first. Collapsed-border tables and row/row-group
-backgrounds are not covered. The Zig tests that go through `pdf/paged.zig` need the
-PDF feature (paragraph cuts) and are skipped without `-Dpdf=true`. Flex/grid
-parallel continuations retain their established track widths, matching the
-current reference probes; this does not establish arbitrary nested cases.
+## 3. Continuation tokens (tasks 16–18)
 
-Grid layout also retains the unaligned area block start through coordinate
-rounding. An aligned item with an empty first fragment resumes at the following
-fragment's start. When a better breakpoint exists before the grid, an empty item
-fragment does not make the inside break preferable. Start/center/end alignment,
-preceding content, row spans and flex regression probes pass. Full grid track
-and spanning-row continuation state is still required.
+A frame cannot change its inline size during pagination. Pages of another width (`@page :first`,
+`:left`/`:right`, named pages) are a new layout at that width, continued from a token:
 
-The required token carries the formatting-context kind and its ordered child
-continuations, text source-cluster position, consumed block size, repeated table
-sections, grid row/track state, float exclusion state, and whether a break was
-forced. Tokens must use stable source IDs rather than pointers into a frame that
-will be released. Resume must reconstruct the containing-block and counter state
-before laying out at the next page's width.
+- `fragment.Start { node, line, forced, branches, row_height, side_flows }`: one point (a box or a
+  paragraph line), or parallel `ResumePoint`s for a table row's cells, a flex line's or grid row's
+  items (`branches`), and rowspanning cells continuing independently (`side_flows`).
+- `ParagraphCut { node, glyph }`: a paragraph resumes at a glyph cut of its shaped text, so the next
+  frame breaks the paragraph at the same place.
+- `FrozenWidth { node, w }`: a flex/grid container continued at another width keeps its items'
+  first-fragment widths (takumi keeps the flex/grid algorithm's sizes).
+- `paged.laySegments` chains the frames in the same block coordinates (`Options.start`,
+  `start_top`); counters (`counters.Seg`), links/anchors (`interactive.Collector.beginRun`), the
+  structure tree and the emitter's neighbouring passes work across frames. A page whose start cannot
+  be found again keeps the previous run's width.
 
-## Settled pages and retained state
+Tokens refer to layout node ids of a frame that shares the element model; across independently
+built frames (section 5) they are re-keyed by DOM element (`paged.NodeKey`: nearest element plus
+child path, the same key `tags.Carry` uses).
 
-There are three distinct lifetimes:
+## 4. Layout passes for counters and bands
 
-1. Document: source model, registered font/image resources, object IDs, font subset
-   usage, destination IDs, structure-tree references and total-page counters.
-2. Active layout: continuation tokens, current formatting-context stacks, live
-   floats, repeated/fixed content and fragments that can still reach another page.
-3. Page paint: paths, temporary masks/patterns, paint queues and content builders.
+`paged.layOutRules` (whole document) measures bands with the counters of a one-page document,
+resolves margins, lays the content out, and repeats while counter hooks change
+(`counter_passes` = 3, then once more with the last numbers); dynamic bands are measured again with
+the real page count and an `auto` margin that moves restarts the content layout
+(`band_passes` = 3). Each pass owns an arena (`Pass.mem`) released as soon as the next pass replaces
+it; the last pass belongs to the `Document` and is released after the file is written.
 
-The existing emitter resets page paint scratch, and counter/band re-layout frees a
-replaced pass. A document laid out whole still retains the complete final layout.
+## 5. Emitting and releasing pages (tasks 19–21)
 
-**Parts at forced page breaks (2026-11-17).** `paged.writeChunked` lays out and draws a
-document a part at a time when `chunks.plan` can cut it: a chain of plain blocks from the root
-(no decoration, size, offset, effect, generated content, role or anchor) down to the flow, cut
-between two of the flow's block children where a page is forced, with no fixed box, no float,
-no absolute box escaping its child, no counter in the content, uniform page width, and parts of
-at least `chunk_elements` (2048) source elements. Anything else, or any check failing on the
-way, draws the document whole (memory checkpoint `chunks: whole: <why>`). The document's element
-model and styles are built once (`Frame.prepareDocument`) and shared, read only, by every part's
-frame (`Frame.initChunk`, `PagedState.chunk` filtering the flow's children); a part's frame lives
-in its own arena, freed once its pages are drawn (`emit.DocWriter`: `beginChunk`, `drawPages`,
-`endChunk`, then `finish`).
+There are three lifetimes:
 
-Each part's frame also lays out the last child of the part before and the first child of the
-part after: a box a forced break starts a page with has an empty fragment at the bottom of the
-page before, where its content regions open (takumi does the same), and its content paints as a
-continued fragment. Only the part's own pages are drawn, the neighbouring pages of its frame
-taking part as `prev_win` / `next_win`. The frame is placed where the whole document has it: its
-pages start at the document page top of the seam (`Options.origin`), and its root moves so its
-first child sits at that child's top in the part before (`Options.root_shift`), so page tops
-are the same float sums and boxes snap to the same device pixels. Structure records of the
-part after's first child carry over (`tags.Carry`: element plus child path), links and anchors
-resolve to destinations when the part ends, the structure tree is built per part and copied
-compactly, and a part whose pages `pageRanges` drops still collects its anchors and headings
-(`DocWriter.collect`). A link to a later part joins the parts between. Bands with page counters
-are measured after a counting pass over the parts.
+| Lifetime | Holds | Released |
+|:--|:--|:--|
+| Document | source, element model + computed styles + pseudos + CSS matcher (`Frame.prepareDocument`), fonts and subsets in use, object ids, encoded page streams, resolved anchors/destinations, structure tree, outline | after `DocWriter.finish` |
+| Part | render nodes, layout tree, paragraphs, pagination, its pages' paint scratch (`Frame.initChunk`, its own arena) | after its pages are drawn (`DocWriter.endChunk`) |
+| Page | paths, masks, patterns, paint queues, content builder | after each page (`emit` page scratch reset) |
 
-`scripts/pdf-chunks-check.mjs` (`npm run test:pdf:chunks`) renders 26 documents both ways and
-compares page count, page boxes, device-space draw lists, extracted text, structure and parent
-trees, annotations and outline: all equivalent, and byte-identical up to about 30 pages. Further
-down, positions summed in another order differ by a few float steps; page assignment and window
-exclusion accept such a difference at a page edge (`Pages.pageAt`, `Window.excludes`; far below
-the 1/64 px grid, no golden changes).
+`paged.writeChunked` draws a document a part at a time when `chunks.plan` can cut it:
 
-Measured on the stress document (native, fresh process, page counter footer): peak 153 → 61 MiB
-at 500 pages and 297 → 119 MiB at 1000 pages, 10–25 % more time (the counting pass). Live bytes
-after each part grow by about 20 KiB per page (encoded page content, structure tree); the live
-bytes after page ~200 are within 1.06× of those after page ~50. Still linear: the shared element
-model and styles (about 55 KiB per page of this document) and the final assembly of the file.
-The upstream memory test's document (700 sections without forced breaks) is laid out whole: cutting
-at any page boundary needs continuation tokens keyed by source element, not render node.
+- **`.forced`** — cuts between two block children of the flow element where a page break is forced;
+  parts of at least `chunk_elements` (2048) source elements. Each part's frame also lays out the last
+  child of the part before and the first of the part after, so the boxes at the seams break and open
+  their regions exactly as in the whole document; only the part's own pages are drawn, its
+  neighbours serving as `prev_win` / `next_win`. The frame is placed where the whole document has it
+  (`Options.origin`, `Options.root_shift`).
+- **`.flowing`** (`paged.FlowIter`) — cuts at any page boundary when there is no usable forced
+  break: a part lays out the flow's children from the one holding its first page's start up to at
+  least `chunk_elements / 4` elements (`flowBudget`), keeps every page but its last, and hands a
+  `Resume` (`NodeKey`, line + first glyph, page tops before/at/after, the child's top) to the next
+  part, which must reproduce the same break.
+- `DocWriter`: `beginChunk` → `drawPages` (pages of that part, link annotations registered up front)
+  → `endChunk` (structure tree built per part and copied compactly, `tags.Skip` / `tags.Carry` hand
+  records over a seam, anchors/headings resolved to destinations: `handOn` / `takeOn`) → `finish`
+  (one allocation for the file). A part whose pages `pageRanges` drops still collects its anchors
+  and headings (`DocWriter.collect`). Bands with page counters: a counting pass over the parts, then
+  the drawing pass.
 
-A page is releasable only when no pending layout decision can change its break,
-no later transform/positioned descendant can paint into it, repeated content has a
-stable placement, and page-rule/band/counter convergence is complete for it.
-Unbounded backward transforms or forward references require retaining an affected
-range or another layout pass. A fixed-size look-behind window is insufficient.
+### When a page may be emitted, and when it must be held
 
-Font subsets, destinations and structure objects may be finalized after page
-streams, provided streams reference stable document object IDs. Region ownership
-and source order must survive release; retaining pointers to page scratch is invalid.
+A page is emitted (its part released) only when nothing later can change it. bm decides this per
+cut, conservatively, before or while laying a part out; anything it cannot prove makes `chunks.plan`
+refuse, and the document is laid out whole (memory checkpoint `chunks: whole: <why>`). The page is
+held — i.e. the whole document waits — when:
 
-## Verification and measurements
+| Condition | Why the page cannot be settled | takumi behaviour (`streaming_tests.rs`) |
+|:--|:--|:--|
+| a child of the flow holds a positioned or transformed box (`Flow.cuttable` false) | it may paint into an earlier page or move the break | holds pages back to the reach of the transform / positioned box |
+| `position: fixed`, floats among the flow's children, an absolute box whose containing block is outside its child | repeats on every page / exclusions cross the seam / its page is unknown | holds the containing block's pages until the box is found |
+| page counters or target counters in the content, page rules depending on the root, pages of different widths | page numbers or geometry settle only after the whole layout | numbers again (bounded passes) before drawing |
+| a `#fragment` link to a later part | its annotation is decided when its part is drawn: the parts between are joined | draws before layout ends and fixes the link later |
+| the seam check fails (the next frame breaks differently, or ink crosses the cut: `Extents.computeWith`) | the part would not equal the whole document | n/a |
+| table / flex / grid tokens with branches, cut inside such a container | no single-point resume token | resumes inside |
 
-The correctness-gated benchmark was run on 2026-11-14. Warm render geomean was
-1.37 ms native and 2.01 ms WASM, versus 3.93 ms for Takumi. The 500-page case
-took 1,150 ms native, 2,049 ms WASM and 6,846 ms for Takumi. These measurements
-describe runtime only. They do not establish bounded live-layout memory: the
-complete final layout is still retained. The benchmark did not separately
-measure document resource bytes, live layout bytes, retained arena capacity,
-page scratch and output bytes. RSS and WASM linear-memory size alone cannot prove
-that live layout is bounded. See [the benchmark report](../bench/out/pdf/PDF.md).
+Fonts, destinations and structure objects are finalized after the page streams; streams only
+reference stable document object ids. No pointer into a part's arena survives `endChunk` (records
+crossing a seam are copied with element keys).
 
-Window scenes, streaming tests and memory tests remain required adapters. Every
-reported run must identify backend, binary hash, source revision, font hashes,
-toolchain and reference kind (committed fixtures, source build or published npm).
+## 6. Fixed interfaces
 
-Latest verified run (2026-11-15): the full PDF benchmark measured 159 common documents over three interleaved passes. bm-native async was 0.31x Takumi time and bm-wasm async 0.51x. Full validator gate `bm-only` passed 161 documents, native/WASM byte identity passed 161/161, and veraPDF passed 45/45 for each backend. This supersedes the historical runtime measurements above; the remaining source audit differences are documented in `docs/PDF_TEST_PORT.md` and still need case-level classification.
+The interfaces later tasks build on, and which must not be bypassed by local coordinate offsets:
+`fragment.Options` (`page_height_fn`, `start`, `start_top`, `origin`, `root_shift`, `extent_fn`),
+`fragment.Pages` / `Start` / `ResumePoint` / `ParagraphCut` / `FrozenWidth` / `Extend` /
+`BoxFragment`, `emit.BoxFragment`, `chunks.Plan` / `Part` / `Flow` / `Cut`, `paged.NodeKey` /
+`Resume` / `FlowIter`, `emit.DocWriter`, `tags.Carry` / `tags.Skip`, and the memtrace checkpoints
+(`count: page`, `emit: page done`, `part: drawn`, `chunks: whole: <why>`).
 
-Follow-up on 2026-11-15: collapsed-border rows cut by a page window now paint the fragment's start/end horizontal edges. Raster regression coverage checks both page boundaries on native and WASM. Full Zig (676), PDF API (393 per backend), 161-document visual gate, and the `bm-only` validator all pass after this change; the full strict audit has 1540/1571 probes passing, with 31 previously classified parity differences remaining.
+## 7. Measurements
+
+Live bytes are the native addon's allocation counter (`src/memtrace.zig`; `memoryTrace`
+checkpoints minus the baseline before the render), not RSS or the wasm memory size. Each render runs
+in a fresh process. `node scripts/pdf-memory.mjs --stress` (native `linux-x64-gnu`, ReleaseFast,
+2026-11-23, this checkout; the stress document of `bench/pdf/corpus`: per A4 page a heading,
+paragraphs, a 14-row collapsed table and an image, page-counter footer, forced page breaks):
+
+| Pages | ms/page | Peak | Live after page 1 | after page 50 | after page 200 | after last page | Parts | PDF KiB/page |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 4.55 | 2.37 MiB | 2.12 MiB | – | – | 2.12 MiB | whole (1 page) | 26.9 |
+| 10 | 2.31 | 5.81 MiB | 5.80 MiB | – | – | 4.73 MiB | whole (too short for two parts) | 6.0 |
+| 100 | 1.88 | 20.11 MiB | 16.48 MiB | 13.97 MiB | – | 12.32 MiB | 4 | 3.9 |
+| 500 | 1.84 | 52.96 MiB | 38.13 MiB | 35.62 MiB | 41.62 MiB | 40.21 MiB | 18 | 3.7 |
+
+The same documents laid out whole (`BM_PDF_CHUNKS=off`): peak 34.76 MiB at 100 pages and
+160.36 MiB at 500 pages (live after page 200: 109.06 MiB).
+
+`memory_tests.rs` document (700 sections, no forced break, `Page n of N` header, 350 pages, cut at
+any page boundary in 5 parts): live after page 50 / 200 = 4.48 / 4.64 MiB in the counting pass
+(x1.036) and 5.74 / 6.10 MiB in the drawing pass (x1.064), within takumi's x1.1 invariant; peak
+7.61 MiB (17.37 MiB laid out whole). Timing figures are from one run on a shared 4-core container
+and are indicative only; live bytes and peaks are deterministic.
+
+What still grows with the page count (task 21): the shared element model and styles (about
+55 KiB per stress page), encoded page streams and the structure tree kept until `finish` (about
+11 KiB per stress page), and the object map built when the file is assembled.
+
+## 8. Open items
+
+- Cutting inside tables, flex and grid containers, and inside children holding positioned or
+  transformed boxes (they hold the whole document today, see the table in section 5).
+- Pages with forward links are joined instead of drawn early; page / target counters in the content
+  and fixed boxes lay out the whole document.
+- Streaming adapters of `streaming_tests.rs` compare output equivalence and part emission
+  (`npm run test:pdf:chunks`, 55 cases); takumi's layout-pass counts and "laid at first page"
+  instrumentation have no bm counterpart. The case-by-case status is in
+  `scripts/pdf-coverage-map.json`.
+- `window_scenes.rs` fixtures at small page sizes paginate differently from takumi (open
+  exceptions of `upstream.html_fixtures_paint_from_their_windows` in `scripts/pdf-audit/exceptions.json`).

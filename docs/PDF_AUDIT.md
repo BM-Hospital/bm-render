@@ -21,7 +21,22 @@ and probes. The user documentation is in `docs/en/pdf/`.
 
 ## Scope and method
 
-**Reference.** `ref/takumi` at commit `33eed4a` (2026-11-11): the crate `takumi-pdf` 0.20.0 (which vendors
+**Current reference and gate (2026-11-23).** The probes compare with takumi-pdf built from source at the
+pinned revision `ff9a5d411310c8cdd1ac76a4f106c123d309e0a4` (`scripts/build-takumi-pdf-oracle.mjs`,
+`bench/out/pdf-oracle`, `TAKUMI_PDF_REF_ENTRY`; the loader checks the wasm and wrapper hashes). The
+published npm package is no longer the oracle of the gate: `node scripts/pdf-audit/run.mjs --strict` fails
+without the pinned entry, on any unverified comparison, on any failure that `scripts/pdf-audit/exceptions.json`
+does not name (one probe, one assertion kind, one failure pattern, status `deliberate` or `open`, and a reason),
+and on a stale exception. Assertions are counted by kind (`scripts/pdf-audit/gate.mjs`: error, page count, page
+box, tags, links, font mapping, text, metadata, page content), and `bench/out/pdf-audit/results.json` records
+the provenance: bm revision and local changes, backend and the hash of the binary that ran (the published
+native package is named as such), oracle revision / kind / hashes, the font files loaded with their hashes, the
+exception list's hash, and tool versions (node, pdftotext, pdfjs-dist, @napi-rs/canvas). The gate's own tests:
+`node --test scripts/pdf-audit/gates.test.mjs`. Every Rust and Bun test declaration of takumi-pdf is mapped
+to its adapters or a reason in `scripts/pdf-coverage-map.json` (`node scripts/pdf-coverage.mjs --strict`).
+The sections below keep the audit's history; the statuses are current where they name a pinned probe.
+
+**Reference (history).** `ref/takumi` at commit `33eed4a` (2026-11-11): the crate `takumi-pdf` 0.20.0 (which vendors
 a modified krilla and a font subsetter), the JS package `takumi-pdf-js` 0.20.0, the layout core
 `takumi-core` 0.36.0 (block fragmentation is its `fragmentation` feature) and the docs in
 `docs/content/docs/pdf/*.mdx`. The published npm package `takumi-pdf@0.20.0` was installed outside the
@@ -75,19 +90,20 @@ behind them.
 
 | Status | Features |
 |:--|--:|
-| ported+equivalent | 75 |
-| ported+differs | 44 |
-| partial | 1 |
-| missing | 6 |
+| ported+equivalent | 91 |
+| ported+differs | 45 (3 of them open: a difference not resolved yet) |
+| partial | 0 |
+| missing | 0 |
 | extension | 8 |
 | n/a | 4 |
 
 | Evidence | Before the audit (main `664fb3f`) | Now |
 |:--|:--|:--|
 | Probes vs published takumi-pdf 0.20.0 (`scripts/pdf-audit/run.mjs`, 1458) | 1168 pass / 290 fail | 1347 pass / 111 fail (every remaining failure is a row below) |
-| Latest full probe audit (2026-11-23, pinned takumi-pdf source `ff9a5d4`, `scripts/pdf-audit/run.mjs --strict`, wasm) | — | 2121 probes: 2099 pass / 22 strict parity differences; these include intentional CSS/API differences and are not a count of bm-render defects |
+| Latest full probe audit (2026-11-23, pinned takumi-pdf source `ff9a5d4`, `scripts/pdf-audit/run.mjs --strict`, wasm and native) | — | 2187 probes: 2161 pass, 0 unexpected, 26 expected: 22 deliberate (CSS / API, rows below) and 4 open (new findings of the upstream-test ports, rows below), 0 unverified; strict gate exit 0 |
+| takumi-pdf test declarations (`scripts/pdf-coverage.mjs --strict`) | — | 272 Rust: 122 golden adapters, 125 verified, 12 partial, 1 differs, 1 open, 11 not applicable; 69 Bun: 60 verified, 9 not applicable; 0 unclassified, every adapter resolves |
 | Golden fixtures (`scripts/pdf-compare.mjs`, 136) | 105 identical / 2 close / 29 differ / 0 errors | 125 identical / 10 close / 1 differ / 0 errors (`list-marker-pagination`, deliberate) |
-| `npm run test:pdf` | 367 passed | 393 passed on each backend (WASM and native) |
+| `npm run test:pdf` | 367 passed | 401 passed on each backend (WASM and native) |
 
 What was missing at the start of this audit and is ported now: pages of different widths (`@page :first` /
 `:left` / `:right` and named pages of other sizes), the `@page` cascade (inside `@media` / `@layer` /
@@ -158,6 +174,8 @@ All 136 golden fixtures of `ref/takumi/takumi-pdf/tests/fixtures-generated` are 
 | `@page` lengths: any unit, `calc()` / `min()` / `max()` / `clamp()`, viewport units, `em` / `ex` / `ch` / `rem`, unitless px | ported+equivalent | was partial |
 | `var()` in page descriptors, unresolved `var()` resets the descriptor | ported+equivalent | |
 | `cssVariables` reaching the page context of a whole HTML document | ported+differs | bm-render applies them there too (`page.at-page.var.no-root-element`) |
+| Last fragment of a table that is a row-flex item broken over pages | ported+differs (open) | `upstream.content_beside_a_table_does_not_replay_with_its_header`: takumi's rows on the last page are 14.3–14.4 px tall where both engines use 13.5 px on every earlier page; bm keeps 13.5 px, pdftotext orders the same words differently. Not checked against Chrome yet |
+| HTML fixtures on very small pages (`window_scenes.rs` sizes 400x300 down to 250x90, no margin) | ported+differs (open) | `upstream.html_fixtures_paint_from_their_windows`, `upstream.page_summaries_add_up_to_the_summary_of_the_whole_scene`: equal at 523x770 apart from one glyph at the page edge of the letter-spaced certificate heading; at 120 / 90 px page heights the invoice header row, the report appendix and the certificate land on other pages than in takumi (report 250x90: 24 vs 23 pages). Not investigated yet |
 | Page-margin boxes (`@top-center` ...) | n/a | takumi-pdf skips them too; bm-render parses and skips |
 | Header / footer bands (HTML, nodes, JSX, `true` / numbers / objects as text, `false`) | ported+equivalent | `bands.*` |
 | Band viewport units (the whole page) | ported+equivalent | |
@@ -235,6 +253,8 @@ All 136 golden fixtures of `ref/takumi/takumi-pdf/tests/fixtures-generated` are 
 | Truncated / no-cmap fonts | ported+equivalent | registered as a family drawing nothing when the table directory reads (text falls back), as takumi; bytes that are no font: "Unsupported font format" |
 | Fallback font | ported+equivalent | the PDF builds bundle the same last-resort Geist file as takumi-pdf (src/pdf/geist), tried after every registered family; `clearFonts()` goes back to it |
 | Default-ignorable characters as invisible glyphs (ZWSP, ZWJ, marks, U+FEFF) | ported+equivalent | ToUnicode / ActualText like HarfBuzz |
+| ZWNJ (U+200C) in Persian / Arabic text | ported+differs (open) | `upstream.persian_zero_width_non_joiners_keep_their_own_glyph`: bm keeps the ZWNJ in the grapheme cluster of the letter before it, so that glyph maps to two characters (`<067E200C>`) and pdftotext extracts the ZWNJ before its letter in RTL; takumi maps it alone (`<200C>`). Open text-layer bug |
+| Font subsets for page-counter numerals | ported+equivalent | was missing: a `unicodeRange` face that only a page / target counter's style needs (`trad-chinese-informal` in a footer) was not loaded and the render failed; `src/pdf/needs.zig` now adds the style's numerals (`upstream.js.counter-face`, Zig `PDF needs` cases) |
 | Control characters raising the uncovered-text error | ported+equivalent | was differing |
 | Fill text, synthetic bold (`2 Tr` stroke) and oblique, `font-synthesis` | ported+equivalent | |
 | `-webkit-text-stroke`, `paint-order` | ported+differs | bm-render follows the goldens (a takumi newer than 0.20.0): separate fill and stroke passes; 0.20.0 writes one `2 Tr` object and ignores `paint-order` (all `text.stroke.*` probes) |
@@ -256,6 +276,7 @@ All 136 golden fixtures of `ref/takumi/takumi-pdf/tests/fixtures-generated` are 
 | PNG passthrough (predictors, indexed, ICC) | ported+equivalent | was decoded and re-encoded; `src/pdf/png_krilla.zig` |
 | PNG decode as krilla's png crate (gray stays DeviceGray, 16-bit kept, straight alpha, tRNS, interlace, CRC / EOF errors) | ported+equivalent | `images.png.*` (21) |
 | PNG errors raised before the first IDAT | ported+differs | fall back to bm-render's decoder instead of takumi's error |
+| A filtered PNG whose pixels do not decode | ported+equivalent | was silently left out; now `Image could not be decoded: <src>: a filter needs the image's pixels: …` like takumi's UndrawableImage (`upstream.an_undecodable_image_stops_the_render`, Zig `images: a filtered PNG…`); the decoder's own words after the prefix differ |
 | JPEG passthrough, CMYK / YCCK (`/Decode`), Adobe transform 0, ICC (`ICCBased`) | ported+equivalent | `images.jpeg.*` |
 | WebP (first frame, alpha only when declared), GIF (draws nothing), APNG (decoded) | ported+equivalent | WebP decode error messages are generic |
 | PDF/A gray images | ported+differs | DeviceGray; takumi uses an ICC-based sGrey |
@@ -315,12 +336,21 @@ Forms, encryption, digital signatures, linearization and page-margin boxes are n
 ## How to re-run the evidence
 
 ```sh
-npm run build:pdf                                  # js/bm_render.pdf.wasm
-TAKUMI_PDF_REF=bench/pdf node scripts/pdf-audit/run.mjs --quiet   # probes vs takumi-pdf 0.20.0 (npm run pdf:setup first)
-node scripts/pdf-compare.mjs                       # the 136 goldens (needs ref/takumi)
-npm run test:pdf                                   # PDF tests, wasm and native
-node scripts/pdf-scaling.mjs --takumi              # 100 vs 500 pages: time, bytes and memory per page
-zig build test -Dpdf=true                          # unit tests
+npm run build:pdf                                   # js/bm_render.pdf.wasm
+node scripts/build-takumi-pdf-oracle.mjs            # the pinned oracle in bench/out/pdf-oracle (ff9a5d4)
+BM_RENDER_BACKEND=wasm TAKUMI_PDF_REF_ENTRY=bench/out/pdf-oracle/node.mjs \
+  node scripts/pdf-audit/run.mjs --strict --quiet   # probes vs the pinned oracle; exceptions.json; provenance
+node --test scripts/pdf-audit/gates.test.mjs        # the gate's own tests (incl. a new difference failing it)
+node scripts/pdf-coverage.mjs --strict --audit=bench/out/pdf-audit/results.json   # test-case mapping
+npm run test:pdf:takumi                             # the 136 goldens
+npm run test:pdf                                    # PDF API tests (BM_RENDER_BACKEND=wasm|native)
+npm run test:pdf:chunks                             # parts vs whole document, 55 cases
+npm run test:pdf:memory -- --stress                 # live bytes: 700-section invariant, 1/10/100/500 pages
+zig build test -Dpdf=true                           # unit tests
+node bench/pdf/validate.mjs --gate=bm-only          # qpdf, pdfcpu, poppler, MuPDF, pdf.js, veraPDF
 ```
 
 `BM_RENDER_BACKEND=wasm|native` picks the backend; both give byte-identical files (`node bench/native-identity.mjs`).
+Without a native addon built in this checkout (`npm run build:native -- --target=<host>`), `js/node-pdf.mjs`
+loads the published `@hunghg255/bm-render-<host>` package, an older build: set `BM_RENDER_BACKEND=wasm`
+(the audit's provenance names the binary that ran).

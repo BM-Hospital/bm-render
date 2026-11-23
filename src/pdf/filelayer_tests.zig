@@ -674,3 +674,17 @@ test "transformed box at a page boundary: a box lifted from the page before's fr
     const out = try t.render(html, "{\"size\":{\"width\":300,\"height\":400},\"margin\":20}");
     try before(out, "315.5691 cm 0.8 0.2 0.2 rg 0 0 60 24 re", "555 cm 0.6 0.6 0.6 rg 10 449 200 1 re");
 }
+
+test "images: a filtered PNG whose pixels do not decode stops the render, as takumi-pdf's UndrawableImage" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // takumi-pdf `an_undecodable_image_stops_the_render`: the IHDR still reads 8x8, the IDAT is zeros
+    const broken = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAD0lEQVQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAElFTkSuQmCC";
+    const opts = "{\"viewport\":{\"width\":48,\"height\":48}}";
+    const msg = try t.err("<img src=\"" ++ broken ++ "\" style=\"filter:grayscale(1);width:32px;height:32px\">", opts);
+    try expectHas(msg, "Image could not be decoded: ");
+    try expectHas(msg, ": a filter needs the image's pixels: An error occurred while decoding the image data: ");
+    // without a filter the PNG is embedded as krilla decodes it, which fails too
+    _ = try t.err("<img src=\"" ++ broken ++ "\" style=\"width:32px;height:32px\">", opts);
+}

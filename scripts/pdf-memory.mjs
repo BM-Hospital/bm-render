@@ -8,7 +8,8 @@
 // wasm memory size. Each render runs in a child process of its own (a fresh heap).
 //
 //   node scripts/pdf-memory.mjs              the invariant, and peak / live figures
-//   node scripts/pdf-memory.mjs --stress     also the stress document at 100 and 500 pages (peak, live, time, size)
+//   node scripts/pdf-memory.mjs --stress     also the stress document at 1, 10, 100 and 500 pages (peak, live, time, size)
+//   node scripts/pdf-memory.mjs --stress --sizes=100,500     other page counts of the stress document
 //   BM_PDF_CHUNKS=off node scripts/pdf-memory.mjs   the document laid out whole (for comparison; fails)
 //
 // Exit code 1 when the invariant fails or the native addon is not built (node scripts/build-native.mjs).
@@ -97,11 +98,15 @@ for (const p of s.passes) {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${p.label.padEnd(16)} live after page ${EARLY}: ${MiB(p.early ?? 0)}, after page ${LATE}: ${MiB(p.late ?? 0)} (x${(p.late / p.early).toFixed(3)}), first ${MiB(p.first)}, last ${MiB(p.last)}`);
 }
 if (args.includes("--stress")) {
-  for (const n of [100, 500]) {
+  const sizes = (args.find((a) => a.startsWith("--sizes="))?.slice(8) ?? "1,10,100,500").split(",").map(Number);
+  console.log("stress document (native, fresh process each; live = allocator bytes above the pre-render baseline):");
+  console.log("| pages | ms/page | peak | live after page 1 | live after page 50 | live after page 200 | live after last page | parts | PDF KiB/page |");
+  console.log("|--:|--:|--:|--:|--:|--:|--:|--:|--:|");
+  for (const n of sizes) {
     const t = run(String(n));
     const d = t.passes.find((p) => p.label === "emit: page done");
-    const late = n >= LATE ? d?.late : d?.last;
-    console.log(`stress ${n}: peak ${MiB(t.peak)}, ${(t.ms / n).toFixed(2)} ms/page, ${(t.bytes / n / 1024).toFixed(1)} KiB/page, parts ${t.parts}` + (d ? `, live at page ${EARLY}: ${MiB(d.early ?? 0)}, page ${Math.min(LATE, n)}: ${MiB(late ?? 0)}, last: ${MiB(d.last)}` : ""));
+    const cell = (v) => (v == null ? "-" : MiB(v));
+    console.log(`| ${n} | ${(t.ms / n).toFixed(2)} | ${MiB(t.peak)} | ${cell(d?.first)} | ${cell(d?.early)} | ${cell(d?.late)} | ${cell(d?.last)} | ${t.parts}${t.whole.length ? " (whole: " + t.whole.join("; ") + ")" : ""} | ${(t.bytes / n / 1024).toFixed(1)} |`);
   }
 }
 process.exitCode = failed ? 1 : 0;

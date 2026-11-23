@@ -9,6 +9,7 @@ const svg_style = @import("../svg/style.zig");
 const aType = std.mem.Allocator;
 const json = @import("../json.zig");
 const font_collection = @import("../font/collection.zig");
+const counters = @import("counters.zig");
 
 /// A `fonts` entry of the render with a `unicodeRange`, not loaded yet (takumi `PendingSource::Listed`):
 /// what font fallback reads it as before its bytes arrive.
@@ -219,6 +220,9 @@ pub const Collector = struct {
             for (el.cs.mask_image) |v| try c.image(v);
             if (el.cs.display == .list_item) try c.image(el.cs.list_style_image);
             try c.textOf(el.text, el.cs);
+            // a page / target counter hook draws numerals no text holds yet: takumi reads them when
+            // it writes the counter, so the face its style's characters fall in loads too
+            if (!el.run) if (counters.hookOf(el.class) != null) try c.textOf(counters.CounterStyle.fromClasses(el.class).symbols(), el.cs);
         }
         for (f.pseudos.items) |p| {
             try c.textOf(p.text, p.cs);

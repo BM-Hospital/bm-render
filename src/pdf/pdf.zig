@@ -425,6 +425,10 @@ test "PDF needs: the listed font subsets font fallback reaches (takumi needs.rs)
         .{ .html = "<p style='font-family:Missing'>a</p>", .opts = "{\"fontFamilies\":[\"B\"],\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"B\"," ++ latin ++ "}]}", .fonts = "[1]" },
         // in a band too
         .{ .html = "<p style='font-family:A'>a</p>", .opts = "{\"footer\":\"<p style='font-family:A'>Ж</p>\",\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"A\"," ++ cyr ++ "},{\"id\":2,\"name\":\"A\",\"ranges\":[[1328,1423]]}]}", .fonts = "[0,1]" },
+        // a page counter hook draws its style's numerals, which no text of the document holds
+        // (takumi-pdf-js render.test.ts: keeps a face the page counter needs but the document never uses)
+        .{ .html = "<p style='font-family:A'>a</p>", .opts = "{\"footer\":\"<div style='font-family:A'><span class='totalPages trad-chinese-informal'></span></div>\",\"listedFonts\":[{\"id\":0,\"name\":\"A\"," ++ latin ++ "},{\"id\":1,\"name\":\"A\",\"ranges\":[[19968,40959]]},{\"id\":2,\"name\":\"A\"," ++ cyr ++ "}]}", .fonts = "[0,1]" },
+        .{ .html = "<p style='font-family:A'>a <span class='pageNumber upper-roman'></span></p>", .opts = "{\"listedFonts\":[{\"id\":0,\"name\":\"A\",\"ranges\":[[97,97]]},{\"id\":1,\"name\":\"A\",\"ranges\":[[65,90]]}]}", .fonts = "[0,1]" },
     };
     for (cases) |c| {
         const result = try r.needsPdf(.html, c.html, c.opts);

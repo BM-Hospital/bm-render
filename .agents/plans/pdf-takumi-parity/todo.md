@@ -1,20 +1,20 @@
 # Task list: bm-engine PDF / Takumi parity
 
-Trạng thái tổng: **needs review — chưa hoàn tất**. Đã có implementation và regression checks cho nhiều nhóm; task 16–17 đang triển khai một phần, task 18–21 chưa hoàn tất. Không đánh dấu hoàn thành theo số golden render thành công.
+Trạng thái tổng: **needs review — chưa hoàn tất**. Task 00, 01 done; 02 và 27 needs review (xem trạng thái từng task và checkpoint “2026-11-23 gate 00/01/02/27” cuối file); 19–21 còn mở. Gate strict (audit pinned, golden, coverage map) xanh với 22 khác biệt có chủ đích và 4 khác biệt mở được liệt kê trong `scripts/pdf-audit/exceptions.json`. Không đánh dấu hoàn thành theo số golden render thành công.
 
 Checkpoint 2026-11-13: Zig 664/664; PDF API 389/389 và focused source-reference 73/73 trên cả native/WASM; 136 golden gồm 123 IDENTICAL, 9 CLOSE, 4 DIFFER, 0 render error, structure/parent tree 136/136. Validator chọn 16 tài liệu: byte identity 16/16, semantics 16/16, veraPDF 14/14 mỗi backend, 0 bm-only issue (6 pdfcpu issue giống reference). Gate parity tổng chưa sạch. Chưa chạy benchmark theo yêu cầu chỉ đo sau khi hoàn tất implementation và gate pass.
 
 ## 00 — Lập bảng ánh xạ test và chức năng (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — `scripts/pdf-coverage.mjs` sinh và kiểm tra `scripts/pdf-coverage-map.json`: 272 khai báo `#[test]` Rust (pdf_fixtures.rs 183, streaming_tests.rs 21, window_scenes.rs 2, memory_tests.rs 1, unit test của src/ 28, krilla/ 25, subsetter/ 12) và 69 `test()` Bun (takumi-pdf-js prepare/render, renderer-facade của bindings-js/helpers, prepare-images). Mỗi case có trạng thái `golden-adapter` 122 / `verified` 125 / `partial` 12 / `differs` 1 / `open` 1 / `not-applicable` 11 (Rust) và `verified` 60 / `not-applicable` 9 (JS); 0 case chưa phân loại. `--strict` thất bại khi còn case `pending-adapter`/`internal-review` hoặc khi adapter không trỏ tới thứ có thật (tên golden, probe khớp filter, tên test Zig, thông điệp check của `npm run test:pdf`, id case của chunks-check); `--audit=<results.json>` thêm điều kiện probe của case `verified` phải PASS/EXPECTED trong audit đủ với oracle pinned. Golden được nhận cả khi tên fixture nằm trong `format!` hoặc biến (trước bỏ sót `font_format_standards`, `paged_lines_under_a_transform_or_a_clip`). Case nào chưa có adapter thì được port: `scripts/pdf-audit/upstream.probe.mjs` (60 probe `upstream.<tên test Rust>`: input và điều test khẳng định, so oracle và so hằng số của test) và `scripts/pdf-audit/upstream-js.probe.mjs` (6 probe `upstream.js.*`). Port này tìm ra 2 lỗi thật của bm (đã sửa, xem checkpoint cuối) và 4 khác biệt mở (ZWNJ, bảng là flex item, fixture HTML trên trang rất nhỏ).
 
 Đối chiếu toàn bộ test PDF upstream với adapter Zig/JS; phân loại implementation, partial, missing, deliberate và chưa kiểm chứng.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Không dùng 136 golden làm mẫu số toàn bộ tính năng PDF; kiểm kê cả 272 khai báo test Rust trong takumi-pdf, test JS và window/stream/memory.
-- [ ] Mỗi case có nguồn, runner tương ứng hoặc lý do không áp dụng; không còn case chưa phân loại.
-- [ ] Cập nhật trạng thái cũ: paged-rotated-text đã sửa, named pages đã có; giữ lịch sử audit riêng.
+- [x] Không dùng 136 golden làm mẫu số toàn bộ tính năng PDF; kiểm kê cả 272 khai báo test Rust trong takumi-pdf, test JS và window/stream/memory. (272 Rust + 69 JS trong `pdf-coverage-map.json`; golden chỉ là 122 case.)
+- [x] Mỗi case có nguồn, runner tương ứng hoặc lý do không áp dụng; không còn case chưa phân loại. (`node scripts/pdf-coverage.mjs --strict --audit=…`: 0 vấn đề; 12 case `partial` ghi rõ phần chưa phủ — chủ yếu streaming_tests.rs về thời điểm emit.)
+- [x] Cập nhật trạng thái cũ: paged-rotated-text đã sửa, named pages đã có; giữ lịch sử audit riêng. (`PDF_AUDIT.md`: bảng golden hiện tại — paged-rotated-text CLOSE do bước float cuối, named pages ported+equivalent; phần tham chiếu cũ 33eed4a giữ dưới “Reference (history)”.)
 
 **Kiểm tra:** Kiểm tra manifest và coverage map; đối chiếu tên test/fixture với corpus; runner phải báo case chưa ánh xạ.
 
@@ -24,15 +24,15 @@ Checkpoint 2026-11-13: Zig 664/664; PDF API 389/389 và focused source-reference
 
 ## 01 — Cố định oracle và cơ chế kiểm tra sai khác (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — `scripts/pdf-audit/gate.mjs` + `scripts/pdf-audit/exceptions.json`. Audit (`run.mjs`) ghi provenance vào `bench/out/pdf-audit/results.json` và in một dòng tóm tắt: revision bm và có thay đổi cục bộ hay không, backend và sha256 của binary đã chạy (addon native của gói npm đã publish được gọi đúng tên), oracle (kind, revision, version, sha256 wasm/wrapper/Cargo.lock, wasm-bindgen), các file font đã nạp kèm sha256, sha256 của danh sách ngoại lệ, phiên bản node/pdftotext/pdfjs-dist/@napi-rs/canvas. Không có reference → UNVERIFIED; `--strict` thất bại khi thiếu `TAKUMI_PDF_REF_ENTRY` pinned (npm 0.20.0 không được chấp nhận), khi còn unverified, khi có fail không nằm trong danh sách, hoặc khi một ngoại lệ không còn khớp (stale). Mỗi ngoại lệ chỉ một probe + một loại assertion + một mẫu của dòng lỗi, trạng thái `deliberate`/`open` và lý do (không wildcard, không prefix, không khớp-tất-cả). Assertion được đếm theo loại: error, page-count, page-box, tags, links, font-mapping, text, metadata, page-content. `cmp` của paged-helpers tách page count / page boxes / text thành ba assertion. Golden (`pdf-compare.mjs --strict`): mọi CLOSE/DIFFER của page content, phần interchange khác `same`, và khác biệt dict/CMap font phải có dòng `golden` (fixture + phần + verdict + lý do) trong cùng file; dòng không còn quan sát được là stale.
 
 Đảm bảo các case ngoài golden so với đúng Takumi ff9a5d4, không lấy npm 0.20.0 làm oracle duy nhất.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Ghi revision, backend, font và phiên bản công cụ trong báo cáo; khi thiếu reference phải báo UNVERIFIED.
-- [ ] Ngoại lệ chỉ theo fixture và loại sai khác, có lý do; không miễn trừ toàn bộ PDF hoặc nới tolerance chung.
-- [ ] --strict phải thất bại khi có lỗi mới; kiểm tra page content, page count/box, text, links, tags, font mapping riêng.
+- [x] Ghi revision, backend, font và phiên bản công cụ trong báo cáo; khi thiếu reference phải báo UNVERIFIED. (`results.json.provenance`; test `strict audit rejects missing reference…`.)
+- [x] Ngoại lệ chỉ theo fixture và loại sai khác, có lý do; không miễn trừ toàn bộ PDF hoặc nới tolerance chung. (44 dòng probe + 18 dòng golden; lưu ý: so golden vẫn có ngưỡng nhiễu float 0,01 tuyệt đối / 1e-4 tương đối, nhưng mọi CLOSE đều phải được liệt kê theo fixture với lý do, nên ngưỡng này không cho qua fixture nào ngầm.)
+- [x] --strict phải thất bại khi có lỗi mới; kiểm tra page content, page count/box, text, links, tags, font mapping riêng. (`node --test scripts/pdf-audit/gates.test.mjs` 11/11: ngoại lệ không phủ probe/loại khác, ngoại lệ stale, cùng sai khác của `paint.stacking.sticky` không có trong danh sách → exit 1, CLOSE golden không liệt kê → exit 1.)
 
 **Kiểm tra:** Chạy baseline 136 golden trên wasm; đối chiếu một số case với native; thử một sai khác mới để chứng minh gate thất bại.
 
@@ -42,15 +42,15 @@ Checkpoint 2026-11-13: Zig 664/664; PDF API 389/389 và focused source-reference
 
 ## 02 — Thiết kế fragment và vòng đời trang (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — tài liệu thiết kế `docs/PDF_FRAGMENT_DESIGN.md` viết lại theo code hiện tại (không gian stitched + cửa sổ trang, `emit.BoxFragment` qua transform/clip, token tiếp nối `Start`/`ResumePoint`/`ParagraphCut`/`FrozenWidth`, pass counter/band, ba lifetime document/part/page, `chunks.plan` `.forced`/`.flowing`, `DocWriter`, bảng điều kiện giữ trang so với streaming_tests.rs, danh sách interface cố định) và benchmark 1/10/100/500 trang có live bytes. Hai tiêu chí đầu chỉ đóng ở mức “thiết kế đã ghi và khớp code”; phần chưa có (cắt trong bảng/flex/grid, emit sớm khi có transform/positioned/fixed/counter) là việc của task 19–21, nên task giữ needs review.
 
 Làm spike thiết kế cho phần rủi ro cao trước khi port sâu: tọa độ layout/paint, fragment decorations, trang ổn định, lifetime metadata và bộ nhớ.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Có mô hình fragment xuyên transform/clip và cách tiếp tục layout của table/flex/grid/float; tránh sửa tọa độ bằng offset cục bộ theo fixture.
-- [ ] Xác định khi nào được emit/release một trang, khi nào phải giữ trang vì transform, positioned descendants hoặc counter chưa ổn định.
-- [ ] Ghi benchmark 1/10/100/500 trang và instrument live bytes; chốt các interface trước task 03, 16–21.
+- [x] Có mô hình fragment xuyên transform/clip và cách tiếp tục layout của table/flex/grid/float; tránh sửa tọa độ bằng offset cục bộ theo fixture. (`PDF_FRAGMENT_DESIGN.md` §1–3: `Pages` không vá node dùng chung, `emit.BoxFragment`, token có `branches`/`side_flows`/`FrozenWidth`; float: retry toàn frame, chưa có mô hình exclusion theo trang — ghi ở giới hạn.)
+- [x] Xác định khi nào được emit/release một trang, khi nào phải giữ trang vì transform, positioned descendants hoặc counter chưa ổn định. (§5: bảng điều kiện; bm giữ bằng cách từ chối cắt — thô hơn takumi, giữ cả tài liệu.)
+- [x] Ghi benchmark 1/10/100/500 trang và instrument live bytes; chốt các interface trước task 03, 16–21. (§6–7; `node scripts/pdf-memory.mjs --stress`, native: 500 trang peak 52,96 MiB, live sau trang 50/200 = 35,62/41,62 MiB, 1,84 ms/trang; layout cả tài liệu 160,36 MiB. Interface “chốt” là mô tả cái đang có — task 03 và 16–18 đã làm trước khi tài liệu này được viết lại.)
 
 **Kiểm tra:** Review thiết kế bằng window_scenes.rs, streaming_tests.rs, memory_tests.rs; thử prototype nhỏ, chưa thay kiến trúc toàn bộ.
 
@@ -497,15 +497,15 @@ Pinned PdfRenderer.prepare gọi native needs rồi prepareSource để tải fo
 
 ## 27 — Nghiệm thu và cập nhật audit theo từng đợt (P0 gate)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — gate chạy đủ ngày 2026-11-23 (số ở checkpoint cuối): PDF API 401/401 (wasm, native), Zig PDF 763/763, `zig build test` 741 pass / 21 skip, golden 125/10/1 với `--strict` exit 0 (18 khác biệt đều được liệt kê), strict audit 0 unexpected trên wasm và native, chunks 55/55, memory pass, coverage `--strict` 0 vấn đề. Cả ba tiêu chí đã tick, nhưng task vẫn needs review: phụ thuộc “hoàn tất sau 03–26 hoặc có quyết định hoãn được ghi rõ” chưa thỏa (19–21 còn in progress, chưa có quyết định hoãn), và 4 khác biệt `open` trong `exceptions.json` (ZWNJ, bảng là flex item, fixture HTML trên trang rất nhỏ) mới được liệt kê, chưa được giải quyết.
 
 Chạy cùng case trên wasm/native, đối chiếu rendering/text/file semantics và chặn regression.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] PDF API 373+ và nhóm Zig PDF 130+ không có fail/skip không giải thích; mọi task mới thêm case tự động có mapping.
-- [ ] 0 unexpected differences, render errors hoặc missing goldens; known differences phải có ngoại lệ hẹp đã giải thích, không hứa mọi file byte-identical.
-- [ ] Chạy qpdf/pdfcpu/pdf.js và veraPDF cho conformance fixtures bị ảnh hưởng; 7 lỗi codec baseline được theo dõi riêng, không được tăng.
+- [x] PDF API 373+ và nhóm Zig PDF 130+ không có fail/skip không giải thích; mọi task mới thêm case tự động có mapping. (401/401 mỗi backend; Zig PDF 763/763, 0 skip; 21 skip của `zig build test` mặc định là test cần `-Dpdf`/css/tw/html hoặc so màu tiny-skia, không phải lỗi; mapping: `pdf-coverage.mjs --strict`.)
+- [x] 0 unexpected differences, render errors hoặc missing goldens; known differences phải có ngoại lệ hẹp đã giải thích, không hứa mọi file byte-identical. (audit: 2.187 probe, 2.161 pass, 26 expected = 22 deliberate + 4 open, 0 unexpected/unverified/stale; golden 0 error, 0 missing, 18 khác biệt liệt kê. Lưu ý 4 probe `open` là khác biệt đã biết nhưng chưa sửa, không phải đã chấp nhận vĩnh viễn.)
+- [x] Chạy qpdf/pdfcpu/pdf.js và veraPDF cho conformance fixtures bị ảnh hưởng; 7 lỗi codec baseline được theo dõi riêng, không được tăng. (`node bench/pdf/validate.mjs --gate=bm-only`, 161 tài liệu × bm-native / bm-wasm / takumi-pdf: 0 render error, 0 issue bm-only, 163 issue mỗi engine đều giống hệt takumi (pdfinfo “Suspects object is wrong type” 151, pdfcpu 12: AF/AFRelationship của PDF 2.0 và đích outline là StructElem), veraPDF 45/45 compliant mỗi engine, native == wasm byte-identical 161/161, pdf.js semantics giống takumi npm 0.20.0 ở 152/161 (so với gói đã publish, không phải oracle pinned). Công cụ trên Linux: qpdf 11.9.0 (apt; pin 12.4.2 là bản Windows), pdfcpu 0.16.4, poppler 24.02.0, OpenJDK 21.0.13, veraPDF 1.28.2 (sha256 khớp pin), pdf.js 6.5.438, MuPDF 1.28.6; `VALIDATION.md` ghi đúng phiên bản đã chạy. Lỗi codec: 0 — 7 lỗi PNG/WebP cũ đã được sửa trước đó (`PDF_TEST_PORT.md`), `zig build test` không còn test nào fail.)
 
 **Kiểm tra:** Build PDF + native hiện tại; 136 goldens, probes reference, API, Zig PDF, targeted full-suite check; ghi tool versions và kết quả máy đọc được.
 
@@ -623,3 +623,23 @@ Oracle pinned build lại từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, prov
 ## 2026-11-23 fragment ở ranh giới trang: transform, clip, inline span, clip-text, outline (task 03–07, 25; lỗi còn lại của task 24)
 
 Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, esbuild wrapper; provenance `source-build-wasm-local-rustc-1.97`). Baseline (HEAD `c6aac32`, wasm): strict audit 1.941 probe, 1.918 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 749/749; `zig build test` 727 pass / 21 skip. Probe mới `scripts/pdf-audit/page-fragments.probe.mjs` (113 probe: `paint.transform-fragment.*` 48, `paint.clip-fragment.*` 13, `paint.inline-fragment.*` 15, `text.background-clip-fragment.*` 8; draw list, text từng trang, structure/parent tree, link annotation): ở HEAD 53/113 fail, nay 113/113. Sau thay đổi: audit 2.025 probe, 2.002 pass, cùng đúng 23 fail của baseline (toàn khác biệt có chủ đích đã phân loại; không fail mới); golden không đổi (125/10/1, cùng từng fixture; `paged-transforms`/`paged-rotated-text` CLOSE chỉ do bước float cuối); PDF Zig 759/759 (+10 test mới trong `src/pdf/filelayer_tests.zig`, mỗi test fail trước fix); `zig build test` 737 pass / 21 skip; `test:pdf` 399/399 (wasm); `test:pdf:chunks` tương đương (wasm + native build lại `linux-x64-gnu`); `test:pdf:memory` pass (×1,036 / ×1,064). Audit chỉ chạy trên wasm. File đổi: `src/pdf/emit.zig`, `src/pdf/emit_text.zig`, `src/pdf/interactive.zig`, `src/layout/fragment.zig`, `src/pdf/filelayer_tests.zig`, `scripts/pdf-audit/page-fragments.probe.mjs` (mới), `docs/PDF_AUDIT.md`. Chi tiết và phần còn mở ở trạng thái task 03, 04, 05, 06, 07, 24, 25: clip dưới transform để lộ dòng bị che trong text layer (cả hai engine), khối `background-clip:text` xoay qua trang, region của nền fragment bên cạnh khi span có padding/border dọc (không thấy được).
+
+## 2026-11-23 gate 00/01/02/27: ánh xạ test, oracle và ngoại lệ, thiết kế fragment, nghiệm thu
+
+Baseline (HEAD `24ba1bf`, wasm, oracle pinned `ff9a5d4` build lại cục bộ: rustc 1.97, wasm-bindgen 0.2.129, provenance `source-build-wasm-local-rustc-1.97`): strict audit 2.121 probe, 2.099 pass, 22 fail (đều là khác biệt có chủ đích đã phân loại; khi đó `--strict` luôn exit 1); golden 125/10/1; PDF Zig 762/762; `zig build test` 740 pass / 21 skip; `test:pdf` 401/401.
+
+- **Task 00:** `scripts/pdf-coverage.mjs` viết lại: nhận golden cả qua `format!`/biến, xác thực từng adapter (golden, probe, test Zig, check của `test:pdf`, case chunks), `--strict` và `--audit=`. 272 case Rust + 69 case Bun đều đã phân loại (xem trạng thái task 00). Probe mới: `scripts/pdf-audit/upstream.probe.mjs` (60) và `upstream-js.probe.mjs` (6) port input và điều khẳng định của các test chưa có adapter.
+- **Task 01:** `scripts/pdf-audit/gate.mjs` (loại assertion, ngoại lệ, provenance), `scripts/pdf-audit/exceptions.json` (44 dòng probe: 25 deliberate + 19 open; 18 dòng golden), `run.mjs` (EXPECTED / STALE, đếm theo loại, provenance), `paged-helpers.mjs` (`cmp` tách page count / boxes / text), `pdf-compare.mjs --strict` (khác biệt golden phải được liệt kê), `gates.test.mjs` 11/11 (trước 5).
+- **Task 02:** `docs/PDF_FRAGMENT_DESIGN.md` viết lại theo code; `scripts/pdf-memory.mjs --stress` đo 1/10/100/500 trang (live bytes sau trang 1/50/200/cuối, peak, ms/trang, KiB/trang).
+- **Lỗi thật tìm thấy khi port (đã sửa, mỗi lỗi có test Zig fail trước khi sửa):** (1) `src/pdf/emit_image.zig`: ảnh PNG có `filter` mà pixel không giải mã được bị bỏ qua im lặng; takumi báo `Image could not be decoded: <src>: a filter needs the image's pixels: …` — nay bm báo lỗi như vậy (test `images: a filtered PNG whose pixels do not decode…`; probe `upstream.an_undecodable_image_stops_the_render`). (2) `src/pdf/needs.zig` + `CounterStyle.symbols` (`src/pdf/counters.zig`): face `unicodeRange` chỉ cần cho chữ số của counter trang (`totalPages trad-chinese-informal` trong footer) không được nạp nên render lỗi “No font the text can use draws 五”; nay needs thêm các ký tự của kiểu counter (2 case mới trong test `PDF needs: …`; probe `upstream.js.counter-face`).
+- **Khác biệt mở mới (status `open` trong `exceptions.json`, dòng trong `PDF_AUDIT.md`):** ZWNJ (U+200C) tiếng Ba Tư nằm trong cluster của chữ trước nên ToUnicode `<067E200C>` và pdftotext đặt ZWNJ sai chỗ trong RTL (takumi: `<200C>` riêng); trang cuối của bảng là flex item bị cắt qua trang: hàng của takumi cao 14,3–14,4 px, bm giữ 13,5 px như các trang trước; 4 fixture HTML của `window_scenes.rs` trên trang rất nhỏ (400x300 → 250x90, margin 0/12) phân trang khác takumi (report 250x90: 24 so với 23 trang); dòng chữ giãn ký tự của certificate chạm mép trang 523x770.
+
+Sau thay đổi:
+- Strict audit (pinned `ff9a5d4`): **2.187 probe, 2.161 pass, 0 fail, 26 expected (22 deliberate + 4 open), 0 unverified, 0 stale; exit 0**, giống hệt trên wasm và native (addon build lại `linux-x64-gnu` trong worktree). Theo loại (pass / unexpected / expected): error 1102/0/2, page-count 2878/0/3, page-box 1395/0/0, tags 1480/0/2, links 464/0/2, font-mapping 265/0/2, text 2825/0/11, metadata 326/0/0, page-content 2088/0/22.
+- Golden `npm run test:pdf:takumi`: 125 IDENTICAL / 10 CLOSE / 1 DIFFER, 0 error (không đổi, cùng từng fixture); `pdf-compare.mjs --strict` exit 0: 18 khác biệt (content/annots/outline/fonts) đều liệt kê, 0 unlisted, 0 stale.
+- PDF Zig `zig build test -Dpdf=true` 763/763 (+1 test mới); `zig build test` 741 pass / 21 skip (+1; skip là test cần `-Dpdf`/css/tw/html hoặc phép so màu của tiny-skia, không có codec nào).
+- **7 lỗi codec baseline:** 0 — đã được sửa trước đó (`docs/PDF_TEST_PORT.md`: giữ bit kênh không dấu thay vì bão hòa SIMD có dấu); `zig build test` không còn test PNG/WebP/animation nào fail.
+- `npm run test:pdf` 401/401 trên wasm và native; `npm run test:pdf:chunks` 55/55 tương đương trên native và wasm; `npm run test:pdf:memory` pass (×1,036 / ×1,064); coverage `--strict --audit` 0 vấn đề với results của cả hai backend; `gates.test.mjs` 11/11.
+- Benchmark (native, `pdf-memory.mjs --stress`): 1 trang 4,55 ms/trang, peak 2,37 MiB; 10 trang 2,31 ms, 5,81 MiB (layout cả tài liệu: quá ngắn để cắt); 100 trang 1,88 ms, peak 20,11 MiB, live sau trang 50 13,97 MiB, 4 phần; 500 trang 1,84 ms, peak 52,96 MiB, live sau trang 50/200 = 35,62/41,62 MiB, 18 phần, 3,7 KiB/trang. `BM_PDF_CHUNKS=off`: 100 trang peak 34,76 MiB, 500 trang 160,36 MiB.
+- Validator (`node bench/pdf/validate.mjs --gate=bm-only`, công cụ Linux, xem tiêu chí 3 của task 27): 161 tài liệu, 0 render error, 0 issue bm-only (163 issue mỗi engine, đều giống takumi), veraPDF 45/45 compliant mỗi engine, native == wasm 161/161 byte-identical; gate pass. `bench/pdf/lib/tools.mjs` nay tìm được binary không đuôi `.exe` / symlink; `validate.mjs` ghi phiên bản thật của công cụ từ `.ok.json` khi công cụ không do `setup.mjs` cài.
+- File đổi: `src/pdf/emit_image.zig`, `src/pdf/needs.zig`, `src/pdf/counters.zig`, `src/pdf/pdf.zig`, `src/pdf/filelayer_tests.zig`; `scripts/pdf-coverage.mjs`, `scripts/pdf-coverage-map.json`, `scripts/pdf-compare.mjs`, `scripts/pdf-memory.mjs`, `scripts/pdf-audit/{run,lib,paged-helpers,gates.test}.mjs`, mới: `scripts/pdf-audit/{gate.mjs,exceptions.json,upstream.probe.mjs,upstream-js.probe.mjs}`; `bench/pdf/lib/tools.mjs` (tìm binary không đuôi `.exe` và symlink ngoài Windows), `bench/pdf/validate.mjs` (phiên bản công cụ thật); `package.json` (`test:pdf:coverage`, `test:pdf:gate`); `docs/PDF_AUDIT.md`, `docs/PDF_FRAGMENT_DESIGN.md`.

@@ -100,6 +100,19 @@ pub const CounterStyle = union(enum) {
         return .decimal;
     }
 
+    /// Every character a value of this style can be written with (for resource discovery: the
+    /// characters a page hook may draw before its value is known).
+    pub fn symbols(self: CounterStyle) []const u8 {
+        return switch (self) {
+            .decimal, .decimal_leading_zero => "0123456789",
+            .digits => |d| d,
+            .alphabet => |alpha| alpha,
+            .chinese_informal => chinese_digits ++ "十百千",
+            .lower_roman => "ivxlcdm",
+            .upper_roman => "IVXLCDM",
+        };
+    }
+
     pub fn format(self: CounterStyle, a: Allocator, value: usize) Allocator.Error![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         switch (self) {

@@ -214,6 +214,8 @@
     "test:pdf:chunks": "node scripts/pdf-chunks-check.mjs",
     "test:pdf:memory": "node scripts/pdf-memory.mjs",
     "test:pdf:takumi": "node scripts/pdf-compare.mjs",
+    "test:pdf:coverage": "node scripts/pdf-coverage.mjs --strict",
+    "test:pdf:gate": "node --test scripts/pdf-audit/gates.test.mjs",
     "test:pdf:takumi:fetch": "node scripts/fetch-takumi-tests.mjs",
     "test:takumi:verify": "node scripts/takumi-test-corpus.mjs",
     "pdf:setup": "node bench/pdf/setup.mjs",

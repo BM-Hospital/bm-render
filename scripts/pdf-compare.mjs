@@ -22,7 +22,9 @@
 // Verdicts per fixture: IDENTICAL (same operators and numbers), CLOSE (same operators, numbers within
 // 0.01 absolute or 1e-4 relative), DIFFER (first difference shown), plus a font verdict (same / which
 // part differs). Missing inputs, uncovered goldens and rendering failures exit nonzero. --strict
-// also rejects DIFFER page content or interchange; font program byte differences are informational.
+// also rejects any CLOSE / DIFFER page content, interchange part or font dictionary / CMap that
+// scripts/pdf-audit/exceptions.json ("golden") does not list for that fixture, and a listed one that is
+// gone (stale); font program byte differences are informational.
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -836,7 +838,7 @@ for (const fx of FIXTURES) {
   if (gold.some((l) => /T[Jj]$/.test(l))) counts.TEXT++;
   const pc = minePdf.pages.length === goldPdf.pages.length ? "" : `  PAGES ${minePdf.pages.length} vs ${goldPdf.pages.length}`;
   counts[res.verdict]++;
-  const row = { name: fx.name, ...res, mine: mine.length, gold: gold.length, objects: lm === lg, fonts: fonts.same,
+  const row = { name: fx.name, ...res, mine: mine.length, gold: gold.length, objects: lm === lg, fonts: fonts.same, fontParts: fonts.same ? [] : String(fonts.what).split(/\s+/),
     inputFonts: (fx.fonts || DEFAULT_FONTS).map((file) => ({ file, sha256: sha256(readFileSync(path.join(ref, file))) })),
     goldenSha256: sha256(readFileSync(goldPath)), pages: { bm: minePdf.pages.length, takumi: goldPdf.pages.length } };
   rows.push(row);
@@ -878,4 +880,26 @@ console.log(`interchange (same / close / differ): ${Object.entries(ixCounts).map
 writeFileSync(path.join(outDir, "results.json"), JSON.stringify({ backend: pdfMod.backend, reference: provenance, node: process.version,
   wasmSha256: pdfMod.backend === "wasm" ? sha256(readFileSync(path.join(root, "js", "bm_render.pdf.wasm"))) : null,
   counts, uncovered, missing, interchange: ixCounts, rows }, null, 2) + "\n");
-if (counts.ERROR || missing.length || uncovered.length || (argv.includes("--strict") && (counts.DIFFER || Object.values(ixCounts).some((c) => c.differ)))) process.exitCode = 1;
+// [gate] every fixture difference must be listed, by fixture and part, in scripts/pdf-audit/exceptions.json
+// ("golden"): page content CLOSE / DIFFER, an interchange part close / differ, font dictionaries / CMaps /
+// Type3 procedures (font program bytes are informational: another subsetter). An unlisted difference, or a listed
+// one a fixture that ran no longer shows (stale), fails --strict. No tolerance applies to unlisted fixtures beyond
+// the comparison's own float noise (0.01 absolute / 1e-4 relative, reported as CLOSE and therefore listed too).
+const goldenList = JSON.parse(readFileSync(process.env.PDF_AUDIT_EXCEPTIONS || path.join(root, "scripts", "pdf-audit", "exceptions.json"), "utf8")).golden || [];
+for (const [i, e] of goldenList.entries()) if (!e.fixture || !e.part || !e.verdict || !["deliberate", "open", "noise"].includes(e.status) || !(e.reason?.length >= 40)) throw new Error(`exceptions.json golden ${i}: fixture, part, verdict, status (deliberate | open | noise) and a reason are required`);
+const observed = [];
+for (const row of rows) {
+  if (row.verdict === "CLOSE" || row.verdict === "DIFFER") observed.push({ fixture: row.name, part: "content", verdict: row.verdict });
+  for (const [k, v] of Object.entries(row.interchange || {})) if (v !== "same") observed.push({ fixture: row.name, part: k, verdict: v.toUpperCase() });
+  if (row.fontParts && row.fontParts.some((w) => !/\.program$/.test(w))) observed.push({ fixture: row.name, part: "fonts", verdict: "DIFFER" });
+}
+const listedKey = (e) => `${e.fixture} ${e.part} ${String(e.verdict).toUpperCase()}`;
+const listed = new Set(goldenList.map(listedKey));
+const unexpectedGolden = observed.filter((o) => !listed.has(listedKey(o)));
+const ran = new Set(rows.map((r) => r.name));
+const seen = new Set(observed.map(listedKey));
+const staleGolden = goldenList.filter((e) => ran.has(e.fixture) && !seen.has(listedKey(e)));
+for (const o of unexpectedGolden) console.log(`UNLISTED  ${o.fixture} ${o.part} ${o.verdict} (not in scripts/pdf-audit/exceptions.json "golden")`);
+for (const e of staleGolden) console.log(`STALE     ${e.fixture} ${e.part} ${e.verdict}: listed in exceptions.json, no longer observed`);
+console.log(`gate: ${observed.length} differences, ${observed.length - unexpectedGolden.length} listed, ${unexpectedGolden.length} unlisted, ${staleGolden.length} stale`);
+if (counts.ERROR || missing.length || uncovered.length || (argv.includes("--strict") && (unexpectedGolden.length || staleGolden.length))) process.exitCode = 1;

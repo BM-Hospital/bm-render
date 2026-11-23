@@ -14,7 +14,7 @@ export const toolsManifest = () => (manifest ??= JSON.parse(readFileSync(path.jo
 function walk(dir, name, depth = 0) {
   if (depth > 6 || !existsSync(dir)) return null;
   for (const e of readdirSync(dir, { withFileTypes: true })) {
-    if (e.isFile() && e.name.toLowerCase() === name.toLowerCase()) return path.join(dir, e.name);
+    if ((e.isFile() || e.isSymbolicLink()) && e.name.toLowerCase() === name.toLowerCase()) return path.join(dir, e.name);
   }
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     if (e.isDirectory() && e.name !== "download") { const r = walk(path.join(dir, e.name), name, depth + 1); if (r) return r; }
@@ -34,6 +34,9 @@ export function findBin(name, bin) {
     const rel = t.bin[bin];
     if (rel && existsSync(path.join(dir, rel))) p = path.join(dir, rel);
     else p = walk(dir, path.basename(rel || bin + (process.platform === "win32" ? ".exe" : "")));
+    // (tools.json pins the Windows builds; elsewhere the same tool, installed by other means into
+    // bench/pdf/tools/<name>/, is the binary without the .exe suffix)
+    if (!p && process.platform !== "win32" && rel) p = walk(dir, path.basename(rel).replace(/\.exe$/i, ""));
   }
   cache.set(key, p);
   return p;
