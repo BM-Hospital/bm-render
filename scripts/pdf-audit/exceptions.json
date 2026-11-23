@@ -266,6 +266,13 @@
       "match": "^certificate\\.html 250x90: link destinations per page: bm ",
       "status": "open",
       "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
+    },
+    {
+      "probe": "pagination.table.spacing-breaks",
+      "kind": "text",
+      "match": "^definite height: what follows comes after the last table fragment \\(Chrome\\): word positions differ: page 4: bm \\[\"After\",7\\.5,52\\.9\\] vs takumi \\[\"After\",7\\.5,7\\.9\\]$",
+      "status": "deliberate",
+      "reason": "A table of a definite height with a repeated thead whose last row is cut in the free space of its cells: Chrome (Playwright Chromium printed to PDF, checked 2026-11-23) lays the last table fragment out below the repeated thead (the rest of the row, the spacing) and the block after the table follows it; takumi places that block at the top of the last page, over the repeated thead. bm-render follows Chrome. docs/PDF_AUDIT.md, Page model: table border spacing and rowspans at a break."
     }
   ],
   "golden": [

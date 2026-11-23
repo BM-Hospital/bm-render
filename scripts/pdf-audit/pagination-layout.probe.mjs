@@ -85,6 +85,46 @@ probe("pagination.table.rowspan", "tables: a cell that spans rows across a page 
     ["rowspan over 12 rows (more than a page)", table(`<tr><td rowspan="12">S1<br>S2<br>S3<br>S4<br>S5<br>S6<br>S7<br>S8<br>S9<br>S10<br>S11<br>S12</td><td>a01</td></tr>` + Array.from({ length: 11 }, (_, i) => `<tr><td>a${pad(i + 2)}</td></tr>`).join("")), SMALL],
   ], G);
 });
+// Tables with their default border spacing (or 10px) on 300 x 220 pages, 12px/16px rows with `padding: 1px 2px`
+// (18px rows): the spacing at a break, rows that start or continue a cell spanning rows, rows grown by a definite
+// table height. Checked against Playwright Chromium printed to PDF as well (2026-11-23): Chrome agrees with takumi
+// in every case here but the last, where takumi draws the content after the table over its repeated header.
+const SP_CSS = `body{font:12px/16px Inter} table{width:200px;font:12px/16px Inter} td,th{padding:1px 2px;text-align:left;font-weight:400}`;
+const spTable = ({ n = 20, span = -1, head = false, height = "", css = "", body2 = false } = {}) => {
+  const row = (i, word = "Item") => span >= 0 && i === span ? `<tr><td rowspan="3">${word} ${pad(i + 1)}</td><td>${(i + 1) * 3}</td></tr>`
+    : span >= 0 && (i === span + 1 || i === span + 2) ? `<tr><td>${(i + 1) * 3}</td></tr>` : `<tr><td>${word} ${pad(i + 1)}</td><td>${(i + 1) * 3}</td></tr>`;
+  const body = Array.from({ length: n }, (_, i) => row(i)).join("");
+  const hd = head ? "<thead><tr><th>Name</th><th>Qty</th></tr></thead>" : "";
+  const second = body2 ? `<tbody>${Array.from({ length: n }, (_, i) => row(i, "Next")).join("")}</tbody>` : "";
+  return doc(`<table style="${height ? `height:${height};` : ""}${css}">${hd}<tbody>${body}</tbody>${second}</table><div>After</div>`, SP_CSS);
+};
+probe("pagination.table.spacing-breaks", "tables: border spacing at a break, cells spanning rows over it, rows grown by a definite table height", async (t) => {
+  const sp10 = "border-spacing:0 10px";
+  await cmpAll(t, [
+    // the spacing before the first row of a continuation is truncated (it was kept without a thead)
+    ["no thead: the rows of the next page start at its top", spTable({ n: 30 }), ST_PAGE],
+    ["no thead, 10px spacing", spTable({ n: 20, css: sp10 }), ST_PAGE],
+    ["no thead, a second row group continues", spTable({ n: 6, css: sp10, body2: true }), ST_PAGE],
+    ["the spacing after the last row is cut where the rows end at the page end (and a block-end border follows)", spTable({ n: 20, span: 8, css: "border-bottom:1px solid #000" }), ST_PAGE],
+    ["the spacing after the last row is cut where the rows end at the page end", spTable({ n: 20, span: 8 }), ST_PAGE],
+    // a cell spanning rows from above the break: its row resumes first, the spacing after it stays
+    ["rowspan over the break, 10px spacing", spTable({ n: 20, span: 5, css: sp10 }), ST_PAGE],
+    ["rowspan starting the next page, 10px spacing", spTable({ n: 20, span: 7, css: sp10 }), ST_PAGE],
+    ["rowspan over the break with a repeated thead", spTable({ n: 20, span: 7, head: true }), ST_PAGE],
+    ["rowspan over the break with a repeated thead, 10px spacing", spTable({ n: 20, span: 5, head: true, css: sp10 }), ST_PAGE],
+    // the rows a definite table height grew: a row whose cells all span rows from it or above splits as a
+    // row of several cells does; a row whose content and padding do not fit moves on whole
+    ["definite height: a row of one cell beside a rowspan splits", spTable({ n: 8, span: 3, height: "700px" }), ST_PAGE],
+    ["definite height: the row of the first rowspan cell splits", spTable({ n: 8, span: 0, height: "700px", css: sp10 }), ST_PAGE],
+    ["definite height: a row whose content does not fit moves on whole", spTable({ n: 8, height: "700px", css: sp10 }), ST_PAGE],
+    ["definite height: the spacing at the break, the table keeps its height", spTable({ n: 3, height: "900px", css: sp10 }), ST_PAGE],
+    ["definite height: a row cut in its free space resumes below the repeated thead", spTable({ n: 3, height: "900px", head: true }), ST_PAGE],
+    ["definite height with a repeated thead and rowspan, 10px spacing", spTable({ n: 8, span: 4, height: "700px", head: true, css: sp10 }), ST_PAGE],
+    // (Chrome: the last table box takes what is left of the height below its repeated thead, the block after it
+    // follows; takumi places the block at the top of that last page, over the repeated thead)
+    ["definite height: what follows comes after the last table fragment (Chrome)", spTable({ n: 3, height: "600px", head: true }), ST_PAGE],
+  ], G);
+});
 probe("pagination.table.caption", "tables: captions", async (t) => {
   await cmpAll(t, [
     ["top caption", table(`<caption style="font:12px/20px Inter;text-align:left">CAP</caption>` + rows(1, 20)), SMALL],
