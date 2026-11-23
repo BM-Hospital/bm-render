@@ -1068,6 +1068,32 @@ fn flowBudget(o: opt.PdfOptions) u32 {
     return @max(1, o.chunk_elements / 4);
 }
 
+/// How much a part of a flowing document lays out beyond what the next part lays out again: the
+/// next part starts in the child of the flow holding its first page and lays that child out whole,
+/// and the child after it too (the last two children a part lays out, at least: `FlowIter.lay`).
+/// Children of many elements (a long table each) would otherwise be laid out about three times a
+/// pass, so a part lays out at least `overlap_share` times its last two children, as long as that
+/// stays within `overlap_cap` times the budget (its memory stays bounded; a part whose last two
+/// children hold more than that lays out its minimum).
+const overlap_share: u32 = 6;
+const overlap_cap: u32 = 8;
+
+/// The end (exclusive index in `kids`) of the children of the flow a part starting in `kids[kid0]`
+/// lays out: at least `min_j`, at least `budget` source elements, and enough that the children it
+/// lays out again with the next part are a small share of it (`overlap_share`).
+fn partEnd(kids: []const u32, kid0: usize, min_j: usize, budget: u32) usize {
+    var j = kid0 + 1;
+    while (j < kids.len) : (j += 1) {
+        if (j < min_j) continue;
+        const laid = kids[j] - kids[kid0];
+        if (laid < budget) continue;
+        const again = kids[j] - kids[j - 2];
+        if (laid < overlap_share *| again and laid < overlap_cap *| budget) continue;
+        break;
+    }
+    return j;
+}
+
 /// A render node of one frame named so that another frame of the same document finds it
 /// (`tags.Carry`): the nearest node at or above it with an element (that element, its kind) and
 /// the child indices down from there.
@@ -1143,7 +1169,8 @@ const FlowPart = struct {
 /// Lays a flowing document out a part at a time (`next`), each part in an arena of its own,
 /// released when the next one is laid out (or on `deinit`). A part's frame lays out the flow's
 /// children from the one holding its first page's start up to at least `budget` source elements
-/// further (more when no page boundary of those can be cut at), and gives up all but its last
+/// further, more when its last children are big (`partEnd`) or no page boundary of those can be
+/// cut at, and gives up all but its last
 /// pages: the page it stops at is where the next part starts. The pages it keeps are those of the
 /// whole document laid out at once: the content before its first page only moves the boxes, which
 /// the part lays out where the document has them (`Options.root_shift`, `Options.start` /
@@ -1177,8 +1204,7 @@ const FlowIter = struct {
         var min_j = it.kid0 + 3;
         while (true) {
             it.deinit();
-            var j = it.kid0 + 1;
-            while (j < kids.len and (kids[j] - kids[it.kid0] < budget or j < min_j)) j += 1;
+            const j = partEnd(kids, it.kid0, min_j, budget);
             // (a first part that would hold the whole document: laid out whole)
             if (j >= kids.len and it.res == null) return refuse(FlowPart, "no page boundary to cut at");
             const mem = try newMem(it.r);

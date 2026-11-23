@@ -131,6 +131,8 @@ const CASES = [
   { id: "flow-grid-placed", source: sections(8, (k) => `<div style="display:grid;grid-template-columns:1fr 1fr;grid-auto-flow:dense;gap:4px">${Array.from({ length: 30 }, (_, i) => `<div style="${i % 5 === 0 ? "grid-column:span 2;" : ""}${i % 7 === 3 ? `grid-row:${30 - i};` : ""}border:1px solid #765;padding:4px">${k}.${i}</div>`).join("")}</div>`, () => ""), options: { size: "A5" } },
   { id: "flow-table-rowspan", source: sections(8, (k) => `<table style="width:100%;border-collapse:collapse">${Array.from({ length: 30 }, (_, i) => `<tr>${i % 6 === 0 ? `<td rowspan="4" style="border:1px solid #999">span ${k}.${i}</td>` : i % 6 >= 4 ? "<td>-</td>" : ""}<td style="border:1px solid #999">${k}.${i}</td></tr>`).join("")}</table>`, () => ""), options: { size: "A5" } },
   { id: "flow-stress-no-breaks", source: stressHtml(30).replaceAll("break-after:page", ""), options: stressOpts, chunks: 256 },
+  // (default part sizes, children of the flow of 247 elements each: a part lays out several of them, paged.zig `partEnd`)
+  { id: "flow-long-tables-default", source: `<div style="font-family:Inter;font-size:11px">${Array.from({ length: 24 }, (_, t) => `<table style="width:100%;border-collapse:collapse;margin:8px 0"><thead><tr><th>Item</th><th>Qty</th><th>Amount</th></tr></thead><tbody>${Array.from({ length: 60 }, (_, r) => { const i = t * 60 + r; return `<tr><td style="border-bottom:1px solid #e2e8f0">Line ${i}</td><td style="text-align:right">${i % 23}</td><td style="text-align:right">${(i * 37) % 997}.50</td></tr>`; }).join("")}</tbody></table>`).join("")}</div>`, options: stressOpts, chunks: 2048, parts: true },
 ];
 
 const round = (v, k = 100) => Math.round(v * k) / k;

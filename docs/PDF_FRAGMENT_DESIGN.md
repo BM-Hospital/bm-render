@@ -107,7 +107,10 @@ There are three lifetimes:
   (`Options.origin`, `Options.root_shift`).
 - **`.flowing`** (`paged.FlowIter`) — cuts at any page boundary when there is no usable forced
   break: a part lays out the flow's children from the one holding its first page's start up to at
-  least `chunk_elements / 4` elements (`flowBudget`), keeps every page but its last, and hands a
+  least `chunk_elements / 4` elements (`flowBudget`), and at least six times its last two children
+  when those are big, up to `2 × chunk_elements` elements (`partEnd`: the next part lays out again
+  the child it starts in and the one after it, so parts of one or two big children — a long table
+  each — laid every table out about three times a pass), keeps every page but its last, and hands a
   `Resume` (`NodeKey`, line + first glyph, page tops before/at/after, the child's top) to the next
   part, which must reproduce the same break. The start may be inside blocks, between the rows of a
   table, before a line / row / item of a flex or grid container (`paged.resumeKid`: any start that
@@ -118,7 +121,11 @@ There are three lifetimes:
   records over a seam, anchors/headings resolved to destinations: `handOn` / `takeOn`) → `finish`
   (one allocation for the file). A part whose pages `pageRanges` drops still collects its anchors
   and headings (`DocWriter.collect`). Bands with page counters: a counting pass over the parts, then
-  the drawing pass.
+  the drawing pass. The count cannot wait for the drawing: the page count's digits in the first
+  page's header are among the first glyphs drawn, and a font subset numbers its glyphs in the
+  order they are first drawn, so every page's text codes depend on it (drawing the bands into
+  their places afterwards was tried: one layout instead of two, but other glyph codes than the
+  document laid out whole). The counting pass costs one layout of the document (§7: long tables).
 
 ### When a page may be emitted, and when it must be held
 
@@ -183,6 +190,19 @@ Long tables without forced breaks (`--stress`, 60-row tables on the stress page,
 rows since 2026-11-23): 200 tables / 201 pages, peak 186.93 MiB laid out whole (before: no page
 boundary could be cut at) → 70.82 MiB in 198 parts, live after page 50 / 200 = 43.60 / 49.34 MiB;
 4.17 → 8.58 ms/page, as each part lays out again the table the next part starts in.
+
+Since `partEnd` (2026-11-23), a part of such a document lays out about twelve tables instead of
+three (wasm, 60-row tables on the stress page with its `Page n of N` footer, median of 5): 50
+tables 790 → 460 ms (laid out whole 346 ms), wasm memory 27.3 → 38.9 MiB (whole 61.1 MiB); 100
+tables 1572 → 966 ms (whole 668 ms), 47.8 → 53.2 MiB (whole 113 MiB). Each table was laid out
+5.8 times (2.9 a pass: 48 parts of about one page for 51 pages); now 2.3 times (1.16 a pass, 5
+parts). What remains over the whole layout is the counting pass the footer's page count needs
+(one more layout of the document, about a third of the time drawn whole) and the 16 % laid out
+again at the seams. The stress documents (cut at forced breaks) and documents of small children
+(`memory_tests.rs` sections: the budget decides first) are cut as before. Native
+(`pdf-memory.mjs --stress`): 200 tables in 20 parts instead of 198, 8.58 → 4.87 ms/page, peak
+70.84 MiB (as before), live after page 50 / 200 = 46.36 / 51.57 MiB; 50 tables 4.37 ms/page,
+peak 24.98 MiB, 5 parts.
 
 ## 8. Open items
 

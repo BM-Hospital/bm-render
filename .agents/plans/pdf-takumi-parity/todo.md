@@ -694,3 +694,18 @@ Baseline (HEAD `d1eb50c`, wasm, oracle pinned `ff9a5d4`): strict audit 2.202 pro
 
 Sau thay đổi (wasm): strict audit **2.203 probe, 2.178 pass, 0 fail, 25 expected, 0 unverified, 0 stale; exit 0**; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER, `--strict` 18 khác biệt đều liệt kê; PDF Zig 776/776 (+3); `zig build test` 753 pass / 22 skip (+3); `test:pdf` 401/401; `pdf-chunks-check --backend=wasm` tất cả tương đương; coverage `--strict` 0 vấn đề; `test:pdf:gate` 11/11 (oracle symlink rồi gỡ). Native chưa build lại.
 File đổi: `src/layout/fragment.zig`, test `src/test_paged.zig`; `scripts/pdf-audit/{exceptions.json,pagination-layout.probe.mjs}`, `docs/PDF_AUDIT.md`.
+
+## 2026-11-23 hiệu năng cắt phần không có forced break (bảng dài): kích thước phần theo con lớn
+
+Baseline (HEAD `d89f5e7`, wasm, median 5 lần): 50 bảng 60 hàng (trang stress, footer `Page n of N`) 790–859 ms / 27,3 MiB; `chunks:false` 346 ms / 61,1 MiB; 10/100 bảng 150 / 1572 ms.
+
+- **Nguyên nhân (đã đo bằng bộ đếm tạm trong wasm + `node --cpu-prof` bản không strip):** mỗi phần chỉ lấy `flowBudget` = 512 phần tử nhưng tối thiểu 3 con của flow; một bảng = 247 phần tử nên mỗi phần layout 3 bảng (~4 trang), mà phần sau phải layout lại con chứa điểm bắt đầu và con kế tiếp (`ki + 2 ≤ j`) → mỗi phần chỉ giữ ~1 trang: 48 phần cho 51 trang mỗi lượt, mỗi bảng layout 2,9 lần/lượt, × 2 lượt (lượt đếm trang cho footer có `totalPages` + lượt vẽ) = 5,8 lần so với 1 lần khi layout cả tài liệu. `Frame.prepareLayout` (build + shaping + layout bảng) chiếm 2260/3850 ms mẫu (4 lần render), lượt đếm 1353.
+- **Sửa:** `src/pdf/paged.zig` `partEnd`: phần layout ít nhất `budget` phần tử và ít nhất 6 lần hai con cuối (phần bị layout lại), tối đa `8 × budget` phần tử (bộ nhớ vẫn bị chặn; với `chunks: 1` không đổi). Với con nhỏ (section của `memory_tests.rs`) budget quyết định trước → các phần y như cũ. Bảng: 1,16 lần/lượt, 5 phần/lượt.
+- **Đã thử, không giữ:** vẽ header/footer sau khi biết số trang (bỏ lượt đếm: 50 bảng ~1,12× bản layout cả tài liệu) — không tương đương: subset font đánh số glyph theo thứ tự vẽ đầu tiên, header trang 1 chứa chữ số của tổng số trang nên mã glyph của mọi trang khác bản layout cả tài liệu (`bands-counters`, `flow-takumi-*`, `flow-bands` fail trong `pdf-chunks-check`). Lượt đếm (một lần layout nữa) là phần còn lại.
+- **Sau thay đổi (wasm, median 5):** 50 bảng 460 ms / 38,9 MiB (whole 346 / 61,1); 100 bảng 966 ms / 53,2 MiB (whole 668 / 113); 10 bảng 88 ms (giờ layout cả tài liệu, như whole 82); stress 100/500 trang, 21 docs, image không đổi (nhiễu ±2 %). Ghi chú: bản chia phần của bảng dài vốn không byte-identical với bản whole (cả ở HEAD; tọa độ), chỉ tương đương; các case byte-identical của chunks check vẫn vậy.
+- Case mới `flow-long-tables-default` (24 bảng, `chunks: 2048`) trong `scripts/pdf-chunks-check.mjs`.
+
+Native (`pdf-memory.mjs --stress`): 200 bảng 198 → 20 phần, 8,58 → 4,87 ms/trang, peak 70,84 MiB (như cũ); 700 section không đổi (×1,036 / ×1,061, 5 phần, invariant pass).
+
+Gate (wasm): `zig build test -Dprofile=pdf`, `zig build test` pass; `test:pdf` 401/401; `pdf-chunks-check` tất cả tương đương (76 case, wasm và native; `flow-long-tables-default` 3 phần); `test:pdf:memory` pass (native build lại); strict audit 2.203 probe, 2.168 pass, 0 fail, 35 expected, exit 0.
+File đổi: `src/pdf/paged.zig`, `src/pdf/chunks.zig` (comment), `scripts/pdf-chunks-check.mjs`, `docs/PDF_FRAGMENT_DESIGN.md`.
