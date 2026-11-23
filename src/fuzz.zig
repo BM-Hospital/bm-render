@@ -514,6 +514,33 @@ test "long text runs render in linear time (fuzz regression)" {
     }
 }
 
+test "long unspaced Thai and CJK runs shape in linear time (fuzz regression)" {
+    // No spaces outside Latin: the run was never split into shaping segments, and every SARA AM
+    // (decomposed with an insertion into the shaping buffer) moved the rest of the run. 4x the
+    // text must cost well under 16x the time.
+    inline for (.{ "\u{0e01}\u{0e33}", "\u{6f22}\u{5b57}\u{304b}\u{306a}" }) |unit| {
+        const short = try renderUnitMs(unit, 18_000 / unit.len * 3);
+        const long = try renderUnitMs(unit, 72_000 / unit.len * 3);
+        if (long > 8 * short + 100) {
+            std.debug.print("unspaced run {s}: {d} ms, 4x as long: {d} ms\n", .{ unit, short, long });
+            return error.SlowInput;
+        }
+    }
+}
+
+fn renderUnitMs(comptime unit: []const u8, reps: usize) !i64 {
+    const a = std.testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(a);
+    try src.appendSlice(a, "<p>");
+    for (0..reps) |_| try src.appendSlice(a, unit);
+    try src.appendSlice(a, "</p>");
+    const io = std.testing.io;
+    const t0 = std.Io.Clock.awake.now(io);
+    run(.render_html, a, src.items);
+    return t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+}
+
 fn renderMs(reps: usize) !i64 {
     const a = std.testing.allocator;
     var src: std.ArrayList(u8) = .empty;

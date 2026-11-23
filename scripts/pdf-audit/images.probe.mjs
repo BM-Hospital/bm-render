@@ -527,7 +527,7 @@ cases("images.svg-text-path", "SVG textPath and text decorations", [
   const F = (name, file) => ({ name, data: new Uint8Array(fileBytes("tests/upstream/takumi/assets/fonts/" + file)) });
   const fonts = () => [F("Geist", "geist/Geist[wght].woff2"), F("Geist Mono", "geist/GeistMono[wght].woff2"), F("Archivo", "archivo/Archivo-VariableFont_wdth,wght.ttf"),
     F("Scheherazade New Test", "sil/scheherazade-new-v17-arabic-regular.woff2"), F("Noto Sans Devanagari", "noto-sans/noto-sans-devanagari-v30-devanagari-regular.woff2")];
-  for (const name of ["svg_text_shaping", "svg_text_baselines", "svg_text_path_rotate", "image_svg_text", "svg_inline_page_styles", "offset_path_along_curve", "offset_path_circular_text", "offset_path_ray_burst", "offset_path_wave_text"]) {
+  for (const name of ["svg_text_shaping", "svg_text_spacing", "svg_text_baselines", "svg_text_path_rotate", "image_svg_text", "svg_inline_page_styles", "offset_path_along_curve", "offset_path_circular_text", "offset_path_ray_burst", "offset_path_wave_text"]) {
     probeAs(`images.svg-fixture.${name}`, "upstream takumi fixtures-html (SVG text, inline SVG, motion paths)", async (t) => {
       const html = fileBytes(`takumi/tests/fixtures-html/${name}.html`).toString("utf8").replace(/<link[^>]*>/g, "").replace(/<base[^>]*>/g, "");
       await cmp(t, "", html, { viewport: { width: 1200, height: 630 }, tagged: false }, { fonts: fonts() });

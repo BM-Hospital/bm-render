@@ -338,6 +338,8 @@ pub const S = struct {
     /// overflow clip is a flush point as well, since clips are open groups of the document
     float_q: std.ArrayList(QueuedFloat) = .empty,
     float_now: u32 = none,
+    /// `svg_out_text.synthOf`: the colour tables of the last face it looked at
+    color_tables: pm.ColorTablesCache = .{},
     outlines: std.ArrayList(Deferred) = .empty,
     outline_clips: std.ArrayList(ClipEnt) = .empty,
     path: Path = .empty,

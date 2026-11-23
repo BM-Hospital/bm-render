@@ -3728,11 +3728,11 @@
       "line": 6893,
       "name": "persian_zero_width_non_joiners_keep_their_own_glyph",
       "sourceSha256": "8cdd8ad0c7efbc0f21305bb99e13ed595399102a57049f6a254c2008ce302ee3",
-      "status": "open",
+      "status": "verified",
       "adapters": [
         "node scripts/pdf-audit/run.mjs --strict upstream.persian_zero_width_non_joiners_keep_their_own_glyph"
       ],
-      "reason": "Open text-layer bug: bm keeps U+200C in the grapheme cluster of the letter before it, so that glyph maps to two characters and pdftotext places the ZWNJ before its letter in RTL; takumi gives ZWNJ its own glyph (exceptions.json, status open)."
+      "reason": "Ported case-level: the test's input and the facet it asserts, compared with the pinned oracle and with the constant the Rust test asserts (scripts/pdf-audit/upstream.probe.mjs). Was open: bm folded U+200C into the cluster of the letter before it in RTL runs; it now keeps its own invisible glyph and ToUnicode entry (src/pdf/text.zig hideIgnorables)."
     },
     {
       "id": "takumi-pdf/tests/pdf_fixtures.rs:6934:synthesized_italic_leans_right_about_the_baseline",

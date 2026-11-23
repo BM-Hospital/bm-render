@@ -148,8 +148,7 @@ fn synthOf(e: *Emitter, rcs: *const CS, g: *const font.PositionedGlyph) Synth {
     // (font-synthesis: a face is emboldened / slanted only where the style allows it)
     var sy: Synth = .{ .italic = rcs.font_synthesis.style and rcs.font_style != .normal and !fc.italic, .bold = rcs.font_synthesis.weight and rcs.font_weight >= 600 and fc.weight < 600, .colored = false };
     if (comptime pm.enable_color_fonts) {
-        const color = @import("../font/color.zig");
-        if (color.glyphKind(&fc.font, g.gid) != .none) sy = .{ .italic = false, .bold = false, .colored = true };
+        if (e.color_tables.get(g.face, &fc.font).kind(g.gid) != .none) sy = .{ .italic = false, .bold = false, .colored = true };
     }
     return sy;
 }

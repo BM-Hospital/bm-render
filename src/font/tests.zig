@@ -699,6 +699,28 @@ test "tabs use the run's CSS count and generated hyphens keep a character mappin
     try t.expect(found);
 }
 
+test "the hyphen of a soft hyphen that opens a span takes the span's style" {
+    // `extra<span style="color:red; font-size:30px">&shy;ordinary</span>` broken at the soft hyphen:
+    // the line ends in the span's item, so its hyphen is the span's (Blink, Firefox, takumi)
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const outer: font.TextStyle = .{ .families = inter_fam, .size = 20, .user = 1 };
+    var span = outer;
+    span.user = 2;
+    for ([_]f32{ 20, 30 }) |size| {
+        span.size = size;
+        var l = try font.layoutText(t.allocator, &fx.fc, &.{ .{ .text = "extra", .style = outer }, .{ .text = "\u{ad}ordinary", .style = span } }, .{ .max_width = 60 });
+        defer l.deinit(t.allocator);
+        var found = false;
+        for (l.glyphs) |g| if (g.generated != null) {
+            try t.expectEqual(@as(u32, 2), g.user);
+            try t.expectEqual(size, g.size);
+            found = true;
+        };
+        try t.expect(found);
+    }
+}
+
 test "continuation cuts do not enlarge intrinsic text widths" {
     var fx = try Fixture.init();
     defer fx.deinit();

@@ -230,6 +230,8 @@ pub const Emitter = struct {
     background_strip: ?Geom = null,
     path: Path = .empty,
     path2: Path = .empty,
+    /// `emit_text.synthOf`: the colour tables of the last face it looked at
+    color_tables: pm.ColorTablesCache = .{},
     outlines: std.ArrayList(Deferred) = .empty,
     /// clips opened by the walk (overflow, clip-path), for re-entering them around deferred outlines
     clips: std.ArrayList(ClipRec) = .empty,

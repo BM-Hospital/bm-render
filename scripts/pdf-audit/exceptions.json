@@ -184,27 +184,6 @@
       "reason": "Not what the Rust test asserts (that passes: the sidebar paints once). On the last page of a table that is a row-flex item and breaks over pages, takumi's rows are 14.3-14.4 px tall where both engines use 13.5 px on every earlier page; bm keeps 13.5 px, so pdftotext orders the words of page 3 differently (same words). Not yet checked against Chrome; docs/PDF_AUDIT.md, Page model."
     },
     {
-      "probe": "upstream.persian_zero_width_non_joiners_keep_their_own_glyph",
-      "kind": "font-mapping",
-      "match": "^bm maps U\\+200C alone: ",
-      "status": "open",
-      "reason": "bm-render keeps U+200C ZWNJ in the grapheme cluster of the letter before it (UAX #29 Extend), so that glyph maps to two characters (e.g. U+067E U+200C) where takumi gives the ZWNJ its own glyph and ToUnicode entry. Open text-layer bug; docs/PDF_AUDIT.md, Text and fonts."
-    },
-    {
-      "probe": "upstream.persian_zero_width_non_joiners_keep_their_own_glyph",
-      "kind": "font-mapping",
-      "match": "^U\\+200C mappings: bm ",
-      "status": "open",
-      "reason": "The same ZWNJ cluster mapping, compared with takumi's mappings (only 200C there). Open text-layer bug; docs/PDF_AUDIT.md, Text and fonts."
-    },
-    {
-      "probe": "upstream.persian_zero_width_non_joiners_keep_their_own_glyph",
-      "kind": "text",
-      "match": "^text per page: bm ",
-      "status": "open",
-      "reason": "Consequence of the ZWNJ mapping: in RTL text pdftotext reverses the two-character mapping, so the ZWNJ is extracted before its letter instead of after it. Open text-layer bug; docs/PDF_AUDIT.md, Text and fonts."
-    },
-    {
       "probe": "upstream.html_fixtures_paint_from_their_windows",
       "kind": "text",
       "match": "^certificate\\.html 523x770: text per page: bm ",

@@ -260,17 +260,16 @@ differs("text.overflow-tail.taller-span-baseline", "text-overflow / line-clamp m
     t.ok(ys.length >= 3 && ys.every((y) => y === ys[0]), `one baseline: ${ys.join(", ")}`);
   },
   { fonts: BIDI });
-// Bidi text in a left-to-right line: Blink's LineTruncator hides what overflows in visual order
-// (takumi keeps the visual-left, logically last Arabic words); bm-render truncates in logical
-// order before reordering. Same marker, brush and paint order; different words kept.
-for (const [id, html] of [
-  ["ltr-arabic", bp(narrow + "text-overflow:ellipsis", "مرحبا بالعالم مرحبا بالعالم مرحبا")],
-  ["ltr-mixed", bp(narrow + "text-overflow:ellipsis", "abc مرحبا بالعالم def ghi")],
-]) {
-  differs(`text.overflow-tail.visual-truncation-${id}`, "text-overflow / line-clamp markers: brush, paint order, RTL", html,
-    "an RTL run in an LTR line is truncated in logical order by bm, in visual order by takumi",
-    (t, _bm, j) => t.ok(j.pages[0].text.endsWith("…"), `marker last: ${j.pages[0].text}`), { fonts: BIDI });
-}
+// Bidi text in a line of the other direction: what overflows is hidden at the line's visual end
+// (CSS Overflow 3; Blink's LineTruncator works in visual order, as takumi), so the visual-left,
+// logically last Arabic words of a left-to-right line stay.
+same("text.overflow-tail", "text-overflow / line-clamp markers: brush, paint order, RTL", [
+  ["visual-truncation-ltr-arabic", bp(narrow + "text-overflow:ellipsis", "مرحبا بالعالم مرحبا بالعالم مرحبا")],
+  ["visual-truncation-ltr-mixed", bp(narrow + "text-overflow:ellipsis", "abc مرحبا بالعالم def ghi")],
+  ["visual-truncation-ltr-mixed-span", bp(narrow + "text-overflow:ellipsis", `abc <span style="color:red">مرحبا</span> بالعالم def ghi`)],
+  ["visual-truncation-rtl-latin-run", bp(narrow + "text-overflow:ellipsis;direction:rtl", "مرحبا abc def ghi jkl بالعالم")],
+  ["visual-truncation-rtl-digits", bp(narrow + "text-overflow:ellipsis;direction:rtl", "مرحبا 12345 67890 بالعالم")],
+], { fonts: BIDI });
 
 // ------------------------------------------------------------------------------------------------ 29 tabs / pre-wrap / soft hyphen
 
@@ -306,9 +305,14 @@ same("text.whitespace", "tabs, pre-wrap spaces and soft hyphens in the text laye
 differs("text.whitespace.tab-size-length", "tabs, pre-wrap spaces and soft hyphens in the text layer",
   tp("white-space:pre;tab-size:30px", "a\tb\tc"), "tab-size <length>: bm puts stops every 30px, takumi 22.5px apart",
   (t, _bm, j) => t.ok(j.pages[0].text.replace(/\s+/g, " ") === "a b c", "text a b c"));
-// The hyphen of a soft hyphen at the start of a span: takumi paints it with the span's colour,
-// bm-render with the preceding glyph's (the soft hyphen has no glyph of its own in bm's line).
-differs("text.whitespace.soft-hyphen-span-color", "tabs, pre-wrap spaces and soft hyphens in the text layer",
-  tp("width:60px;hyphens:manual", `extra<span style="color:red">&shy;ordinary</span>`),
-  "soft hyphen opening a span: bm's generated hyphen takes the preceding text's colour, takumi's the span's",
-  (t, _bm, j) => t.ok(j.pages[0].text.replace(/\s+/g, " ") === "extra‐ ordinary", "text extra‐ ordinary"));
+// The hyphen of a soft hyphen at the start of a span: the line ends in the span's item, so the
+// hyphen takes the span's style (Blink, Firefox and takumi), not the preceding text's.
+same("text.whitespace", "tabs, pre-wrap spaces and soft hyphens in the text layer", [
+  ["soft-hyphen-span-color", tp("width:60px;hyphens:manual", `extra<span style="color:red">&shy;ordinary</span>`)],
+  ["soft-hyphen-span-size", tp("width:60px;hyphens:manual", `extra<span style="color:red;font-size:26px">&shy;ordinary</span>`)],
+  ["soft-hyphen-before-span", tp("width:60px;hyphens:manual", `extra&shy;<span style="color:red">ordinary</span>`)],
+  // not broken there: the pair kerning across the soft hyphen stays
+  ["soft-hyphen-span-kern", tp("hyphens:manual", `AV A<span style="color:red">&shy;V</span> T<span style="color:red">&shy;o</span>`)],
+  ["soft-hyphen-span-kern-break", tp("width:30px;hyphens:manual", `TA<span style="color:red">&shy;VA</span>`)],
+  ["soft-hyphen-kern-break", tp("width:30px;hyphens:manual", `TA&shy;VA`)],
+]);

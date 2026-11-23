@@ -537,6 +537,19 @@ test "soft hyphens: hyphens none keeps the word whole, a generated hyphen sits o
     try expectHas(multi, "Tm[-1627.3438(");
 }
 
+test "a zero-width non-joiner in right-to-left text keeps its own invisible glyph and mapping" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    _ = try t.r.registerFont(try testing.allocator.dupe(u8, naskh), "", 0, -1, null);
+    // Persian words with U+200C: takumi (HarfBuzz) keeps it as a space glyph without advance in a
+    // cluster of its own; folded into the letter before it, that letter mapped to <067E200C> and
+    // pdftotext put the ZWNJ before its letter
+    const doc = try t.render("<p dir=\"rtl\" lang=\"fa\" style=\"margin:0;font:24px 'Noto Naskh Arabic'\">\u{645}\u{6cc}\u{200c}\u{62f}\u{647}\u{62f} \u{644}\u{67e}\u{200c}\u{62a}\u{627}\u{67e}</p>", "{\"tagged\":false}");
+    try expectHas(doc, "<200C>");
+    try testing.expectEqual(count(doc, "<200C>"), count(doc, "200C>"));
+}
+
 fn before(hay: []const u8, a: []const u8, b: []const u8) !void {
     const ia = std.mem.indexOf(u8, hay, a) orelse return error.TestUnexpectedResult;
     const ib = std.mem.indexOf(u8, hay, b) orelse return error.TestUnexpectedResult;

@@ -29,6 +29,34 @@ const ptable = @import("paint_table.zig");
 pub const enable_color_fonts = @import("config.zig").enable_color_fonts;
 /// Colour glyphs of some kind are drawn (COLR needs `enable_color_fonts`, bitmaps either flag).
 pub const enable_color_glyphs = enable_color_fonts or @import("config.zig").enable_bitmap_glyphs;
+/// The colour tables of one face, cached by `paint_text.synthOf` / `svg_out_text.synthOf`.
+pub const ColorTablesCache = struct {
+    const T = if (enable_color_glyphs) @import("font/color.zig").ColorTables else void;
+    face: u32 = 0xffff_ffff,
+    tables: T = if (enable_color_glyphs) .{} else {},
+    /// times the tables were read
+    reads: u32 = 0,
+    /// The colour tables of `fnt` (face id `id`), read once per face in a row of glyphs.
+    pub fn get(c: *ColorTablesCache, id: u32, fnt: anytype) *const T {
+        if (c.face != id) {
+            c.tables = T.init(fnt);
+            c.face = id;
+            c.reads +%= 1;
+        }
+        return &c.tables;
+    }
+};
+
+test "glyph synthesis reads a face's colour tables once per run of its glyphs" {
+    if (comptime !enable_color_glyphs) return;
+    const inter = try font.Font.init(@embedFile("font/testdata/Inter-Regular.ttf"), 0);
+    const roboto = try font.Font.init(@embedFile("font/testdata/Roboto-Regular.ttf"), 0);
+    var c: ColorTablesCache = .{};
+    for (0..1000) |g| try std.testing.expectEqual(.none, c.get(0, &inter).kind(@intCast(g)));
+    try std.testing.expectEqual(@as(u32, 1), c.reads);
+    try std.testing.expect(!c.get(1, &roboto).hasColor());
+    try std.testing.expectEqual(@as(u32, 2), c.reads);
+}
 pub const enable_svg = @import("config.zig").enable_svg;
 /// clip-path, mask-image, mix-/background-blend-mode, backdrop-filter, isolation.
 pub const enable_effects = @import("config.zig").enable_effects;
@@ -314,6 +342,8 @@ pub const Painter = struct {
     zpos_q: std.ArrayList(Queued) = .empty,
     float_now: u32 = none,
     pos_now: u32 = none,
+    /// `paint_text.synthOf`: the colour tables of the last face it looked at
+    color_tables: ColorTablesCache = .{},
 
     /// `text`: the inline content of paragraph node `id` whose box origin is (ox, oy); else the node
     /// `id` as a whole, with its parent's origin.
