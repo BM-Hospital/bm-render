@@ -60,15 +60,15 @@ Làm spike thiết kế cho phần rủi ro cao trước khi port sâu: tọa đ
 
 ## 03 — Chia decoration của box transform qua trang (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — đối chiếu oracle pinned `ff9a5d4` bằng 48 probe `paint.transform-fragment.*` (`scripts/pdf-audit/page-fragments.probe.mjs`: draw list từng trang, text từng trang, structure/parent tree, link annotation; rotate/skew/scale/offset-path, chiều cao cố định và auto, cha có border hoặc `position:relative`, clone + radius, transform lồng nhau, block con, link; box bị ranh giới cắt hoặc nằm ở trang sau nhưng góc xoay chạm trang trước). Ở HEAD 34/36 probe đầu và 4/12 probe cha positioned fail. Sửa (`src/pdf/emit.zig`, `src/pdf/emit_text.zig`, `src/pdf/interactive.zig`): (1) nội dung của box transform vẽ ở pass của fragment chứa nó (`Emitter.ownsContent` = `tpage` trong không gian transform) chứ không ở pass của trang hiện tại — trước đó box nằm ở trang 2 mà góc chạm trang 1 thì chữ (outline) vẽ trước nền, tức bị nền che; (2) `BoxFragment` mang transform của fragment và cờ first/last; dòng chữ, link (`inOtherFragment`), box con (cắt bằng `windowSlice` theo cửa sổ fragment) và box transform lồng nhau (fragment riêng, cắt cùng chỗ) chỉ vẽ trong fragment chứa chúng; (3) fragment không chạm trang thì không vẽ nền và không mở region rỗng (`tfExcludes` theo phần box của fragment, `tfRegionShows` theo box của khối + dòng của fragment); line frame của đoạn ẩn danh duy nhất là border box của khối (takumi `LineFrame`); (4) box positioned/lift xếp theo thứ tự scene của takumi: z-index, rồi pass (trang) rồi tree order. Zig: 5 test `transformed box at a page boundary: …` trong `src/pdf/filelayer_tests.zig`, đều fail trước fix. Khác biệt có chủ đích: fragment `slice` có `border-radius` — takumi bo cả góc bị cắt (kể cả không transform, `pagination.box-decoration-break.block`), bm cắt vuông theo CSS. Golden `paged-transforms`/`paged-rotated-text` CLOSE (chỉ lệch bước float cuối của `cm`).
 
 Port per-fragment box geometry và transform origin cho rotate/skew/scale; bảo toàn paint order và nội dung con.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] paged-transforms hết sai khác chưa được chấp nhận; giữ paged-rotated-text ở CLOSE hoặc IDENTICAL.
-- [ ] Box có border/radius, nested transform, clone/slice được cắt đúng và không mất hoặc vẽ lặp text/link.
-- [ ] Không ghi tạm layout toàn cục hoặc special-case theo tên fixture.
+- [x] paged-transforms hết sai khác chưa được chấp nhận; giữ paged-rotated-text ở CLOSE hoặc IDENTICAL. (Cả hai CLOSE: `22.560555` vs `22.560556`.)
+- [x] Box có border/radius, nested transform, clone/slice được cắt đúng và không mất hoặc vẽ lặp text/link. (48 probe; slice + radius là khác biệt có chủ đích đã ghi.)
+- [x] Không ghi tạm layout toàn cục hoặc special-case theo tên fixture. (Trạng thái fragment nằm trong `BoxFragment` của lượt vẽ; layout không bị sửa.)
 
 **Kiểm tra:** Golden paged-transforms, paged-rotated-text, translated/overflow/clip stitched; thêm nested transform và border-radius.
 
@@ -78,15 +78,15 @@ Port per-fragment box geometry và transform origin cho rotate/skew/scale; bảo
 
 ## 04 — Sửa clip ở ranh giới trang (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — 2/3 tiêu chí đóng (2026-11-23). Golden `paged-clipped-overflow` IDENTICAL. 13 probe `paint.clip-fragment.*` (clip lồng nhau, clip dưới transform, dòng bị cắt trên baseline, box `absolute` thoát clip) khớp oracle; 8 fail ở HEAD. Sửa: (1) `src/layout/fragment.zig`: box `absolute` thoát overflow clip (containing block nằm ngoài box clip) nay được phân trang như flow riêng và tính vào extent (`clippedOut`, `insideClip` giữ hành vi cũ cho `fixed`) — trước đó thiếu trang, phần dưới bị vẽ ra ngoài trang; (2) `src/pdf/emit.zig`: clip box đó thoát không còn thu hẹp `clip_y` (chữ E3–E5 bị mất khỏi text layer) và không còn làm box thành monolithic trong `windowSlice` (`outOfClip`); (3) `src/pdf/emit_text.zig`: đoạn ẩn danh của khối clip kết thúc ở đáy khối nên dòng bị clip không mở region rỗng ở trang sau. Zig: `clip at a page boundary: …` (2 test, fail trước fix). Khác biệt có chủ đích (dòng trong `PDF_AUDIT.md`): takumi thêm một trang trắng khi line box của box `overflow:hidden/clip` tràn qua trang cuối (con là block thì không) và vẽ lại box đó phía trên trang sau (không thấy); bm theo Chrome. Còn mở: clip dưới transform không thu hẹp text layer ở cả hai engine (dòng bị che vẫn trích xuất được).
 
 Đối chiếu phần overflow/clip còn lệch, nhất là clip của stitched box và descendant thoát containing block.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] paged-clipped-overflow hết sai khác chưa được chấp nhận; không làm hỏng các golden clipped-line đã qua.
-- [ ] Pixel và text layer thống nhất: phần bị che không lộ trong text layer, phần còn thấy vẫn selectable.
-- [ ] Có case nested clip, transformed ancestor và line bị cắt baseline.
+- [x] paged-clipped-overflow hết sai khác chưa được chấp nhận; không làm hỏng các golden clipped-line đã qua. (IDENTICAL; golden 125/10/1 không đổi.)
+- [ ] Pixel và text layer thống nhất: phần bị che không lộ trong text layer, phần còn thấy vẫn selectable. (Đúng với clip không transform và box `absolute` thoát clip; clip dưới transform vẫn để lộ dòng bị che, takumi cũng vậy.)
+- [x] Có case nested clip, transformed ancestor và line bị cắt baseline. (`paint.clip-fragment.nested-*`, `in-rotated-120`, `rotated-clip-120`, `baseline-cut-*`.)
 
 **Kiểm tra:** Chạy golden overflow/clip, extracted-text và raster diff dưới cùng rasterizer; chọn file probe thực tế theo coverage map.
 
@@ -96,15 +96,15 @@ Port per-fragment box geometry và transform origin cho rotate/skew/scale; bảo
 
 ## 05 — Sửa marked content và structure parent qua trang (P0)
 
-**Trạng thái:** needs review — structure/parent mapping đã khớp; còn thứ tự region rỗng của monolithic overflow.
+**Trạng thái:** done (2026-11-23) — golden `paged-monolithic-overflow` IDENTICAL (structure/parent 136/136). Region theo paint bounds của takumi: fragment transform không chạm trang thì không mở `/P` rỗng (lỗi còn lại của task 24), đoạn của khối clip dừng ở đáy khối, và bounds của đoạn được nới theo `span_ink_reach` (padding + border lớn nhất của span, cộng outline, mọi phía: `spanReach`). Zig `inline span across pages: the spans' reach opens …` và `clip at a page boundary: a clipped paragraph …` fail trước fix. Còn lệch không thấy được: span có padding/border dọc — takumi vẽ nền của fragment bên cạnh (viền thừa) trong region rỗng của fragment đó.
 
 Port quy tắc mở/đóng region theo fragment thay vì sinh region rỗng không cần thiết.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] paged-monolithic-overflow khớp structure tree/parent tree hoặc có chứng cứ ngoại lệ cụ thể.
-- [ ] MCID không trùng, parent mapping hợp lệ cho split box, repeats, empty inline và out-of-flow.
-- [ ] PDF/UA, ActualText và thứ tự đọc giữ nguyên trên các fixture trước đó đã qua.
+- [x] paged-monolithic-overflow khớp structure tree/parent tree hoặc có chứng cứ ngoại lệ cụ thể. (IDENTICAL.)
+- [x] MCID không trùng, parent mapping hợp lệ cho split box, repeats, empty inline và out-of-flow. (structure/parent golden 136/136; mọi probe `tagging.*` pass trừ `mixed-image` có chủ đích; 101 probe `page-fragments` so structure tree.)
+- [x] PDF/UA, ActualText và thứ tự đọc giữ nguyên trên các fixture trước đó đã qua. (Golden `report-tagged-ua1/a2a` vẫn CLOSE, interchange same; `test:pdf` 399/399; veraPDF không chạy lại ở mốc này.)
 
 **Kiểm tra:** Compare struct/parents, pdf.js extraction/structure; chạy các fixture tagged UA1/UA2/A2a và validator khi có tool.
 
@@ -114,15 +114,15 @@ Port quy tắc mở/đóng region theo fragment thay vì sinh region rỗng khô
 
 ## 06 — Sửa fragment background của inline span (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — golden `inline-span-background-image` IDENTICAL; 15 probe `paint.inline-fragment.*` (slice/clone, gradient/radial, radius, padding + border, shadow, qua trang, trong box xoay qua trang) khớp oracle; 7 fail ở HEAD. Sửa (`src/pdf/emit_text.zig`, `src/pdf/emit.zig`): strip ảnh của span `slice` chỉ gồm các fragment trong fragment đoạn trên cùng trang (takumi lay out fragment items theo từng trang); pattern phủ padding box của strip với border hai đầu span (`image_geom.bw`, trước dùng border của fragment dòng); fragment được snap cả trong không gian transform (`SnappedBox`). Zig `inline span across pages: each page's fragment has its own image strip`, `inline span strip: the pattern covers …` fail trước fix. Khác biệt có chủ đích: takumi vẽ fragment của dòng sang trang sau khi padding/border vượt đáy trang (viền thừa, `pagination.box-decoration-break.inline`), bm chỉ vẽ ở trang chứa dòng.
 
 Sửa extents và cách chia nền ảnh/gradient của inline box qua nhiều dòng.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] inline-span-background-image hết sai khác ngoài tolerance.
-- [ ] slice/clone, span có padding/border và span qua trang có case riêng.
-- [ ] Không tạo thêm hoặc làm mất vùng nền ở line break.
+- [x] inline-span-background-image hết sai khác ngoài tolerance. (IDENTICAL.)
+- [x] slice/clone, span có padding/border và span qua trang có case riêng. (`paint.inline-fragment.*`, `pagination.box-decoration-break.inline`.)
+- [x] Không tạo thêm hoặc làm mất vùng nền ở line break. (strip theo trang; viền thừa của takumi ở trang sau không chép.)
 
 **Kiểm tra:** Golden inline-span-background-image, inline-span-border, box-decoration-break-clone; raster diff các case mới.
 
@@ -132,15 +132,15 @@ Sửa extents và cách chia nền ảnh/gradient của inline box qua nhiều d
 
 ## 07 — Sửa mask background-clip text (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — 3/3 tiêu chí đóng, còn 1 case mở (2026-11-23). Golden `inline-span-background-clip-text-nested` và `background-clip-text-reach` IDENTICAL (đã khớp ở HEAD, bảng golden trong `PDF_AUDIT.md` cũ). 8 probe mới `text.background-clip-fragment.*` (span lồng nhau, opacity, transform, clip tổ tiên, decoration, ligature/ActualText, span qua trang) khớp oracle ở HEAD lẫn sau thay đổi. Còn mở: khối `background-clip:text` xoay bị ranh giới trang cắt — hình clip của mask và cách chia glyph (text/outline) khác takumi (pdftotext `sev\nera\n\nl` vs `sev\neral`); khối không transform qua trang chỉ lệch một nhóm artifact rỗng.
 
 Đối chiếu glyph placement của span lồng nhau và độ vươn của mask.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] inline-span-background-clip-text-nested và background-clip-text-reach hết sai khác chưa được chấp nhận.
-- [ ] Mask áp đúng descendant, decoration và clip ancestor; không ảnh hưởng ToUnicode/ActualText.
-- [ ] Không đổi glyph advance chỉ để khớp mask; kiểm tra riêng layout và paint.
+- [x] inline-span-background-clip-text-nested và background-clip-text-reach hết sai khác chưa được chấp nhận. (IDENTICAL.)
+- [x] Mask áp đúng descendant, decoration và clip ancestor; không ảnh hưởng ToUnicode/ActualText. (`text.background-clip.*` 20 + `text.background-clip-fragment.*` 8: draw list, text từng trang, structure.)
+- [x] Không đổi glyph advance chỉ để khớp mask; kiểm tra riêng layout và paint. (Không đổi glyph advance; golden khớp cả vị trí `Tm`/glyph, text probe so layout riêng.)
 
 **Kiểm tra:** Golden hai case mục tiêu; regression clip-text-stroke, nested spans, opacity, transform và page cut.
 
@@ -443,14 +443,14 @@ Bổ sung relative color syntax mà upstream có, bắt đầu rgb(from ...).
 
 ## 24 — Port offset-path (P2)
 
-**Trạng thái:** needs review — 2/3 tiêu chí đóng. 20 probe mới `paint.motion.*` (box + text + link annotation so oracle; 12 viewport, 8 phân trang) cùng 10 probe cũ và 4 fixture `images.svg-fixture.offset_path_*` khớp oracle pinned; 7 probe phân trang fail ở HEAD. Sửa (`src/style/motion_path.zig`, `src/style/values.zig`, `src/style/style.zig`, `src/style/computed.zig`, `src/render.zig`): takumi lấy reference box là query container, rồi kích thước viewport, rồi chính phần tử (`local_transform`); takumi-pdf layout trên column không có chiều cao, nên khi phân trang (hoặc render không có height) chiều cao reference là border box của phần tử: ray dùng chiều cao phần tử, shape/coord box được đo lười theo từng chiều cao (`motion_path.Lazy`). Trước fix bm dùng chiều cao vùng trang (vd `ray(… farthest-side)` đẩy box sang trang sau, thừa 1 trang). Zig: `motion paths without a viewport height take the element's height as the reference box` (fail trước fix). Còn lệch ở ranh giới trang, chung cho mọi transform xoay chứ không riêng offset-path (`transform: rotate()` cho cùng kết quả): box xoay có fragment bắt đầu ở trang sau vẫn mở một region marked-content rỗng `/P` ở trang trước; box transform chạy tiếp sang trang sau được vẽ sau fragment border của cha thay vì trước — thuộc task 03/05. Link rect `circle()` lệch 0,02 pt (làm tròn cung).
+**Trạng thái:** done (2026-11-23; hai lỗi ở ranh giới trang sửa ở task 03/05) — 20 probe mới `paint.motion.*` (box + text + link annotation so oracle; 12 viewport, 8 phân trang) cùng 10 probe cũ và 4 fixture `images.svg-fixture.offset_path_*` khớp oracle pinned; 7 probe phân trang fail ở HEAD. Sửa (`src/style/motion_path.zig`, `src/style/values.zig`, `src/style/style.zig`, `src/style/computed.zig`, `src/render.zig`): takumi lấy reference box là query container, rồi kích thước viewport, rồi chính phần tử (`local_transform`); takumi-pdf layout trên column không có chiều cao, nên khi phân trang (hoặc render không có height) chiều cao reference là border box của phần tử: ray dùng chiều cao phần tử, shape/coord box được đo lười theo từng chiều cao (`motion_path.Lazy`). Trước fix bm dùng chiều cao vùng trang (vd `ray(… farthest-side)` đẩy box sang trang sau, thừa 1 trang). Zig: `motion paths without a viewport height take the element's height as the reference box` (fail trước fix). Còn lệch ở ranh giới trang, chung cho mọi transform xoay chứ không riêng offset-path (`transform: rotate()` cho cùng kết quả): box xoay có fragment bắt đầu ở trang sau vẫn mở một region marked-content rỗng `/P` ở trang trước; box transform chạy tiếp sang trang sau được vẽ sau fragment border của cha thay vì trước — thuộc task 03/05. Link rect `circle()` lệch 0,02 pt (làm tròn cung).
 
 Port phạm vi motion-path upstream thực sự hỗ trợ vào shared transform pipeline.
 
 **Tiêu chí nghiệm thu:**
 
 - [x] Coverage map liệt kê path/ray/shape và offset-distance/rotate/anchor được reference chấp nhận trước khi code. (`scripts/pdf-coverage-map.json` chỉ chứa khai báo test Rust của takumi-pdf, không có case offset-path; phạm vi cú pháp pinned — `offset_path.rs`: `ray()` với size/`contain`/`at`, `path()`, basic shape, coord box, `offset-position`/`-anchor`/`-rotate`/`-distance` — ghi ở `docs/PDF_AUDIT.md` và có probe từng loại.)
-- [ ] Box, glyph và link rectangle dùng cùng transform, kể cả page boundary. (Box/chữ/link khớp oracle cả viewport lẫn phân trang; còn region rỗng và thứ tự vẽ ở ranh giới trang chung cho transform xoay, xem trạng thái.)
+- [x] Box, glyph và link rectangle dùng cùng transform, kể cả page boundary. (Hai lỗi còn lại đã sửa ở task 03/05, 2026-11-23: fragment không chạm trang không mở `/P` rỗng; box lift từ fragment của trang trước vẽ trước fragment border của cha positioned ở trang sau — `paint.transform-fragment.positioned-parent-*` 12/12, ở HEAD 4 fail. Còn: link rect `circle()` lệch 0,02 pt.)
 - [x] Không thêm các cú pháp mà Takumi không hỗ trợ vào phạm vi parity bắt buộc. (`url()` không phải motion path ở cả hai, `paint.motion.url-not-a-path`.)
 
 **Kiểm tra:** Fixture offset_path_ray_burst và các fixture offset_path khác; compare visual bounds, text ownership và links.
@@ -461,15 +461,15 @@ Port phạm vi motion-path upstream thực sự hỗ trợ vào shared transform
 
 ## 25 — Hoàn thiện multi-line inline outline (P2)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — xác minh với oracle pinned: island nhiều dòng dashed/dotted/double/groove/ridge/inset/outset có radii (`paint.outline.inline-*`, 32 probe) giữ dash và cung bo như takumi (ghi chú "vẽ solid và vuông" trong `PDF_AUDIT.md` đã cũ). Qua trang/transform/clip: `paint.outline.inline-paged`, `inline-transformed-clip`, `paint.inline-fragment.rotated-outline-paged` (fail ở HEAD, pass sau sửa task 03), `outline-dotted-paged` (region rỗng sửa theo `span_ink_reach`). Golden `inline-outlines` IDENTICAL.
 
 Port các outline island non-solid và corner radius hiện còn bị vẽ solid/square.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Multi-line inline outline giữ đúng dash/dot/double và radii trong phạm vi reference hỗ trợ.
-- [ ] Có case inline box qua nhiều dòng và qua trang, với transform hoặc clip.
-- [ ] Không đổi paint order và stacking của các inline-outlines golden đã qua.
+- [x] Multi-line inline outline giữ đúng dash/dot/double và radii trong phạm vi reference hỗ trợ.
+- [x] Có case inline box qua nhiều dòng và qua trang, với transform hoặc clip.
+- [x] Không đổi paint order và stacking của các inline-outlines golden đã qua.
 
 **Kiểm tra:** Golden inline-outlines và các biến thể non-solid/radii; normalized path và raster diff.
 
@@ -619,3 +619,7 @@ Oracle pinned build lại từ `ff9a5d4` như mốc trên (rustc 1.97, wasm-bind
 ## 2026-11-23 list-style-image, content url(), prepare resources, glyph closure (task 11, 12, 26)
 
 Oracle pinned build lại từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, provenance `source-build-wasm-local-rustc-1.97`). Baseline (HEAD `c6aac32`, wasm): strict audit 1.941 probe, 1.918 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 749/749; `zig build test` 727 pass / 21 skip; `test:pdf` 399/399. Probe mới: `generated-images.probe.mjs` (61: `lists.image.*`, `generated.url.*`), `prepare.probe.mjs` (33: `prepare.*`), `fonts.subset.line-start-alternate`, `fonts.subset.nbsp-paragraph`. Sau thay đổi: audit 2.037 probe, 2.015 pass, 22 fail — đúng 23 fail baseline trừ `fonts.subset.glyph-closure` (không fail mới); probe mới chạy cả native (99/99). `fonts.subset.glyph-closure`: không phải lỗi closure của bm — (a) đoạn chỉ có `&nbsp;` ở cấp trên cùng của fragment: takumi bỏ text (coi U+00A0 là khoảng trắng gộp được) và mất cả dòng (`<p>&nbsp;</p><p>x</p>` vẽ `x` cao hơn một dòng), bm giữ như trình duyệt; (b) dòng bắt đầu bằng `@` trước chữ hoa sau khi ngắt dòng: cả hai engine nâng `@` (calt của Inter, `@.case` là composite của `@` mặc định) trên dòng liền, takumi vẽ `@` mặc định khi ngắt trước nó, bm giữ `@.case` (Blink cũng ra `@.case` dù dùng lại hay shape lại đầu dòng). Probe closure giờ so trên dòng không ngắt và `&nbsp;` lồng trong block (12/12 khớp); hai lỗi takumi thành probe `differs`. Golden không đổi (125/10/1); PDF Zig 752/752 (+3, mỗi test fail trước fix); `zig build test` 730 pass / 21 skip; `test:pdf` 401/401 trên wasm và native (+2: chọn subset theo fallback, retry 503; test eviction dùng 404 vì 500 giờ được retry); `test:pdf:chunks` tương đương; `test:js`, `test:limits`, `test:workers` pass. File đổi: `src/pdf/markers.zig`, `src/pdf/needs.zig`, `src/pdf/pdf.zig`, `src/font/collection.zig` (`weightDistance` pub), `src/pdf/filelayer_tests.zig`, `js/pdf-resources.mjs`, `js/engine.mjs`, `scripts/pdf-test.mjs`, `scripts/pdf-audit/fonts.probe.mjs`, 2 probe mới, `docs/PDF_AUDIT.md`. Còn mở: marker ngoài cạnh box con có formatting context riêng (task 11).
+
+## 2026-11-23 fragment ở ranh giới trang: transform, clip, inline span, clip-text, outline (task 03–07, 25; lỗi còn lại của task 24)
+
+Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, esbuild wrapper; provenance `source-build-wasm-local-rustc-1.97`). Baseline (HEAD `c6aac32`, wasm): strict audit 1.941 probe, 1.918 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 749/749; `zig build test` 727 pass / 21 skip. Probe mới `scripts/pdf-audit/page-fragments.probe.mjs` (113 probe: `paint.transform-fragment.*` 48, `paint.clip-fragment.*` 13, `paint.inline-fragment.*` 15, `text.background-clip-fragment.*` 8; draw list, text từng trang, structure/parent tree, link annotation): ở HEAD 53/113 fail, nay 113/113. Sau thay đổi: audit 2.025 probe, 2.002 pass, cùng đúng 23 fail của baseline (toàn khác biệt có chủ đích đã phân loại; không fail mới); golden không đổi (125/10/1, cùng từng fixture; `paged-transforms`/`paged-rotated-text` CLOSE chỉ do bước float cuối); PDF Zig 759/759 (+10 test mới trong `src/pdf/filelayer_tests.zig`, mỗi test fail trước fix); `zig build test` 737 pass / 21 skip; `test:pdf` 399/399 (wasm); `test:pdf:chunks` tương đương (wasm + native build lại `linux-x64-gnu`); `test:pdf:memory` pass (×1,036 / ×1,064). Audit chỉ chạy trên wasm. File đổi: `src/pdf/emit.zig`, `src/pdf/emit_text.zig`, `src/pdf/interactive.zig`, `src/layout/fragment.zig`, `src/pdf/filelayer_tests.zig`, `scripts/pdf-audit/page-fragments.probe.mjs` (mới), `docs/PDF_AUDIT.md`. Chi tiết và phần còn mở ở trạng thái task 03, 04, 05, 06, 07, 24, 25: clip dưới transform để lộ dòng bị che trong text layer (cả hai engine), khối `background-clip:text` xoay qua trang, region của nền fragment bên cạnh khi span có padding/border dọc (không thấy được).

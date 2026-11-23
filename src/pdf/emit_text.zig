@@ -269,7 +269,8 @@ fn glyphPass(e: *Emitter, n: *const Node, tl: *const font.TextLayout, x: f32, y:
 // ---- pagination (takumi-pdf window.rs)
 
 /// A run or line on its line (takumi-core `LineItem`), in the frame's coordinates.
-const LineItem = struct { baseline: f32, top: f32, bottom: f32, l0: f32, l1: f32 };
+/// `elsewhere`: the item belongs to another fragment of the fragmented transformed box around it.
+const LineItem = struct { baseline: f32, top: f32, bottom: f32, l0: f32, l1: f32, elsewhere: bool = false };
 
 /// The line box index holding glyph `gi`.
 fn lineOf(tl: *const font.TextLayout, gi: u32) ?usize {
@@ -279,12 +280,25 @@ fn lineOf(tl: *const font.TextLayout, gi: u32) ?usize {
     return null;
 }
 
+/// Whether a line item spanning `x0`..`x1`, `y0`..`y1` (current user space) belongs to another
+/// fragment of the fragmented transformed box around it (`Emitter.box_fragment`): the middle of
+/// its line box, in the fragment's own space, outside the fragment.
+pub fn inOtherFragment(e: *const Emitter, x0: f32, x1: f32, y0: f32, y1: f32) bool {
+    const fr = e.box_fragment orelse return false;
+    const inv = fr.tf.invert() orelse return false;
+    const p = inv.mul(e.tf).apply(.{ .x = (x0 + x1) / 2, .y = (y0 + y1) / 2 });
+    return (!fr.first and p.y < fr.window.top) or (!fr.last and p.y >= fr.window.bottom);
+}
+
 /// `it` (current user space) in frame coordinates: through the walk's transform when one is open,
 /// its extent across the horizontal span `x0..x1` and its baseline at the span's middle
 /// (takumi `LineFrame::map`).
 fn mapItem(e: *const Emitter, it: LineItem, x0: f32, x1: f32) LineItem {
     if (e.tf.isIdentity()) return it;
     const t = e.tf;
+    // (a fragment of a box a page boundary cuts paints the lines laid out in it: the middle of
+    // the line box, in the fragment's own space, within the fragment)
+    const elsewhere = inOtherFragment(e, x0, x1, it.l0, it.l1);
     const yAt = struct {
         fn f(m: Affine, px: f32, py: f32) f32 {
             return m.b * px + m.d * py + m.f;
@@ -299,7 +313,7 @@ fn mapItem(e: *const Emitter, it: LineItem, x0: f32, x1: f32) LineItem {
     const span = e.line_span orelse [2]f32{ x0, x1 };
     const tb = ext(t, span[0], span[1], it.top, it.bottom);
     const lb = ext(t, span[0], span[1], it.l0, it.l1);
-    return .{ .baseline = yAt(t, (span[0] + span[1]) / 2, it.baseline), .top = tb[0], .bottom = tb[1], .l0 = lb[0], .l1 = lb[1] };
+    return .{ .baseline = yAt(t, (span[0] + span[1]) / 2, it.baseline), .top = tb[0], .bottom = tb[1], .l0 = lb[0], .l1 = lb[1], .elsewhere = elsewhere };
 }
 
 /// takumi `Window::disowns`: the line belongs to another page.
@@ -317,6 +331,7 @@ fn disowns(e: *const Emitter, it: LineItem) bool {
 /// on every other page its line box reaches), unless the overflow clips around it cut it away
 /// (`Emitter.clip_y`, takumi's narrowed window).
 fn showsItem(e: *const Emitter, it: LineItem) bool {
+    if (it.elsewhere) return false;
     if (e.clipExcludes(it.top, it.bottom)) return false;
     return !e.window.excludes(it.top, it.bottom) and (!disowns(e, it) or !e.window.excludes(it.l0, it.l1));
 }
@@ -736,7 +751,9 @@ fn paintInlineBoxes(e: *Emitter, n: *const Node, tl: *const font.TextLayout, x: 
     for (tl.boxes) |*fr| {
         const fi = f.boxFragment(n, fr) orelse continue;
         if (!isInlineBox(fi.cs)) continue;
-        // a fragment is drawn on the pages that show its line (takumi `background_fragments`)
+        // a fragment is drawn on the pages that show its line (takumi `background_fragments`;
+        // takumi also draws one on the next page its padding / border reaches past the page
+        // end: a border that is not there in the box, `pagination.box-decoration-break.inline`)
         if (e.window.paged() and fr.line < tl.lines.len) {
             const ln = tl.lines[fr.line];
             const it = mapItem(e, .{ .baseline = y + ln.baseline, .top = y + ln.top, .bottom = y + ln.top + ln.height, .l0 = y + ln.top, .l1 = y + ln.top + ln.height }, x + fi.x0, x + fi.x1);
@@ -860,12 +877,13 @@ fn paintFragment(e: *Emitter, cs: *const CS, face: font.FaceId, x0: f32, x1: f32
     const fh = fb.r.h;
     const plain = e.plain();
     var g: pm.Geom = .{
-        .bx = if (plain) pm.snapRect(fx, fy, fw, fh) else .{ .x = fx, .y = fy, .w = fw, .h = fh },
+        // (snapped in its paint space, a transformed one's included: takumi `SnappedBox`)
+        .bx = pm.snapRect(fx, fy, fw, fh),
         .bw = bw,
         .pad = pad,
         .radii = undefined,
         .rounded = false,
-        .snapped = plain,
+        .snapped = true,
     };
     g.radii = pm.resolveRadiiRaw(cs, g.bx.w, g.bx.h);
     if (!first) {
@@ -885,9 +903,25 @@ fn paintFragment(e: *Emitter, cs: *const CS, face: font.FaceId, x0: f32, x1: f32
         var width: f32 = 0;
         var before: f32 = 0;
         var current = false;
+        // (the strip of the span's fragments in the paragraph's fragment holding this line: a
+        // paragraph a page boundary cuts lays each page's lines out on their own, takumi's
+        // fragment items)
+        const pg = if (plain and e.window.paged()) e.f.paginated() else null;
+        const lineTop = struct {
+            fn f(tl: *const font.TextLayout, line: u32) f32 {
+                return if (line < tl.lines.len) tl.lines[line].top else 0;
+            }
+        }.f;
+        const page = if (pg) |pp| pp.pageAt(fm.y - e.plain_dy + lineTop(fm.tl, fm.line)) else 0;
         for (fm.tl.boxes) |*fr| {
             if (fm.n.box_base + fr.box != fm.box) continue;
             const fi = e.f.boxFragment(fm.n, fr) orelse continue;
+            if (pg) |pp| {
+                if (pp.pageAt(fm.y - e.plain_dy + lineTop(fm.tl, fr.line)) != page) continue;
+            } else if (!plain and e.box_fragment != null and fr.line < fm.tl.lines.len) {
+                const ln = fm.tl.lines[fr.line];
+                if (inOtherFragment(e, fm.x + fi.x0, fm.x + fi.x1, fm.y + ln.top, fm.y + ln.top + ln.height)) continue;
+            }
             const b = fragmentBox(e, cs, fr.face, fi.x0, fi.x1, fr.baseline, fi.left, fi.right);
             if (fr.line == fm.line and !current) current = true;
             if (!current) before += b.r.w;
@@ -898,7 +932,7 @@ fn paintFragment(e: *Emitter, cs: *const CS, face: font.FaceId, x0: f32, x1: f32
         strip.bx.w = width;
         strip.bw = cs.usedBorderWidths();
         for (cs.padding, 0..) |p, k| strip.pad[k] = p.resolve(cs.font_size);
-        if (plain) strip.bx = pm.snapRect(strip.bx.x, strip.bx.y, strip.bx.w, strip.bx.h);
+        strip.bx = pm.snapRect(strip.bx.x, strip.bx.y, strip.bx.w, strip.bx.h);
         e.background_strip = strip;
     };
     try e.paintBackground(cs, &g, g.bx.x, g.bx.y);
@@ -944,6 +978,12 @@ pub fn paintText(e: *Emitter, n: *const Node, x: f32, y: f32, cw: f32) Error!voi
     const box = f.tree.layout(n.lid);
     const left = x - box.border.left - box.padding.left;
     e.line_span = .{ left, left + box.w };
+    // (the sole anonymous paragraph is its block's own inline layout: takumi's line frame is
+    // that block's border box)
+    if (@import("tags.zig").standsForParent(f, f.nodeId(n))) {
+        const pl = f.tree.layout(f.nodes.items[n.parent].lid);
+        e.line_span = .{ left - box.x, left - box.x + pl.w };
+    }
     const tl = (try f.textLayout(f.nodeId(n), cw)) orelse {
         if (e.tagged and textRegions(e, n, null, x, y).shows) etag.end(e, etag.begin(e, f.nodeId(n))); // [tagging]
         return;
@@ -1172,9 +1212,11 @@ fn inlineRegionBounds(e: *Emitter, n: *const Node, tl: *const font.TextLayout, y
     for (tl.boxes) |*fr| {
         if (page) |wanted| if (pg == null or pg.?.pageAt(y - e.plain_dy + fr.baseline) != wanted) continue;
         const fi = e.f.boxFragment(n, fr) orelse continue;
-        if (!border.hasInlineOutline(fi.cs)) continue;
+        // (the span's background and border box: takumi's fragment ink includes them)
+        const outlined = border.hasInlineOutline(fi.cs);
+        if (!outlined and !isInlineBox(fi.cs)) continue;
         const box = fragmentBox(e, fi.cs, fr.face, fi.x0, fi.x1, fr.baseline, fi.left, fi.right).r;
-        const reach = @max(0, @trunc(fi.cs.outline_width) + @trunc(fi.cs.outline_offset));
+        const reach: f32 = if (outlined) @max(0, @trunc(fi.cs.outline_width) + @trunc(fi.cs.outline_offset)) else 0;
         lo.* = @min(lo.*, y + box.y - reach);
         hi.* = @max(hi.*, y + box.y + box.h + reach);
     }
@@ -1197,9 +1239,72 @@ pub fn onlyGeneratedImages(f: *const render.Frame, n: *const Node) bool {
     return any;
 }
 
+/// Inside a transformed box on a page of a paginated document: whether the paragraph's paint
+/// bounds meet this page (takumi skips a chunk whose `paint_bounds`, its box and the ink of its
+/// fragment's items, miss the window): one of its runs shows, or its box does; in a fragment of a
+/// box a page boundary cuts, the part of the box the fragment holds.
+fn tfRegionShows(e: *Emitter, n: *const Node, tl_in: ?*const font.TextLayout, x: f32, y: f32) bool {
+    if (e.pass == null) return true;
+    if (tl_in) |tl| {
+        var it: render.RunIter = .{ .tl = tl };
+        while (it.next()) |r| if (runOnPage(e, tl, x, y, r).shows) return true;
+    }
+    const l = e.f.tree.layout(n.lid);
+    var left = x - l.border.left - l.padding.left;
+    var top = y - l.border.top - l.padding.top;
+    var width = l.w;
+    var height = l.h;
+    // (the sole anonymous paragraph is its block's own inline layout: that block's box)
+    if (@import("tags.zig").standsForParent(e.f, e.f.nodeId(n))) {
+        const pl = e.f.tree.layout(e.f.nodes.items[n.parent].lid);
+        left -= l.x;
+        top -= l.y;
+        width = pl.w;
+        height = pl.h;
+    }
+    var bottom = top + height;
+    if (e.box_fragment) |fr| if (fr.tf.invert()) |inv| {
+        // (the box in the fragment's own space: cut to the fragment there when no other
+        // transform is in between)
+        const rel = inv.mul(e.tf);
+        if (@abs(rel.a - 1) < 1e-4 and @abs(rel.b) < 1e-4 and @abs(rel.c) < 1e-4 and @abs(rel.d - 1) < 1e-4) {
+            if (!fr.first) top = @max(top, fr.window.top - rel.f);
+            if (!fr.last) bottom = @min(bottom, fr.window.bottom - rel.f);
+            if (bottom <= top) return false;
+        }
+    };
+    const sr = shadowReach(n.cs);
+    return !e.tfExcludes(left, top, width, bottom - top, @ceil(@max(-sr[0], sr[1])));
+}
+
+/// takumi `span_ink_reach`: the furthest a painting span of the paragraph reaches past its glyph
+/// boxes (its largest padding + border side, plus its outline's offset + width).
+fn spanReach(e: *Emitter, n: *const Node, tl: *const font.TextLayout) f32 {
+    var reach: f32 = 0;
+    for (tl.boxes) |*fr| {
+        const fi = e.f.boxFragment(n, fr) orelse continue;
+        const cs = fi.cs;
+        const outlined = border.hasInlineOutline(cs);
+        if (!outlined and !isInlineBox(cs)) continue;
+        const bw = cs.usedBorderWidths();
+        var edge: f32 = 0;
+        for (0..4) |k| edge = @max(edge, cs.padding[k].resolve(cs.font_size) + bw[k]);
+        if (outlined) edge += @max(0, cs.outline_offset + cs.outline_width);
+        reach = @max(reach, edge);
+    }
+    return reach;
+}
+
+/// The box clips its block-axis overflow (`overflow-y` other than `visible`, or `visible`
+/// computing to `auto` beside a clipping `overflow-x`).
+fn clipsBlockAxis(cs: *const CS) bool {
+    return cs.overflow_y != .visible or (cs.overflow_x != .visible and cs.overflow_x != .clip);
+}
+
 fn textRegions(e: *Emitter, n: *const Node, tl_in: ?*const font.TextLayout, x: f32, y: f32) TextRegions {
     if (onlyGeneratedImages(e.f, n)) return .{ .shows = false };
-    if (!e.window.paged() or !e.plain()) return .{ .shows = true };
+    if (!e.window.paged()) return .{ .shows = true };
+    if (!e.plain()) return .{ .shows = tfRegionShows(e, n, tl_in, x, y) };
     const l = e.f.tree.layout(n.lid);
     var region_top = y - l.border.top - l.padding.top;
     var region_height = l.h;
@@ -1212,6 +1317,13 @@ fn textRegions(e: *Emitter, n: *const Node, tl_in: ?*const font.TextLayout, x: f
         const parent = e.f.tree.layout(e.f.nodes.items[n.parent].lid);
         region_top -= l.y;
         region_height = parent.h;
+    } else if (n.parent != none and clipsBlockAxis(e.f.nodes.items[n.parent].cs) and
+        @import("tags.zig").standsForParent(e.f, e.f.nodeId(n)))
+    {
+        // The paragraph of a block clipping its overflow ends where the block does: the lines
+        // it clips away below its last fragment open no region on the page after.
+        const parent = e.f.tree.layout(e.f.nodes.items[n.parent].lid);
+        region_height = @max(0, @min(l.h, parent.h - l.y));
     }
     var top = region_top;
     var bottom = top + region_height;
@@ -1229,7 +1341,13 @@ fn textRegions(e: *Emitter, n: *const Node, tl_in: ?*const font.TextLayout, x: f
         }
         inlineRegionBounds(e, n, tl, y, null, &top, &bottom);
     }
-    const ext = shadowReach(n.cs);
+    var ext = shadowReach(n.cs);
+    // (takumi outsets a paragraph's paint bounds by the furthest any of its spans reaches past
+    // its glyph boxes, on every side: `span_ink_reach`)
+    if (tl_in) |tl| {
+        const reach = spanReach(e, n, tl);
+        ext = .{ @min(ext[0], -reach), @max(ext[1], reach) };
+    }
     top = @floor(top + ext[0]);
     bottom = @ceil(bottom + ext[1]);
     const shows = run_shows or !(e.window.excludes(top, bottom) or e.clipExcludes(top, bottom));

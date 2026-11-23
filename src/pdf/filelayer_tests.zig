@@ -536,3 +536,141 @@ test "soft hyphens: hyphens none keeps the word whole, a generated hyphen sits o
     const multi = try t.render("<p style=\"margin:0;font:20px Inter;width:50px\">cal&shy;i&shy;fra</p>", "{\"tagged\":false}");
     try expectHas(multi, "Tm[-1627.3438(");
 }
+
+fn before(hay: []const u8, a: []const u8, b: []const u8) !void {
+    const ia = std.mem.indexOf(u8, hay, a) orelse return error.TestUnexpectedResult;
+    const ib = std.mem.indexOf(u8, hay, b) orelse return error.TestUnexpectedResult;
+    try testing.expect(ia < ib);
+}
+
+// A transformed box at a page boundary (tasks 03 / 05; the cases of
+// scripts/pdf-audit/transform-fragments.probe.mjs, against the pinned takumi-pdf).
+const tf_page = "{\"size\":{\"width\":300,\"height\":200},\"margin\":10}";
+fn tfDoc(comptime pre: []const u8, comptime inner: []const u8) []const u8 {
+    return "<div style=\"font:14px Inter\"><div style=\"height:" ++ pre ++ "px;background:#eee\">A</div>" ++ inner ++ "<div>after</div></div>";
+}
+
+test "transformed box at a page boundary: the page it reaches paints its background, then its text" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // laid out at the top of page 2, its rotated corner reaches page 1: there its text (outlines)
+    // paints with the box, after its background (it was painted in page 1's own pass, first)
+    const html = "<div style=\"border:3px solid #333;padding:4px;font:14px Inter\"><div style=\"height:160px;background:#eee\">A</div><div style=\"transform:rotate(20deg);width:80px;height:40px;background:#c33\">Rot</div><div>after</div></div>";
+    const out = try t.render(html, tf_page);
+    try before(out, "16.856003 cm 0.8 0.2 0.2 rg 0 0 80 40 re", "16.856003 cm 0 0 0 rg");
+}
+
+test "transformed box at a page boundary: each fragment paints the lines laid out in it" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    const out = try t.render(tfDoc("150", "<div style=\"transform:rotate(20deg);width:80px;height:40px;background:#c33\">Rot</div>"), tf_page);
+    // page 2: the line of the first fragment as outlines in that fragment's space (not the second's)
+    try expectHas(out, "174.58215 cm 0 0 0 rg 1.2304688 14 m");
+    try testing.expect(!has(out, "cm 0 0 0 rg 1.2304688 -16 m"));
+    // the second fragment reaches page 1: its (empty) content region opens there too
+    try testing.expectEqual(@as(usize, 2), count(out, "/P<</MCID 2>>BDC"));
+}
+
+test "transformed box at a page boundary: a fragment missing a page paints nothing there" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // skewX keeps the second fragment below page 1: no fill, no empty region there
+    const out = try t.render(tfDoc("100", "<div style=\"transform:skewX(15deg);width:100px;background:#9c9\">L1<br>L2<br>L3<br>L4<br>L5</div>"), tf_page);
+    try testing.expectEqual(@as(usize, 1), count(out, "cm 0.6 0.8 0.6 rg 0 0 100 34 re"));
+    try testing.expect(!has(out, "/MCID 2>>BDC"));
+}
+
+test "transformed box at a page boundary: boxes and links inside take the fragment holding them" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // a child block cut with its rotated parent: one piece per fragment, not the whole child twice
+    const child = try t.render(tfDoc("100", "<div style=\"transform:rotate(12deg);width:120px;background:#fcc;padding:2px\"><div style=\"background:#ccf;border:2px solid #333\">C1<br>C2<br>C3<br>C4<br>C5</div></div>"), tf_page);
+    try testing.expect(!has(child, "0.8 0.8 1 rg 2 2 116 114 re"));
+    try expectHas(child, "0.8 0.8 1 rg 2 2 116 78 re");
+    try expectHas(child, "0.8 0.8 1 rg 2 0 116 36 re");
+    // a link in the first fragment: one annotation, not one per fragment pass
+    const link = try t.render(tfDoc("100", "<div style=\"transform:rotate(12deg);width:120px;background:#fcc\">L1<br>L2<br><a href=\"https://example.com/x\">link</a><br>M1<br>M2</div>"), tf_page);
+    try testing.expectEqual(@as(usize, 1), count(link, "/Subtype/Link"));
+    // a transformed box inside, cut with it: its fragment on page 2 misses page 1 (one content
+    // region there for the outer box's lines)
+    const nested = try t.render(tfDoc("100", "<div style=\"transform:rotate(8deg);width:120px;background:#fcc;padding:2px\"><div style=\"transform:skewX(10deg);background:#ccf\">N1<br>N2<br>N3<br>N4</div>O1<br>O2</div>"), tf_page);
+    try testing.expectEqual(@as(usize, 1), count(nested, "0.8 0.8 1 rg"));
+    try testing.expect(!has(nested, "/MCID 3>>BDC"));
+}
+
+fn clipDoc(comptime pre: []const u8, comptime inner: []const u8) []const u8 {
+    return "<div style=\"font:14px Inter\"><div style=\"height:" ++ pre ++ "px;background:#eee\">A</div>" ++ inner ++ "<div>after</div></div>";
+}
+const abs_in_clip = "<div style=\"position:relative\"><div style=\"overflow:hidden;height:70px;background:#cde\">S1<br>S2<br>S3<div style=\"position:absolute;top:40px;left:100px;background:#fc3\">E1<br>E2<br>E3<br>E4<br>E5</div></div></div>";
+
+test "clip at a page boundary: an absolutely positioned box escaping the clip takes its own pages and text" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // its end below the last page adds a page, where its second fragment paints
+    const end = try t.render(clipDoc("60", abs_in_clip), tf_page);
+    try testing.expectEqual(@as(usize, 2), count(end, "/MediaBox"));
+    try expectHas(end, "1 0.8 0.2 rg 100 100 17 80 re");
+    try expectHas(end, "1 0.8 0.2 rg 100 180 17 34 re");
+    // the clip it escapes does not narrow its text: E5 (frame y 245) is on page 2
+    const cut = try t.render(clipDoc("120", abs_in_clip), tf_page);
+    try expectHas(cut, "Tm[(\\000\\006\\000\\r)]TJ");
+}
+
+test "clip at a page boundary: a clipped paragraph opens no region past its block" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // the block ends at the page end, its clipped lines overflow it: one region on page 1
+    const out = try t.render(clipDoc("120", "<div style=\"overflow:hidden;height:60px;background:#cde\">B1<br>B2<br>B3<br>B4<br>B5<br>B6<br>B7<br>B8</div>"), tf_page);
+    try testing.expect(!has(out, "/P<</MCID 2>>BDC"));
+}
+
+fn spanDoc(comptime st: []const u8) []const u8 {
+    return "<div style=\"font:16px Inter\"><div style=\"height:140px\">A</div><p style=\"margin:0;width:120px\">a <span style=\"" ++ st ++ "\">inline box that wraps over several lines here and more words to cross</span> b</p></div>";
+}
+
+test "inline span across pages: each page's fragment has its own image strip" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    const out = try t.render(spanDoc("background:linear-gradient(90deg,#f00,#00f)"), tf_page);
+    // page 1: two lines (190 px); page 2 starts a strip of its own at x 0
+    try expectHas(out, "/Coords[13 150 203 150]");
+    try expectHas(out, "/Coords[0 190 315 190]");
+}
+
+test "inline span strip: the pattern covers the strip's padding box, both end borders out" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    const out = try t.render("<p style=\"margin:20px;width:120px;font:16px Inter\">a <span style=\"background:linear-gradient(90deg,#f00,#00f);padding:2px 6px;border:2px solid #000\">inline box that wraps over several lines here</span> b</p>", tf_page);
+    try expectHas(out, "scn 35 18 330 24 re");
+    try expectHas(out, "scn -270 78 330 24 re");
+}
+
+test "inline span across pages: the spans' reach opens the neighbouring fragments' regions" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // padding 0 4px: takumi's `span_ink_reach` (4 px, every side) takes both fragments' paint
+    // bounds over the boundary: an empty region on each page
+    const out = try t.render(spanDoc("background:radial-gradient(circle,#ff0,#0a0);border-radius:6px;padding:0 4px"), tf_page);
+    try expectHas(out, "/K[1 2<</Type/MCR/MCID 0/Pg");
+    try testing.expectEqual(@as(usize, 1), count(out, "/P<</MCID 2>>BDC"));
+}
+
+test "transformed box at a page boundary: a box lifted from the page before's fragment paints before this page's positioned fragments" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // page 2: the moved box (laid out on page 1) before the border of its positioned parent's
+    // page-2 fragment (takumi's page scene visits the root fragments page by page)
+    const html = "<div style=\"height:320px\"></div><div style=\"position:relative;width:200px;height:120px;margin:10px;border:1px solid #999\"><div style=\"width:60px;height:24px;background:#c33;font:14px Inter;offset-path:ray(135deg closest-side);offset-distance:70%\">Tx</div></div>";
+    const out = try t.render(html, "{\"size\":{\"width\":300,\"height\":400},\"margin\":20}");
+    try before(out, "315.5691 cm 0.8 0.2 0.2 rg 0 0 60 24 re", "555 cm 0.6 0.6 0.6 rg 10 449 200 1 re");
+}

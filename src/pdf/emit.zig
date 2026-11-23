@@ -148,9 +148,14 @@ pub const PageBox = struct {
 const Deferred = struct { cs: *const CS, g: Geom, ctm: Tf, clip0: u32, clip1: u32 };
 /// A clip the walk opened; `overflow_of`: the box whose `overflow` clip it is (an absolutely
 /// positioned descendant escapes it when the box is not in its containing block chain).
-const ClipRec = struct { path: Path, rule: sf.FillRule, ctm: Tf, overflow_of: u32 = none };
+/// `y`: the vertical extent it narrows `Emitter.clip_y` to (`narrowClip`).
+const ClipRec = struct { path: Path, rule: sf.FillRule, ctm: Tf, overflow_of: u32 = none, y: [2]f32 = .{ -std.math.inf(f32), std.math.inf(f32) } };
 /// A transformed box is decorated in its layout fragment's local coordinate space.
-const BoxFragment = struct { id: u32, window: Window };
+/// `tf`: the transform of the fragment's own space (its border box top at its local y 0, set
+/// when the box's transform is pushed); `first` / `last`: the box starts / ends in it. The
+/// content of a fragmented box paints with the fragment holding it (takumi visits each fragment's
+/// own items and children, `fragment_items_of`, `FragmentChildren::in_fragment`).
+const BoxFragment = struct { id: u32, window: Window, tf: Affine = Affine.identity, first: bool = true, last: bool = true };
 /// A box (`whole`: a float or an atomic in-flow box, at its parent's origin) or the content of a
 /// box (its text / replaced content, at its own origin) waiting for the paint phase of its context
 /// (CSS 2.1 appendix E as takumi's `StackingContextNode::paint_phases`), with what the walk was in
@@ -387,6 +392,7 @@ pub const Emitter = struct {
         if (cs.overflow_x == .clip and cs.overflow_y == .visible) return;
         const pr = g.overflowRect();
         e.clip_y = .{ @max(e.clip_y[0], pr.y), @min(e.clip_y[1], pr.y + pr.h) };
+        if (e.clips.items.len > 0) e.clips.items[e.clips.items.len - 1].y = .{ pr.y, pr.y + pr.h };
     }
 
     pub noinline fn fail(e: *Emitter, msg: []const u8, arg: []const u8) void {
@@ -464,6 +470,19 @@ pub const Emitter = struct {
             if (a == owner) return true;
             if (a == f.root) return false;
             a = an.parent;
+        }
+        return false;
+    }
+
+    /// Whether `id` or a box between it and `owner` is absolutely positioned (or fixed) and
+    /// escapes `owner`'s overflow clip (`escapesClip`): the clip does not hold it.
+    fn outOfClip(e: *const Emitter, id: u32, owner: u32) bool {
+        var c = id;
+        var guard: u32 = 0;
+        while (c != none and c != owner and guard < 4096) : (guard += 1) {
+            const cn = &e.f.nodes.items[c];
+            if (cn.kind != .anon_text and (cn.cs.position == .absolute or cn.cs.position == .fixed) and e.escapesClip(c, owner)) return true;
+            c = cn.parent;
         }
         return false;
     }
@@ -663,7 +682,20 @@ pub const Emitter = struct {
                         fragment_offset = fr.s0 - y;
                         y = fr.s0;
                         m_open = localTransform(cs, x, y, l.w, height);
-                        fragment = .{ .id = id, .window = .{ .top = 0, .bottom = height } };
+                        fragment = .{ .id = id, .window = .{ .top = 0, .bottom = height }, .first = fragment_offset == 0, .last = fr.s1 >= y - fragment_offset + l.h };
+                    }
+                };
+                // a transformed box inside a fragment of a transformed box a page boundary cuts
+                // (in its space): its own fragment there, cut where the outer one is, or nothing
+                if (e.box_fragment) |outer| if (e.pass != null and std.meta.eql(outer.tf, e.tf)) {
+                    const s0 = if (outer.first) y else @max(y, outer.window.top);
+                    const s1 = if (outer.last) y + l.h else @min(y + l.h, outer.window.bottom);
+                    if (l.h > 0 and !(s1 > s0)) return;
+                    if (s1 > s0 and (s0 != y or s1 != y + l.h)) {
+                        fragment_offset = s0 - y;
+                        y = s0;
+                        m_open = localTransform(cs, x, y, l.w, s1 - s0);
+                        fragment = .{ .id = id, .window = .{ .top = 0, .bottom = s1 - s0 }, .first = fragment_offset == 0, .last = s1 >= y - fragment_offset + l.h };
                     }
                 };
             }
@@ -699,6 +731,7 @@ pub const Emitter = struct {
                 pushTf(e, m, &x, &y);
                 y -= fragment_offset;
                 if (fragment != null) e.plain_dy = 0;
+                if (fragment != null) e.box_fragment.?.tf = e.tf;
                 pushed_tf = true;
             }
             try e.pushClipPath(cs.clip_path.?, cs, x, y, l);
@@ -713,6 +746,7 @@ pub const Emitter = struct {
             pushTf(e, m_open.?, &x, &y);
             y -= fragment_offset;
             if (fragment != null) e.plain_dy = 0;
+            if (fragment != null) e.box_fragment.?.tf = e.tf;
         }
         if (group and pfx.hasMask(cs)) try e.pushMaskImage(cs, x, y, l);
         if (cs.filter.len > 0) try e.composeFilter(cs);
@@ -823,11 +857,20 @@ pub const Emitter = struct {
         if (e.tphase == .decorations) return true;
         if (e.pre.len == 0) try e.preorder();
         const c0: u32 = @intCast(e.lift_clips.items.len);
+        var clip_y = e.clip_y;
         if (cs.position == .absolute or cs.position == .fixed) {
+            // (nor do the overflow clips it escapes narrow what it paints, its text included)
+            var escaped = false;
+            var narrowed: [2]f32 = .{ -std.math.inf(f32), std.math.inf(f32) };
             for (e.clips.items) |ce| {
-                if (ce.overflow_of != none and e.escapesClip(id, ce.overflow_of)) continue;
+                if (ce.overflow_of != none and e.escapesClip(id, ce.overflow_of)) {
+                    escaped = true;
+                    continue;
+                }
+                narrowed = .{ @max(narrowed[0], ce.y[0]), @min(narrowed[1], ce.y[1]) };
                 try e.lift_clips.append(e.a, ce);
             }
+            if (escaped) clip_y = narrowed;
         } else try e.lift_clips.appendSlice(e.a, e.clips.items);
         try e.lift_q.append(e.a, .{
             .fragment = e.box_fragment,
@@ -844,7 +887,7 @@ pub const Emitter = struct {
             .pass = e.pass,
             .tpage = e.tpage,
             .in_repeat = e.in_repeat,
-            .clip_y = e.clip_y,
+            .clip_y = clip_y,
             .plain_dy = e.plain_dy,
         });
         return true;
@@ -969,10 +1012,16 @@ pub const Emitter = struct {
                 e.lift_q.items.len = q0;
                 return;
             }
+            // (by `z-index`, then in the order takumi's page scene visits them: the root fragments
+            // of the pages reaching the page in page order, each in tree order; so a box lifted
+            // from the page before's fragment paints before the positioned fragments of this
+            // page's)
             var best = q0;
             for (e.lift_q.items[q0 + 1 ..], q0 + 1..) |it, i| {
                 const b = e.lift_q.items[best];
-                if (it.z < b.z or (it.z == b.z and it.pre < b.pre)) best = i;
+                const ip = it.pass orelse 0;
+                const bp = b.pass orelse 0;
+                if (it.z < b.z or (it.z == b.z and (ip < bp or (ip == bp and it.pre < b.pre)))) best = i;
             }
             const it = e.lift_q.orderedRemove(best);
             try e.paintLift(it, base);
@@ -1035,6 +1084,15 @@ pub const Emitter = struct {
         return if (e.pass) |r| r == e.win_page else true;
     }
 
+    /// The pass that paints the content (text) of the current box: the page's own pass, or inside
+    /// a transformed box the pass painting the box's fragment (`tpage`; takumi paints a
+    /// fragment's items with the fragment, on every page it reaches: as text on the page owning
+    /// the line, as outlines elsewhere).
+    pub fn ownsContent(e: *const Emitter) bool {
+        if (e.pass == null) return true;
+        return if (e.plain()) e.home() else e.tpage;
+    }
+
     /// Whether frame y range `y0`..`y1` meets page `r` (the first page reaching up, the last down).
     noinline fn onPage(e: *const Emitter, r: u32, y0: f32, y1: f32) bool {
         const pw = e.windows[r];
@@ -1087,7 +1145,7 @@ pub const Emitter = struct {
     /// Whether a box of the current transformed space (`x`, `y`, `wd`, `h`, ink reaching `reach`
     /// past it) misses this page's window in whole pixels (takumi `SceneBounds::of_rect`,
     /// `outset_bounds`, `excludes_bounds`).
-    noinline fn tfExcludes(e: *const Emitter, x: f32, y: f32, wd: f32, h: f32, reach: f32) bool {
+    pub noinline fn tfExcludes(e: *const Emitter, x: f32, y: f32, wd: f32, h: f32, reach: f32) bool {
         const t = e.tf;
         var lo = std.math.inf(f32);
         var hi = -std.math.inf(f32);
@@ -1290,7 +1348,7 @@ pub const Emitter = struct {
         const content_w = l.w - l.border.left - l.border.right - l.padding.left - l.padding.right;
         if (n.kind == .anon_text) {
             if (mode == .decorations) return e.queueContent(id, x, y);
-            return if (e.home()) etext.paintText(e, n, content_x, content_y, content_w);
+            return if (e.ownsContent()) etext.paintText(e, n, content_x, content_y, content_w);
         }
         // a collapsed table's content pass: the parts' decorations are painted already
         if (e.tphase == .content and e.partKind(id) != .none) {
@@ -1310,7 +1368,7 @@ pub const Emitter = struct {
         const c = e.snapCtx();
         const g = pm.Painter.geomOf(cs, l, x, y, &c);
         var as_part = false;
-        const own = e.home();
+        const own = e.ownsContent();
         // a box whose paint (shadows, outline included) misses this page's window: nothing to draw
         // (takumi `excludes_bounds`; the page clip would drop it anyway). A table still registers its
         // parts; a row group / row / cell off the page paints nothing into its cells either.
@@ -1326,10 +1384,26 @@ pub const Emitter = struct {
             const reach = @ceil(paintReach(cs));
             if (!own and pm.enable_tables and (e.partKind(id) != .none or f.tree.tableGeom(n.lid) != null)) break :blk true;
             if (!e.plain()) {
+                // (a fragment of a transformed box: the part of the box it holds, takumi's paint
+                // bounds of the fragment's layout)
+                var top = y;
+                var height = l.h;
                 if (e.box_fragment) |fr| {
-                    if (fr.id == id) gd = e.windowSlice(id, cs, l, x, y, g, fr.window, true);
+                    if (fr.id == id) {
+                        gd = e.windowSlice(id, cs, l, x, y, g, fr.window, true);
+                        top = fr.window.top;
+                        height = fr.window.bottom - fr.window.top;
+                    } else if (std.meta.eql(fr.tf, e.tf)) {
+                        // (a box inside the fragmented one, in its space: its part in the
+                        // fragment; takumi visits the child fragments each fragment holds)
+                        const win: Window = .{ .top = if (fr.first) -std.math.inf(f32) else fr.window.top, .bottom = if (fr.last) std.math.inf(f32) else fr.window.bottom };
+                        if (win.excludes(y, y + l.h)) break :blk true;
+                        gd = e.windowSlice(id, cs, l, x, y, g, win, true);
+                        top = @max(y, win.top);
+                        height = @min(y + l.h, win.bottom) - top;
+                    }
                 }
-                break :blk !e.tpage or e.tfExcludes(x, y, l.w, l.h, reach);
+                break :blk !e.tpage or e.tfExcludes(x, top, l.w, height, reach);
             }
             const fr = e.passFragment(y, y + l.h) orelse break :blk true;
             gd = e.windowSlice(id, cs, l, x, y, g, fr.win, fr.layout_win);
@@ -1397,7 +1471,7 @@ pub const Emitter = struct {
                 .inline_block, .inline_flex, .inline_grid, .inline_table, .webkit_inline_box => return g,
                 else => {},
             };
-            if (ancestor != id and an.lid != none and (an.cs.overflow_y == .hidden or an.cs.overflow_y == .clip)) {
+            if (ancestor != id and an.lid != none and (an.cs.overflow_y == .hidden or an.cs.overflow_y == .clip) and !e.outOfClip(id, ancestor)) {
                 const height = e.f.tree.layout(an.lid).h;
                 // Only an unfragmented clip keeps its contents monolithic. A clip spanning
                 // pages still gives its descendants page fragments in stitched space.
@@ -1859,7 +1933,8 @@ pub const Emitter = struct {
             var ins: [4]f32 = .{ 0, 0, 0, 0 };
             for (0..4) |i| {
                 const st = cs.border_style[i];
-                const bw = g.bw[i];
+                // (an inline fragment's strip keeps the borders of the span's two ends)
+                const bw = image_geom.bw[i];
                 if (!(bw > 0) or cs.resolveColor(cs.border_color[i]).a != 255) continue;
                 const eff: style.computed.BorderStyle = if (st == .double and bw < 3) .solid else st;
                 if (eff == .hidden or eff == .none or eff == .dotted or eff == .dashed or eff == .double) continue;

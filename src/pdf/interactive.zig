@@ -309,6 +309,8 @@ pub const Collector = struct {
             const lm = fnt.lineMetrics();
             const asc = @as(f32, @floatFromInt(lm.ascent)) * sc;
             const desc = @as(f32, @floatFromInt(lm.descent)) * sc;
+            // (a fragment of a transformed box a page boundary cuts links the runs laid out in it)
+            if (@import("emit_text.zig").inOtherFragment(e, x + r.x0, x + r.x1, y + r.baseline - asc, y + r.baseline + desc)) continue;
             const rect = aabb(e.tf, x + r.x0, y + r.baseline - asc, r.x1 - r.x0, asc + desc) orelse continue;
             try c.add(e, rect, href, id, el);
         }

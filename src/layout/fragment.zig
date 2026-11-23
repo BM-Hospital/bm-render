@@ -981,6 +981,48 @@ fn Engine(comptime T: type) type {
         }
 
         /// Monolithic content without line boxes (a replaced element, a `line-clamp` box).
+        /// Whether an overflow clip of an ancestor (below `root`) cuts `n` away: a clipping box on
+        /// its containing block chain. An absolutely positioned box escapes the clipping boxes
+        /// between it and its containing block (CSS Overflow 3: the clip applies to the descendants
+        /// it contains), and so does what it holds; a fixed box escapes them all. `started`: a
+        /// clipping box that broke on an earlier page counts too (else it clips nothing here).
+        fn clippedOut(e: *Self, n: u32, root: u32, started: bool) bool {
+            const ns = e.t.nodes.items;
+            var abs = ns[n].style.position == .absolute;
+            if (ns[n].style.position == .fixed) return false;
+            var p = ns[n].parent;
+            var guard: u32 = 0;
+            while (p != no_node and p != root and guard < tr.max_depth + 8) : (guard += 1) {
+                const ps = ns[p].style;
+                const clips = clipsY(ps) and (started or !e.st[p].started);
+                if (abs) {
+                    if (ps.position != .static) {
+                        if (clips) return true;
+                        if (ps.position == .fixed) return false;
+                        abs = ps.position == .absolute;
+                    }
+                } else {
+                    if (clips) return true;
+                    if (ps.position == .fixed) return false;
+                    if (ps.position == .absolute) abs = true;
+                }
+                p = ns[p].parent;
+            }
+            return false;
+        }
+
+        /// Whether `n` is inside a clipping box (below `root`) that did not break on an earlier page.
+        fn insideClip(e: *Self, n: u32, root: u32) bool {
+            const ns = e.t.nodes.items;
+            var p = ns[n].parent;
+            var guard: u32 = 0;
+            while (p != no_node and p != root and guard < tr.max_depth + 8) : (guard += 1) {
+                if (clipsY(ns[p].style) and !e.st[p].started) return true;
+                p = ns[p].parent;
+            }
+            return false;
+        }
+
         fn monoLeaf(e: *Self, n: u32) bool {
             return switch (e.kindOf(n)) {
                 .mono => true,
@@ -1999,10 +2041,12 @@ fn Engine(comptime T: type) type {
                     const parent_seq = e.st[ns[cur].parent].seq;
                     const row_height = if (parent_seq != no_node) e.seqs.items[parent_seq].h0 else e.lay(ns[cur].parent).h;
                     const is_rowspan = pk == .row and e.lay(cur).h > row_height + eps;
-                    var descend = s.display != .none and !ns[cur].measured and e.kindOf(cur) != .mono and (!clipsY(s) or e.st[cur].started);
+                    // (a clipping box is walked for the absolutely positioned boxes escaping it)
+                    var descend = s.display != .none and !ns[cur].measured and e.kindOf(cur) != .mono;
                     // (an atomic inline box is monolithic)
                     if (pk == .text and !is_abs and !is_float) descend = false;
-                    if (s.display != .none) {
+                    const clipped = if (s.position == .fixed) e.insideClip(cur, root) else (is_abs or is_float or is_rowspan) and e.clippedOut(cur, root, false);
+                    if (s.display != .none and !clipped) {
                         if (s.position == .fixed) {
                             try e.fixed.append(e.a, cur);
                             // where it was laid out, or, with no block offsets (its static position),
@@ -2119,8 +2163,10 @@ fn Engine(comptime T: type) type {
                 const early_mono = cur != root and base + l.y < last_top - eps and e.monoLeaf(cur);
                 if (s.display != .none and (s.position != .fixed or cur == root) and !early_mono) {
                     const y = base + l.y;
-                    extent.* = @max(extent.*, y + l.h);
-                    descend = !ns[cur].measured and (!clipsY(s) or cur == root) and ns[cur].first_child != no_node and sp < stack.len;
+                    // (the content of a clipping box adds nothing, but the absolutely positioned
+                    // boxes escaping it do)
+                    if (cur == root or !e.clippedOut(cur, root, true)) extent.* = @max(extent.*, y + l.h);
+                    descend = !ns[cur].measured and ns[cur].first_child != no_node and sp < stack.len;
                     if (descend) {
                         stack[sp] = base;
                         sp += 1;
