@@ -770,6 +770,16 @@ export function createBinding(defaultWasm, external) {
       return JSON.parse(await this.#runAsync(this.#callPdf("measure", node, await this.#extras(options)), true));
     }
 
+    /**
+     * Internal (js/pdf-resources.mjs): registers `fonts` entries as a render's `fonts` option does, each once
+     * (a later render or prepare naming the same entry does not load it again); returns their family names.
+     */
+    async loadFontsOnce(fonts) {
+      const names = [];
+      for (const f of fonts) for (const fam of (await this.#registerOnce(f)) || []) if (!names.includes(fam.name)) names.push(fam.name);
+      return names;
+    }
+
     /** Internal cascade-only resource discovery; no font loaders or image fetches run here. */
     needsPdfSync(node, options = {}) {
       return JSON.parse(this.#run(this.#callPdf("needs", node, options), true));

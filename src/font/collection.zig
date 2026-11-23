@@ -570,7 +570,7 @@ pub const FontCollection = struct {
 
 /// Rank of candidate weight `have` for requested weight `want` per the CSS font-weight matching
 /// algorithm (lower is better).
-fn weightDistance(want: u16, have: u16) u32 {
+pub fn weightDistance(want: u16, have: u16) u32 {
     const w: i32 = want;
     const h: i32 = have;
     if (h == w) return 0;

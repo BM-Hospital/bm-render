@@ -204,15 +204,15 @@ Nối unicode_bidi đã parse vào bidi segmentation/shaping và PDF text mappin
 
 ## 11 — Port list-style-image (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — tiêu chí đã đạt, còn 1 phần chưa port và 2 khác biệt tag ghi rõ. Probe mới `scripts/pdf-audit/generated-images.probe.mjs` (`lists.image.*`, 36 probe; draw list + pdftotext + pdf.js + raster 2x + structure tree) khớp oracle pinned trên wasm và native: PNG/JPEG/SVG inside/outside, RTL, nested, item xuống dòng / bị chia trang, marker ở mọi trang, `ol` (ảnh thay số), `::marker` content thắng, ảnh thiếu/hỏng giữ counter style (không bao giờ vẽ cả hai). Đã sửa (3 probe fail trước fix): (1) marker ảnh ngoài là nội dung của `Lbl` (`markers.labelOwner` lần từ node ảnh lên node marker; trước đó ảnh rơi vào `P` của `LBody` và item không có `Lbl`); (2) SVG không có width tự nhiên ở marker ngoài: rộng 0, không vẽ và không đẩy dòng (trước lấy 300 px làm TJ dịch chữ 300 px). Zig `tagging: an outside image marker is its item's label` và `list-style-image: an outside SVG without a natural width …` fail trước fix. Khác oracle (probe `differs`, dòng `list-style-image` trong `PDF_AUDIT.md`): takumi gắn ảnh marker vào `P` của `LBody` và để hai sequence rỗng trong `Lbl` (bm: ảnh trong `Lbl`); marker ảnh inside: takumi tách `P` riêng (cùng loại `content: url()`). Chưa port: item bắt đầu bằng box có formatting context riêng (flex/grid/table con, ảnh block) mất marker ngoài, cả chữ lẫn ảnh — takumi/Blink đặt marker cạnh baseline đầu của box con đó (`PositionListMarkerBesideChild`), cần định vị marker sau layout của box con (`lists.image.host-*`).
 
 Đưa marker ảnh vào layout và PDF, giữ numbering/label semantics.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Ảnh marker đúng kích thước/alignment cho inside/outside, lặp trang và RTL.
-- [ ] Thiếu hoặc lỗi ảnh theo đúng fallback đã xác định; không render cả marker ảnh và marker chữ.
-- [ ] Có Lbl/structure và test host bắt đầu bằng flex/grid/table/replaced box để xác định phần còn thiếu trước khi sửa.
+- [x] Ảnh marker đúng kích thước/alignment cho inside/outside, lặp trang và RTL.
+- [x] Thiếu hoặc lỗi ảnh theo đúng fallback đã xác định; không render cả marker ảnh và marker chữ.
+- [x] Có Lbl/structure và test host bắt đầu bằng flex/grid/table/replaced box để xác định phần còn thiếu trước khi sửa. (phần còn thiếu đã xác định: marker cạnh box con có formatting context riêng, chưa port.)
 
 **Kiểm tra:** Fixture list_markers, list_outside_marker_position; ảnh, baseline và structure assertions.
 
@@ -222,15 +222,15 @@ Nối unicode_bidi đã parse vào bidi segmentation/shaping và PDF text mappin
 
 ## 12 — Port generated content url (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — tiêu chí đã đạt, khác biệt sizing/tag ghi rõ. Probe `generated.url.*` (25 probe trong `generated-images.probe.mjs`) khớp oracle pinned trên wasm và native: PNG/JPEG/SVG trong `::before`/`::after`, trong span, dòng xuống hàng, cạnh `counter()`/`attr()`, ảnh thiếu/hỏng (không vẽ gì, như takumi), mỗi đoạn ở nhiều trang, và ảnh lấy qua `prepare` (`generated.url.prepared`: cùng URL được fetch, cùng raster). Không cần sửa code. Khác oracle (probe `differs`, dòng `content: url()` trong `PDF_AUDIT.md`): pseudo `display:block` / `inline-block` / absolute giữ ảnh ở kích thước tự nhiên như trình duyệt, takumi kéo ảnh full chiều rộng pseudo (PNG 8 px thành 180 px trong `::before` block, đẩy chữ khỏi trang); ảnh inline đứng một mình: takumi cho `P` riêng (cùng loại `tagging.generated.mixed-image`). `open-quote url()` bị takumi bỏ cả khai báo (lỗi quotes của takumi, không thuộc task này; không đưa vào probe).
 
 Hỗ trợ ảnh trong ::before/::after qua content:url() dùng cùng resource lifecycle với ảnh thường.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Ảnh được resolve ở prepare/render, có intrinsic sizing và fallback theo oracle.
-- [ ] Hoạt động với inline/block pseudo, positioned ancestor và page break.
-- [ ] Không làm hỏng counters hoặc generated text hiện có.
+- [x] Ảnh được resolve ở prepare/render, có intrinsic sizing và fallback theo oracle. (sizing trong pseudo block/inline-block: khác có chủ đích, theo trình duyệt.)
+- [x] Hoạt động với inline/block pseudo, positioned ancestor và page break.
+- [x] Không làm hỏng counters hoặc generated text hiện có.
 
 **Kiểm tra:** Case content:url PNG/SVG, missing image, prepared image và counter đặt cạnh ảnh.
 
@@ -479,15 +479,15 @@ Port các outline island non-solid và corner radius hiện còn bị vẽ solid
 
 ## 26 — Port resource needs và font subsets trong prepare (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — tiêu chí đã đạt, còn 2 khác biệt ghi rõ. Probe mới `scripts/pdf-audit/prepare.probe.mjs` (33 probe, fetch giả lập, so lời gọi `data()`/`fetch` của hai engine; port prepare.test.ts và renderer-facade.test.ts) khớp oracle pinned trên wasm và native; 10 probe fail ở HEAD. Đã sửa: (1) subset của `fonts` theo font fallback như takumi needs.rs: needs pass của engine nhận `listedFonts` (font có `unicodeRange` chưa load) và báo `fonts` = id các subset được với tới — family của phần tử rồi `fontFamilies`, face đã đăng ký vẽ được glyph thì dừng, so weight/style theo CSS; JS lặp load → đọc lại, nên subset thiếu glyph mà range khai báo có thì ký tự chuyển sang family sau (`src/pdf/needs.zig`, `src/pdf/pdf.zig`, `js/pdf-resources.mjs`, `Renderer.loadFontsOnce` trong `js/engine.mjs` để mỗi entry chỉ load một lần trên renderer). Trước đây bm load mọi font có range giao với text của cả tài liệu, bất kể family. (2) Chính sách fetch như takumi helpers `fetchOk`: timeout mặc định 30 s, tối đa 3 lần thử với 408/429/5xx hoặc lỗi mạng (Retry-After > 1 s thì dừng), `allowUrl` kiểm từng redirect. (3) `signal` được kiểm sau mỗi lần load font. Zig `PDF needs: the listed font subsets font fallback reaches` (8 trường hợp từ needs.rs). Khác oracle (probe `differs`): câu lỗi khi fetch hỏng; `prepare` bị abort vẫn reject khi `fetch` tùy biến bỏ qua `init.signal` (takumi treo mãi — lỗi upstream).
 
 Pinned PdfRenderer.prepare gọi native needs rồi prepareSource để tải font subsets và @font-face files; bm mới scan/fetch ảnh. Port phần thiếu ở pipeline preparation.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] @font-face/fontFiles trong document và bands được resolve/register đúng khi prepare; fonts loader chỉ tải subset được dùng theo unicodeRange như reference.
-- [ ] AbortSignal, fetch/cache/dedup, remote-font failure và failedFontFiles có test; prepared handle render/measure không fetch lại ngoài policy.
-- [ ] Giữ hỗ trợ fonts option hiện có và no-font policy; không bundle Geist mặc định. Fallback font là quyết định độc lập.
+- [x] @font-face/fontFiles trong document và bands được resolve/register đúng khi prepare; fonts loader chỉ tải subset được dùng theo unicodeRange như reference.
+- [x] AbortSignal, fetch/cache/dedup, remote-font failure và failedFontFiles có test; prepared handle render/measure không fetch lại ngoài policy.
+- [x] Giữ hỗ trợ fonts option hiện có và no-font policy; không bundle Geist mặc định. Fallback font là quyết định độc lập. (fonts không có `unicodeRange` vẫn load ngay như trước; không đổi Geist.)
 
 **Kiểm tra:** Upstream pdf-js prepare.test.ts và bindings-js renderer-facade fontFiles/subsets/failure tests; mocked fetch và wasm/native parity.
 
@@ -615,3 +615,7 @@ Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.
 ## 2026-11-23 SVG text, textPath, CSS của inline SVG, relative colors, offset-path (task 13–15, 23–24)
 
 Oracle pinned build lại từ `ff9a5d4` như mốc trên (rustc 1.97, wasm-bindgen 0.2.129). Baseline (HEAD `a8a41d4`, wasm): strict audit 1.619 probe, 1.596 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 741/741; `zig build test` 719 pass / 21 skip; `test:pdf` 399/399; `test:pdf:chunks` tương đương. Sau thay đổi: audit 1.790 probe (+171 mới), 1.767 pass, cùng đúng 23 fail của baseline (không fail mới); 44 probe mới fail ở HEAD (đo bằng cùng file probe trên wasm build từ HEAD), nay pass. Golden không đổi (125/10/1, cùng từng fixture); PDF Zig 745/745 (+4 test mới, mỗi test fail trước fix); `zig build test` 723 pass / 21 skip (oracle ảnh 850/850); `test:pdf` 399/399; `test:pdf:chunks` tương đương. Renderer ảnh: bench equivalence với `@takumi-rs/wasm` 250 case, không case nào đổi verdict (81 identical, còn lại equivalent). Chỉ đo wasm; native chưa build lại ở mốc này. Phần còn mở ghi ở trạng thái task 13, 15, 24: letter-spacing tại khoảng trắng Arabic (engine chữ chung), synthetic bold / COLR trong SVG text, selector đầy đủ cho `<style>` của SVG độc lập, region rỗng và thứ tự vẽ của box xoay ở ranh giới trang (task 03/05).
+
+## 2026-11-23 list-style-image, content url(), prepare resources, glyph closure (task 11, 12, 26)
+
+Oracle pinned build lại từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, provenance `source-build-wasm-local-rustc-1.97`). Baseline (HEAD `c6aac32`, wasm): strict audit 1.941 probe, 1.918 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 749/749; `zig build test` 727 pass / 21 skip; `test:pdf` 399/399. Probe mới: `generated-images.probe.mjs` (61: `lists.image.*`, `generated.url.*`), `prepare.probe.mjs` (33: `prepare.*`), `fonts.subset.line-start-alternate`, `fonts.subset.nbsp-paragraph`. Sau thay đổi: audit 2.037 probe, 2.015 pass, 22 fail — đúng 23 fail baseline trừ `fonts.subset.glyph-closure` (không fail mới); probe mới chạy cả native (99/99). `fonts.subset.glyph-closure`: không phải lỗi closure của bm — (a) đoạn chỉ có `&nbsp;` ở cấp trên cùng của fragment: takumi bỏ text (coi U+00A0 là khoảng trắng gộp được) và mất cả dòng (`<p>&nbsp;</p><p>x</p>` vẽ `x` cao hơn một dòng), bm giữ như trình duyệt; (b) dòng bắt đầu bằng `@` trước chữ hoa sau khi ngắt dòng: cả hai engine nâng `@` (calt của Inter, `@.case` là composite của `@` mặc định) trên dòng liền, takumi vẽ `@` mặc định khi ngắt trước nó, bm giữ `@.case` (Blink cũng ra `@.case` dù dùng lại hay shape lại đầu dòng). Probe closure giờ so trên dòng không ngắt và `&nbsp;` lồng trong block (12/12 khớp); hai lỗi takumi thành probe `differs`. Golden không đổi (125/10/1); PDF Zig 752/752 (+3, mỗi test fail trước fix); `zig build test` 730 pass / 21 skip; `test:pdf` 401/401 trên wasm và native (+2: chọn subset theo fallback, retry 503; test eviction dùng 404 vì 500 giờ được retry); `test:pdf:chunks` tương đương; `test:js`, `test:limits`, `test:workers` pass. File đổi: `src/pdf/markers.zig`, `src/pdf/needs.zig`, `src/pdf/pdf.zig`, `src/font/collection.zig` (`weightDistance` pub), `src/pdf/filelayer_tests.zig`, `js/pdf-resources.mjs`, `js/engine.mjs`, `scripts/pdf-test.mjs`, `scripts/pdf-audit/fonts.probe.mjs`, 2 probe mới, `docs/PDF_AUDIT.md`. Còn mở: marker ngoài cạnh box con có formatting context riêng (task 11).

@@ -225,6 +225,30 @@ test "tagging: list labels and numbering" {
     try expectHas(geo, "/ListNumbering/Disc");
 }
 
+test "tagging: an outside image marker is its item's label" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    const image = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='10'%20height='10'%3E%3Crect%20width='10'%20height='10'%20fill='blue'/%3E%3C/svg%3E";
+    // the item's text (MCID 0), then the marker image in the Lbl (MCID 1)
+    const doc = try t.render("<ul style=\"list-style-image:url(&quot;" ++ image ++ "&quot;)\"><li>Body</li></ul>", "{}");
+    try testing.expectEqual(@as(usize, 1), count(doc, "/S/Lbl"));
+    try testing.expectEqual(@as(u8, 49), lblKid(doc));
+    try testing.expectEqual(@as(usize, 1), count(doc, "/S/P"));
+}
+
+test "list-style-image: an outside SVG without a natural width neither paints nor moves the line" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    const image = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2010%2010'%3E%3Crect%20width='10'%20height='10'%20fill='blue'/%3E%3C/svg%3E";
+    const doc = try t.render("<ul style=\"margin:0;padding-left:30px;list-style-image:url(&quot;" ++ image ++ "&quot;)\"><li>Body</li></ul>", "{\"viewport\":{\"width\":200,\"height\":100},\"tagged\":false}");
+    // the text starts at the item's content edge, without a TJ shift
+    try expectHas(doc, "1 0 0 -1 30 ");
+    try testing.expect(has(doc, "Tm[(") or has(doc, "Tm[<"));
+    try testing.expect(!has(doc, "0 0 1 rg"));
+}
+
 /// The first kid (a marked-content id digit) of the first Lbl element.
 fn lblKid(doc: []const u8) u8 {
     const at = std.mem.indexOf(u8, doc, "/S/Lbl") orelse return 0;

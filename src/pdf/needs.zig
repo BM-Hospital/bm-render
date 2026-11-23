@@ -7,6 +7,62 @@ const css = @import("../css/css.zig");
 const svg_dom = @import("../svg/dom.zig");
 const svg_style = @import("../svg/style.zig");
 const aType = std.mem.Allocator;
+const json = @import("../json.zig");
+const font_collection = @import("../font/collection.zig");
+
+/// A `fonts` entry of the render with a `unicodeRange`, not loaded yet (takumi `PendingSource::Listed`):
+/// what font fallback reads it as before its bytes arrive.
+pub const Listed = struct {
+    /// its index in the render's `fonts` list
+    id: u32,
+    name: []const u8,
+    weight_min: u16 = 400,
+    weight_max: u16 = 400,
+    italic: bool = false,
+    ranges: []const [2]u21 = &.{},
+
+    fn covers(l: *const Listed, cp: u21) bool {
+        for (l.ranges) |r| if (cp >= r[0] and cp <= r[1]) return true;
+        return false;
+    }
+    /// CSS font matching distance to a request (style first, then weight)
+    fn score(l: *const Listed, weight: u16, italic: bool) u64 {
+        const have = std.math.clamp(weight, l.weight_min, @max(l.weight_min, l.weight_max));
+        var d: u64 = font_collection.weightDistance(weight, have);
+        if (l.italic != italic) d += 1 << 20;
+        return d;
+    }
+};
+
+/// The `listedFonts` of the options (`js/pdf-resources.mjs`): `[{ id, name, weight: [min, max],
+/// italic, ranges: [[from, to], ...] }]`.
+pub fn parseListed(a: aType, v: ?json.Value) ![]const Listed {
+    const list = v orelse return &.{};
+    if (list != .array) return &.{};
+    var out: std.ArrayList(Listed) = .empty;
+    for (list.array) |item| {
+        const id = (item.get("id") orelse continue).asNumber() orelse continue;
+        const name = (item.get("name") orelse continue).asString() orelse continue;
+        var l: Listed = .{ .id = @intFromFloat(@max(0, id)), .name = name };
+        if (item.get("weight")) |w| if (w == .array and w.array.len == 2) {
+            l.weight_min = @intFromFloat(std.math.clamp(w.array[0].asNumber() orelse 400, 1, 1000));
+            l.weight_max = @intFromFloat(std.math.clamp(w.array[1].asNumber() orelse 400, 1, 1000));
+        };
+        if (item.get("italic")) |i| l.italic = i.asBool() orelse false;
+        if (item.get("ranges")) |rs| if (rs == .array) {
+            var ranges: std.ArrayList([2]u21) = .empty;
+            for (rs.array) |r| {
+                if (r != .array or r.array.len != 2) continue;
+                const lo = r.array[0].asNumber() orelse continue;
+                const hi = r.array[1].asNumber() orelse continue;
+                try ranges.append(a, .{ @intFromFloat(std.math.clamp(lo, 0, 0x10ffff)), @intFromFloat(std.math.clamp(hi, 0, 0x10ffff)) });
+            }
+            l.ranges = ranges.items;
+        };
+        try out.append(a, l);
+    }
+    return out.items;
+}
 
 pub const Collector = struct {
     a: aType,
@@ -14,6 +70,11 @@ pub const Collector = struct {
     text: std.ArrayList(u8) = .empty,
     requests: std.ArrayList(u8) = .empty,
     faces: std.ArrayList(u8) = .empty,
+    /// the listed fonts not loaded yet, and the ids of those font fallback reaches
+    listed: []const Listed = &.{},
+    reached: std.AutoArrayHashMapUnmanaged(u32, void) = .empty,
+    /// (set by `collect`: the frame read)
+    frame: ?*const rt.Frame = null,
 
     fn image(c: *Collector, value: style.Image) !void {
         if (value == .url and value.url.len > 0) try c.images.put(c.a, value.url, {});
@@ -33,6 +94,59 @@ pub const Collector = struct {
         try c.requests.appendSlice(c.a, "],\"weight\":");
         try rt.writeNum(c.a, &c.requests, cs.font_weight);
         try c.requests.appendSlice(c.a, if (cs.font_style == .normal) ",\"style\":\"normal\"}" else ",\"style\":\"italic\"}");
+        try c.fallback(shown, cs);
+    }
+
+    /// takumi `NeedsCollector::add_text`: the listed font each character of `text` makes font
+    /// fallback load. The families of `cs`, then the render's `fontFamilies`, are walked in
+    /// order: the best listed face (CSS matching) of the first family whose `unicodeRange`
+    /// claims the character is reached, unless the family's registered faces draw it and match
+    /// the weight and style at least as well (a registered face ends the walk). A listed face
+    /// that, once loaded, lacks the glyph is registered then: the next read walks on past it.
+    fn fallback(c: *Collector, text: []const u8, cs: *const style.ComputedStyle) !void {
+        if (c.listed.len == 0) return;
+        const f = c.frame orelse return;
+        const fonts = &f.r.fonts;
+        const italic = cs.font_style != .normal;
+        var chain: std.ArrayList([]const u8) = .empty;
+        for ([2][]const []const u8{ cs.font_family, f.opts.font_families }) |list| for (list) |name| {
+            for (chain.items) |have| {
+                if (std.ascii.eqlIgnoreCase(have, name)) break;
+            } else try chain.append(c.a, name);
+        };
+        var seen: std.AutoHashMapUnmanaged(u21, void) = .empty;
+        var i: usize = 0;
+        while (i < text.len) {
+            const d = @import("../font/unicode.zig").decodeUtf8(text, i);
+            i += d.len;
+            if (d.cp < 0x20) continue;
+            if ((try seen.getOrPut(c.a, d.cp)).found_existing) continue;
+            for (chain.items) |family| {
+                var pending: ?*const Listed = null;
+                for (c.listed) |*l| {
+                    if (!std.ascii.eqlIgnoreCase(l.name, family) or !l.covers(d.cp)) continue;
+                    if (pending == null or l.score(cs.font_weight, italic) < pending.?.score(cs.font_weight, italic)) pending = l;
+                }
+                var buf: [32]@import("../font/font.zig").FaceId = undefined;
+                const fams = [_][]const u8{family};
+                var best: ?u64 = null;
+                var draws = false;
+                for (fonts.match(&fams, cs.font_weight, italic, &buf)) |id| {
+                    const face = fonts.face(id);
+                    if (!std.ascii.eqlIgnoreCase(face.family, family)) break;
+                    if (best == null) {
+                        const have = std.math.clamp(cs.font_weight, face.weight_min, @max(face.weight_min, face.weight_max));
+                        best = font_collection.weightDistance(cs.font_weight, have) + @as(u64, if (face.italic != italic and !face.can_italic) 1 << 20 else 0);
+                    }
+                    if (fonts.allows(id, d.cp) and face.font.glyphIndex(d.cp) != 0) draws = true;
+                }
+                if (pending) |l| if (!draws or l.score(cs.font_weight, italic) < best.?) {
+                    try c.reached.put(c.a, l.id, {});
+                    break;
+                };
+                if (draws) break;
+            }
+        }
     }
     fn svgText(c: *Collector, f: *const rt.Frame, src: []const u8, cs: *const style.ComputedStyle) !void {
         if (comptime !@import("../config.zig").enable_svg) return;
@@ -78,6 +192,8 @@ pub const Collector = struct {
         while (child != svg_dom.NONE) : (child = tree.nodes[child].next_sibling) try c.svgNode(tree, child, inherited, cs, false, depth + 1);
     }
     pub fn collect(c: *Collector, f: *const rt.Frame) !void {
+        c.frame = f;
+        defer c.frame = null;
         for (f.dom.els.items) |el| {
             if (el.cs.display == .none) continue;
             var parent = el.parent;
@@ -140,6 +256,11 @@ pub const Collector = struct {
         try out.appendSlice(c.a, c.requests.items);
         try out.appendSlice(c.a, "],\"faces\":[");
         try out.appendSlice(c.a, c.faces.items);
+        try out.appendSlice(c.a, "],\"fonts\":[");
+        for (c.reached.keys(), 0..) |id, k| {
+            if (k != 0) try out.append(c.a, ',');
+            try rt.writeNum(c.a, &out, @floatFromInt(id));
+        }
         try out.appendSlice(c.a, "]}");
         return out.items;
     }

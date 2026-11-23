@@ -132,8 +132,17 @@ pub fn hasMarker(f: *const Frame, el: u32) bool {
 /// The render node of the list item whose marker node `id` is (takumi `marker_tag_target`: its
 /// `Lbl` holds the marker), null when `id` is no marker.
 pub fn labelOwner(f: *const Frame, id: u32) ?u32 {
-    const info = ofNode(f, id) orelse return null;
-    var cur = f.nodes.items[id].parent;
+    if (stateOf(f) == null) return null;
+    // (an image marker's content is the replaced box inside the marker box)
+    var mk = id;
+    var up: u32 = 0;
+    const info = while (true) : (up += 1) {
+        if (ofNode(f, mk)) |i| break i;
+        if (up == 2 or (up == 0 and f.nodes.items[mk].kind != .image)) return null;
+        mk = f.nodes.items[mk].parent;
+        if (mk == none) return null;
+    };
+    var cur = f.nodes.items[mk].parent;
     var guard: u32 = 0;
     while (cur != none and guard < 4096) : (guard += 1) {
         const n = &f.nodes.items[cur];
@@ -508,7 +517,9 @@ fn attach(f: *Frame, item: u32, ordinal: i32) Error!void {
         if (f.r.resolveSvg(url)) |source| {
             const doc = @import("../svg/svg.zig").parse(a, source) catch break :blk null;
             const sz = render.svgIntrinsic(&doc, f.opts.dpr);
-            break :blk .{ .url = url, .width = if (sz.w > 0) sz.w else 300 * f.opts.dpr };
+            // (no natural width: takumi's outside marker box shrinks to nothing around it; the
+            // line's text keeps its place)
+            break :blk .{ .url = url, .width = @max(sz.w, 0) };
         }
         break :blk null;
     };

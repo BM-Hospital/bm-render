@@ -197,14 +197,43 @@ probe("fonts.widths", "/W array and /DW: grouping, rounding, most common width, 
   await fonts(t, `<p style="font-family:'Noto Sans'">Noto Sans</p><p style="font-family:'Noto Sans';font-weight:700">Bold</p>`, {}, ["assets/fonts/NotoSans-Regular.ttf", "assets/fonts/NotoSans-Bold.ttf"], { id: "noto sans" });
 });
 
+const ASCII = Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i).replace("<", "&lt;").replace("&", "&amp;")).join("");
+/** The embedded TrueType program of a render (the first one), or null. */
+const sfnt = (d) => [...d.pdf.objs.values()].find((x) => x.raw && x.data && x.data.length > 4 && x.data.readUInt32BE(0) === 0x00010000)?.data ?? null;
 probe("fonts.subset.glyph-closure", "subset contents: composite glyphs pull components, .notdef kept, glyph count", async (t) => {
-  for (const [name, html] of [["accented composites", `<p>Àéîõü Å ç ñ</p>`], ["one glyph", `<p>x</p>`], ["all ASCII", `<p>${Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i).replace("<", "&lt;").replace("&", "&amp;")).join("")}</p>`], ["space only", `<p>&nbsp;</p>`]]) {
+  // (all ASCII on one line: a line break before `@` is a shaping difference, below; an nbsp-only paragraph
+  // inside a block: at the top level of a fragment takumi drops it, below)
+  for (const [name, html] of [["accented composites", `<p>Àéîõü Å ç ñ</p>`], ["one glyph", `<p>x</p>`], ["all ASCII", `<p style="white-space:nowrap">${ASCII}</p>`], ["space only", `<div><p>&nbsp;</p></div>`]]) {
     const r = await t.both(html, {}, { fonts: [INTER] });
     if (!t.same(name + " outcome", outcome(r.bm), outcome(r.ref)) || !r.ref || r.bm.error) continue;
     sameText(t, name + " program shape", programs(r.bm), programs(r.ref));
-    const size = (d) => { const o = [...d.pdf.objs.values()].find((x) => x.raw && x.data && x.data.length > 4 && x.data.readUInt32BE(0) === 0x00010000); return o ? o.data.length : null; };
-    t.same(name + " subset size (bytes)", size(r.bm), size(r.ref));
+    t.same(name + " subset size (bytes)", sfnt(r.bm)?.length ?? null, sfnt(r.ref)?.length ?? null);
   }
+});
+
+// Two takumi defects the subset size showed, bm-render keeping the browser's result (docs/PDF_AUDIT.md "Glyph subset
+// closure"). (1) A line that starts with `@` before capitals after a break: Inter's contextual alternate raises the
+// `@` (the composite `@.case`, whose component is the default `@`) as it does on an unbroken line, which both
+// engines draw; takumi draws the default `@` once the break falls before it. (2) An nbsp-only paragraph at the top
+// level of an HTML fragment: takumi drops its text (U+00A0 read as collapsible white space) and with it the line,
+// so `<p>&nbsp;</p><p>x</p>` draws `x` a line higher; bm-render keeps the line, as browsers do.
+probe("fonts.subset.line-start-alternate", "subset contents: a contextual alternate at the start of a wrapped line", async (t) => {
+  const r = await t.both(`<p style="width:20px">?@AB</p>`, {}, { fonts: [INTER] });
+  t.ok(!r.bm.error, "bm renders");
+  if (r.bm.error) return;
+  const glyphs = programs(r.bm)?.[0]?.program?.numGlyphs;
+  t.ok(glyphs === 6, `bm draws the raised @ (composite) on the second line, as on one line: notdef, ?, @.case, A, B and the @ component (${glyphs} glyphs)`);
+  const one = await t.both(`<p>?@AB</p>`, {}, { fonts: [INTER] });
+  t.same("unbroken line: same glyphs", programs(one.bm), programs(one.ref));
+  if (r.ref && !r.ref.error) t.differs(`takumi draws the default @ after the break (${programs(r.ref)?.[0]?.program?.numGlyphs} glyphs)`);
+});
+probe("fonts.subset.nbsp-paragraph", "subset contents: an nbsp-only paragraph at the top level", async (t) => {
+  const r = await t.both(`<p>&nbsp;</p><p>x</p>`, {}, { fonts: [INTER] });
+  t.ok(!r.bm.error, "bm renders");
+  if (r.bm.error) return;
+  const lines = [...r.bm.content(0).matchAll(/1 0 0 -1 [\d.]+ ([\d.]+) Tm/g)].map((m) => Number(m[1]));
+  t.ok(lines.length === 2 && lines[1] > lines[0], `bm draws the nbsp line, x below it: ${JSON.stringify(lines)}`);
+  if (r.ref && !r.ref.error) t.differs(`takumi drops the nbsp text and its line (lines ${JSON.stringify([...r.ref.content(0).matchAll(/1 0 0 -1 [\d.]+ ([\d.]+) Tm/g)].map((m) => Number(m[1])))})`);
 });
 
 probe("fonts.type3.colr", "colour glyphs: COLR v0 (Twemoji) / COLR v1 (Noto) -> Type3 fonts? char procs, resources, ToUnicode", async (t) => {
