@@ -3759,8 +3759,15 @@ pub const Frame = struct {
             const reflow_floats = f.tree.has_floats and o.start == null;
             const previous_y: []f32 = if (reflow_floats) try f.a.alloc(f32, f.tree.nodes.items.len) else &.{};
             const previous_h: []f32 = if (reflow_floats) try f.a.alloc(f32, f.tree.nodes.items.len) else &.{};
+            // (the block offset of each paragraph's content box before the breaks move it)
+            const previous_text: []f32 = if (reflow_floats) try f.a.alloc(f32, f.tree.nodes.items.len) else &.{};
             var attempts: u32 = 0;
             while (true) {
+                if (reflow_floats) for (previous_text, 0..) |*y, lid| {
+                    y.* = std.math.nan(f32);
+                    const id = if (lid < f.lid_node.items.len) f.lid_node.items[lid] else none;
+                    if (id != none and f.nodes.items[id].para != null) y.* = f.contentTop(@intCast(lid));
+                };
                 if (reflow_floats) for (f.tree.nodes.items, 0..) |nd, lid| {
                     if (nd.style.float != .none) {
                         const before = f.tree.layout(@intCast(lid));
@@ -3820,6 +3827,14 @@ pub const Frame = struct {
                     f.tree.paged.float_shifts[lid] += delta;
                     changed = true;
                 };
+                // A paragraph moved down whole or in part (orphans / widows, a break between its
+                // lines) beside floats: its moved lines wrap against the floats where they land
+                // (takumi lays them out there), so they are laid out again with that offset
+                // (`PagedState.inline_resume`, one paragraph per document).
+                if (!changed and reflow_floats and f.tree.paged.inline_resume == null) if (try f.floatShiftedParagraph(&pages, previous_text)) |resumed| {
+                    f.tree.paged.inline_resume = resumed;
+                    changed = true;
+                };
                 if (changed) {
                     pages.deinit(f.a);
                     attempts += 1;
@@ -3833,6 +3848,76 @@ pub const Frame = struct {
                 return &f.tree.paged.pages.?;
             }
         } else return f.fail("paged layout is not supported by this build", "");
+    }
+
+    /// The first paragraph whose lines `pages` moves down (`Pages.line_shifts`) into or out of the
+    /// block range of a float beside it, as an `inline_resume` laying those lines out against the
+    /// floats where they land; null: none.
+    fn floatShiftedParagraph(f: *Frame, pages: *const layout.fragment.Pages, previous_text: []const f32) Error!?@TypeOf(f.tree.paged.inline_resume.?) {
+        if (comptime !layout.fragment.enabled) return null;
+        const eps = 1.0 / 64.0;
+        const t = &f.tree;
+        // (paragraphs the breaks moved whole: a box moved down with all its lines)
+        var moved: std.ArrayList(layout.fragment.LineShift) = .empty;
+        defer moved.deinit(f.a);
+        for (previous_text, 0..) |before, lid| {
+            if (!(before == before)) continue;
+            const dy = f.contentTop(@intCast(lid)) - before;
+            if (dy > eps) try moved.append(f.a, .{ .node = @intCast(lid), .first_line = 0, .dy = dy });
+        }
+        for ([_][]const layout.fragment.LineShift{ moved.items, pages.line_shifts }) |list| for (list) |sh| {
+            if (!(sh.dy > eps) or sh.node >= f.lid_node.items.len) continue;
+            const id = f.lid_node.items[sh.node];
+            if (id == none) continue;
+            const tl = f.nodes.items[id].tl orelse continue;
+            if (sh.first_line >= tl.lines.len) continue;
+            // (floats among the paragraph's own lines move with them)
+            var own_float = false;
+            var child = t.nodes.items[sh.node].first_child;
+            while (child < t.nodes.items.len) : (child = t.nodes.items[child].next_sibling) {
+                if (t.nodes.items[child].style.float != .none) own_float = true;
+            }
+            if (own_float) continue;
+            const box = t.layout(sh.node);
+            // (where the lines were laid out: before the breaks moved the box)
+            const top = if (list.ptr == moved.items.ptr) previous_text[sh.node] else f.contentTop(sh.node);
+            var left = box.x + box.border.left + box.padding.left;
+            var parent = t.nodes.items[sh.node].parent;
+            while (parent < t.nodes.items.len) : (parent = t.nodes.items[parent].parent) left += t.layout(parent).x;
+            const right = left + box.w - box.border.left - box.border.right - box.padding.left - box.padding.right;
+            for (t.nodes.items, 0..) |nd, lid| {
+                if (nd.style.float == .none or nd.style.display == .none) continue;
+                const fb = t.layout(@intCast(lid));
+                var fy = fb.y - @max(fb.margin.top, 0);
+                var fx = fb.x;
+                var anc = nd.parent;
+                while (anc < t.nodes.items.len) : (anc = t.nodes.items[anc].parent) {
+                    fy += t.layout(anc).y;
+                    fx += t.layout(anc).x;
+                }
+                const fy1 = fy + @max(fb.margin.top, 0) + fb.h + @max(fb.margin.bottom, 0);
+                // (beside the paragraph: its inline range meets the float's)
+                if (fx + fb.w <= left + eps or fx >= right - eps) continue;
+                for (tl.lines[sh.first_line..]) |ln| {
+                    const y0 = top + ln.top;
+                    const y1 = y0 + @max(ln.height, eps);
+                    const before = y1 > fy + eps and y0 < fy1 - eps;
+                    const after = y1 + sh.dy > fy + eps and y0 + sh.dy < fy1 - eps;
+                    if (before != after) return .{ .node = sh.node, .from_y = tl.lines[sh.first_line].top, .dy = sh.dy };
+                }
+            }
+        };
+        return null;
+    }
+
+    /// Block offset of the content box of layout node `lid` in the frame.
+    fn contentTop(f: *const Frame, lid: u32) f32 {
+        const t = &f.tree;
+        const box = t.layout(lid);
+        var top = box.y + box.border.top + box.padding.top;
+        var parent = t.nodes.items[lid].parent;
+        while (parent < t.nodes.items.len) : (parent = t.nodes.items[parent].parent) top += t.layout(parent).y;
+        return top;
     }
 
     fn recomputePaged(f: *Frame) Error!void {

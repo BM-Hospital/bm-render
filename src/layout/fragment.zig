@@ -108,7 +108,8 @@ pub const Start = struct {
     node: u32 = no_node,
     line: u32 = no_node,
     forced: bool = false,
-    /// Independent cell flows of a table row. Flex/grid keep their established track width.
+    /// Independent flows of a table row, a flex line or a grid row (whose items keep the width of
+    /// their first fragment on a page of another width: `FrozenWidth`).
     branches: []const ResumePoint = &.{},
     row_height: f32 = 0,
     /// Rowspanning cell paragraphs continue independently of the current row.
@@ -116,6 +117,10 @@ pub const Start = struct {
 };
 pub const ParagraphCut = struct { node: u32, glyph: u32 };
 pub const RowMinimum = struct { node: u32, height: f32, top: ?f32 = null };
+/// A flex or grid container continued on a page of another width keeps laying its items out at the
+/// border-box width `w` of its first fragment (takumi: the container's box takes the page's width,
+/// its items keep the sizes and offsets the flex / grid algorithm gave them).
+pub const FrozenWidth = struct { node: u32, w: f32 };
 
 pub const Page = struct { top: f32, height: f32 };
 /// Lines `first_line..` of `node` (up to the next entry of the same node) are painted `dy` lower.
@@ -257,6 +262,9 @@ pub const PagedState = struct {
     cut_glyph: u32 = 0,
     cuts: []const ParagraphCut = &.{},
     row_minimums: []const RowMinimum = &.{},
+    /// Flex / grid containers whose items lay out at another width than the container's own
+    /// (src/pdf/paged.zig, tree.zig).
+    frozen_widths: []const FrozenWidth = &.{},
     /// Placement shifts of whole floats deferred to another fragmentainer.
     /// Recomputed inline layout consumes these through the BFC exclusion space.
     float_shifts: []f32 = &.{},
@@ -685,17 +693,26 @@ fn Engine(comptime T: type) type {
             while (guard < tr.max_depth + 8) : (guard += 1) {
                 const st = &e.st[cur];
                 if (!st.started) return .{};
-                const k = e.kindOf(cur);
+                var k = e.kindOf(cur);
                 if (st.spanned) {
+                    // (a cell whose content ended while its row goes on: the row resumes with
+                    // every cell finished, as a row whose cells all ended does)
+                    if (k != .row and cur != e.t.root and e.kindOf(e.t.nodes.items[cur].parent) == .row) {
+                        cur = e.t.nodes.items[cur].parent;
+                        k = .row;
+                    }
                     if (k != .row) return .{};
+                    const row_st = &e.st[cur];
                     var points: std.ArrayList(ResumePoint) = .empty;
                     defer points.deinit(e.a);
                     var child = e.t.nodes.items[cur].first_child;
                     while (child != no_node) : (child = e.t.nodes.items[child].next_sibling) {
                         if (e.style(child).display == .none or e.style(child).position.isOut()) continue;
+                        // (a cell that spans rows is a side flow of its own, as in `seqOf`)
+                        if (e.t.layouts.items[child].h > e.lay(cur).h + eps) continue;
                         if (!try e.finishedPoints(child, &points, 0)) return .{};
                     }
-                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = if (st.seq != no_node) e.seqs.items[st.seq].h0 else e.lay(cur).h };
+                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = if (row_st.seq != no_node) e.seqs.items[row_st.seq].h0 else e.lay(cur).h };
                 }
                 if (k == .text) return .{ .node = cur, .line = st.@"resume" };
                 if (st.seq == no_node) return .{};
@@ -706,14 +723,14 @@ fn Engine(comptime T: type) type {
                 if (!st.child_inside) return .{ .node = c, .forced = st.forced_resume };
                 // (parallel flows broken inside resume at more than one point)
                 if ((k == .row or k == .bands) and bandEnd(sq, st.@"resume") != st.@"resume" + 1) {
-                    if (k != .row) return .{};
+                    // (a flex line or grid row: its items keep their layout on the next page, `FrozenWidth`)
                     var points: std.ArrayList(ResumePoint) = .empty;
                     defer points.deinit(e.a);
                     const end = bandEnd(sq, st.@"resume");
                     for (sq.items[st.@"resume"..end]) |item| {
                         if (!item.flow or !try e.resumePoints(item.node, &points, 0)) return .{};
                     }
-                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = sq.h0 };
+                    return .{ .node = cur, .branches = try points.toOwnedSlice(e.a), .row_height = if (k == .row) sq.h0 else 0 };
                 }
                 cur = c;
             }
@@ -803,6 +820,23 @@ fn Engine(comptime T: type) type {
                 return false;
             }
             return e.start_h != null and e.page == 0 and s.line == no_node and s.node == c;
+        }
+        /// Whether `Options.start` says the parallel flow `c` (or a box in it) ended before the
+        /// start: on page 0 it stays where the pages laid out before had it, not pushed past it.
+        fn startFinished(e: *const Self, c: u32) bool {
+            const s = e.opts.start orelse return false;
+            if (e.start_h == null or e.page != 0) return false;
+            for ([_][]const ResumePoint{ s.branches, s.side_flows }) |points| for (points) |p| {
+                if (!p.finished) continue;
+                var n = p.node;
+                var guard: u32 = 0;
+                while (n < e.t.nodes.items.len and guard < tr.max_depth + 8) : (guard += 1) {
+                    if (n == c) return true;
+                    if (n == e.t.root) break;
+                    n = e.t.nodes.items[n].parent;
+                }
+            };
+            return false;
         }
         fn startForced(e: *const Self, c: u32) bool {
             const s = e.opts.start orelse return false;
@@ -1323,7 +1357,9 @@ fn Engine(comptime T: type) type {
                 agg.last = join(agg.last, join(rc.last, cb.after));
                 var end = rc.end;
                 const sep0 = ct > band_top + eps;
-                if (rc.brk and !rc.par and !rc.forced and sep0 and ct > pg.start + eps and e.breaksAtStart(c)) {
+                // (an item the pages before ended stays on page 0 of `Options.start`)
+                const kept = e.startFinished(c);
+                if (!kept and rc.brk and !rc.par and !rc.forced and sep0 and ct > pg.start + eps and e.breaksAtStart(c)) {
                     // it breaks before all its content and sits lower than its row: the break before
                     // it is as good as one before a monolithic item (Blink's flex / grid items are
                     // parallel flows, whose block-start breakpoint is a class A one)
@@ -1340,7 +1376,7 @@ fn Engine(comptime T: type) type {
                     // unbreakable and too tall: it stays where a break before it makes no progress, else
                     // it goes to the next page alone (a last resort unless it sits lower than its row)
                     const sep = ct > band_top + eps;
-                    if (!(ct <= pg.start + eps or (requires and !sep))) {
+                    if (!(kept or ct <= pg.start + eps or (requires and !sep))) {
                         e.slot[c] = .{ .stamp = e.stamp, .kind = .push, .brk = true };
                         agg.brk = true;
                         agg.appeal = worse(agg.appeal, if (sep) .perfect else .last_resort);
@@ -1481,6 +1517,11 @@ fn Engine(comptime T: type) type {
                 } else if (lt <= lpg.start + eps or lb <= lpg.end + eps) {
                     mp = true;
                 } else mp = appeal_before == .last_resort and requires;
+                // (the paragraph's first line placed below a float that reaches past the page end,
+                // on a later page whole: the empty space before it breaks, nothing moves; takumi lays
+                // the line out on the page the float leaves room on)
+                if (!mp and lc == 0 and i == start and !stt.started and lines[i].top > eps and lt >= pg.next - eps)
+                    return try e.setBreak(n, .line, i, false, .perfect, false, bottom, pg.end);
                 if (!mp) {
                     var go_on = false;
                     if (lc != 0) {
@@ -1777,6 +1818,9 @@ fn Engine(comptime T: type) type {
                     const c = sq.items[k].node;
                     if (!e.st[c].full or e.heightDefinite(c)) continue;
                     const cl = e.lay(c);
+                    // (a grid item spanning more than one row keeps the block size the grid gave
+                    // it: takumi / Blink grow only the rows a break moves content down in)
+                    if (comptime @TypeOf(cl.grid_row_span) != void) if (cl.grid_row_span > 1) continue;
                     cl.h = @max(cl.h, new_bottom - e.itemTop(sq, k, top));
                 }
             }

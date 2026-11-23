@@ -25,8 +25,10 @@
 //! coordinates, and so on. The frames are one document (same element model and render nodes):
 //! counters (`counters.Seg`), links and anchors (`interactive.Collector.beginRun`), the structure
 //! tree and the emitter's neighbouring page passes (`emit.PageBox.frame` / `prev_win` / `next_win`)
-//! work across them. A page whose start is not one point (parallel flows broken inside) keeps the
-//! width of the run before it.
+//! work across them. Parallel flows broken inside (a table row's cells, a flex line's or a grid
+//! row's items) resume at one point each; a flex or grid container continued on a page of another
+//! width keeps laying its items out at its first fragment's width (`frozenWidths`). A page whose
+//! start cannot be found again in the new frame keeps the width of the run before it.
 //!
 //! Memory: each layout of the content (`Pass`) has an arena of its own (`Pass.mem`), released as
 //! soon as a later pass replaces it, so the counter and band passes of a long document hold one
@@ -259,12 +261,18 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
     var row_minimums: []const layout.fragment.RowMinimum = &.{};
     var float_shifts: []const f32 = &.{};
     var float_extents: []const f32 = &.{};
-    var assigned_rows: []const layout.fragment.RowMinimum = &.{};
-    var rows_recorded = false;
+    var frozen: []const layout.fragment.FrozenWidth = &.{};
+    // (the block size of each table row as laid out at the width of the page its table starts on:
+    // takumi lays a table's rows out once; a row that starts on a page of another width keeps it,
+    // a row broken inside goes on with the block size its last fragment's table left it,
+    // `Start.row_height`. The rows of a table with a row span keep it in either case.)
+    var assigned_rows: std.ArrayList(layout.fragment.RowMinimum) = .empty;
+    var spanning_rows: std.ArrayList(u32) = .empty;
+    var recorded_tables: std.ArrayList(u32) = .empty;
     var start_top: f32 = 0;
     var retried = false;
     while (true) {
-        const f = try bands.buildFrameCuts(cx.doc.r, a, cx.doc.o, cx.doc.css, cx.kind, cx.source, null, .{ width, g.area(base, null)[1] }, subst, cuts, row_minimums, float_shifts, float_extents);
+        const f = try bands.buildFrameCuts(cx.doc.r, a, cx.doc.o, cx.doc.css, cx.kind, cx.source, null, .{ width, g.area(base, null)[1] }, subst, cuts, row_minimums, float_shifts, float_extents, frozen);
         g.names = f.tree.paged.page_names;
         if (segs.items.len > 0 and !sameNodes(segs.items[0].frame, f)) return extendLast(segs);
         if (start) |*s| {
@@ -296,14 +304,9 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
         }
         const sc = try a.create(SegCtx);
         sc.* = .{ .g = g, .base = base, .fake = @intFromBool(start != null) };
-        var assigned: std.ArrayList(layout.fragment.RowMinimum) = .empty;
-        if (!rows_recorded) for (f.tree.table_geoms.items) |table| {
-            const spanning = for (table.cells) |cell| {
-                if (cell.rowspan > 1) break true;
-            } else false;
-            if (!spanning) continue;
-            for (table.rows) |row| if (row.node != no_node.node) try assigned.append(a, .{ .node = row.node, .height = row.h });
-        };
+        // (the rows' block sizes as laid out, before pagination moves lines down inside them)
+        var laid_rows: std.AutoHashMapUnmanaged(u32, f32) = .empty;
+        for (f.tree.table_geoms.items) |table| for (table.rows) |row| if (row.node != no_node.node) try laid_rows.put(a, row.node, row.h);
         const pages = try f.paginate(.{ .page_height = g.area(base, null)[1], .page_height_fn = SegCtx.height, .ctx = @ptrCast(sc), .start = start, .start_top = if (start != null) start_top else null, .record_starts = true, .max_pages = max_pages + 1 });
         // (page 1 must start where the run before stopped, else the run before goes on)
         if (start) |s| if (pages.start_page == 0 or pages.pages.len < 2 or !sameStart(pages.starts[1], s)) {
@@ -319,10 +322,6 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
                 continue;
             }
         }
-        if (!rows_recorded) {
-            assigned_rows = try assigned.toOwnedSlice(a);
-            rows_recorded = true;
-        }
         var stop: ?u32 = null;
         var i: u32 = fake + 1;
         while (i < pages.pages.len) : (i += 1) {
@@ -337,6 +336,27 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
             break;
         }
         const end: u32 = stop orelse @intCast(pages.pages.len);
+        {
+            const shown_top = if (start != null) start_top else -std.math.inf(f32);
+            const shown_end = if (end < pages.pages.len) pages.pages[end].top else std.math.inf(f32);
+            for (f.tree.table_geoms.items) |table| {
+                if (table.node == no_node.node) continue;
+                const known = for (recorded_tables.items) |n| {
+                    if (n == table.node) break true;
+                } else false;
+                if (known) continue;
+                const top = absTop(f, table.node);
+                if (top < shown_top - 1.0 / 64.0 or top >= shown_end) continue;
+                try recorded_tables.append(a, table.node);
+                const spanning = for (table.cells) |cell| {
+                    if (cell.rowspan > 1) break true;
+                } else false;
+                for (table.rows) |row| if (row.node != no_node.node) {
+                    try assigned_rows.append(a, .{ .node = row.node, .height = laid_rows.get(row.node) orelse row.h });
+                    if (spanning) try spanning_rows.append(a, row.node);
+                };
+            }
+        }
         try segs.append(a, .{ .frame = f, .first = base, .local0 = fake, .count = end - fake });
         if (base + end - fake > max_pages) {
             cx.doc.r.setErr(too_many_pages, "");
@@ -362,18 +382,28 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
         start = tok;
         float_shifts = f.tree.paged.float_shifts;
         float_extents = f.tree.paged.float_extents;
+        frozen = try frozenWidths(a, f, tok, frozen);
         var rows: std.ArrayList(layout.fragment.RowMinimum) = .empty;
-        try rows.appendSlice(a, assigned_rows);
         for (f.tree.table_geoms.items) |table| for (table.rows) |row| {
-            for (assigned_rows) |minimum| {
+            for (assigned_rows.items) |minimum| {
                 if (row.node != minimum.node) continue;
                 var absolute_top: f32 = 0;
                 var ancestor = row.node;
                 while (ancestor < f.tree.nodes.items.len) : (ancestor = f.tree.nodes.items[ancestor].parent) absolute_top += f.tree.layout(ancestor).y;
-                if (absolute_top <= start_top + 1.0 / 64.0) try rows.append(a, .{ .node = row.node, .height = minimum.height, .top = row.y });
+                const spanning = std.mem.indexOfScalar(u32, spanning_rows.items, row.node) != null;
+                if (absolute_top <= start_top + 1.0 / 64.0) {
+                    if (spanning) {
+                        try rows.append(a, .{ .node = row.node, .height = minimum.height, .top = row.y });
+                    } else if (absolute_top + row.h <= start_top + 1.0 / 64.0) {
+                        // (a row that ended before the start stays where it was: the rows after it
+                        // keep their offsets, whatever the new width does to its content)
+                        try rows.append(a, .{ .node = row.node, .height = row.h, .top = row.y });
+                    }
+                } else try rows.append(a, minimum);
                 break;
             }
         };
+        for (assigned_rows.items) |minimum| if (std.mem.indexOfScalar(u32, spanning_rows.items, minimum.node) != null) try rows.append(a, minimum);
         if (tok.branches.len > 0 and tok.row_height > 0) {
             try rows.append(a, .{ .node = tok.node, .height = tok.row_height });
         }
@@ -404,6 +434,40 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
         }
         cuts = next_cuts.items;
     }
+}
+
+/// The flex and grid containers the content from `tok` on continues in (its points' ancestors), with
+/// the width their items lay out at: takumi lays a flex / grid container's items out once, so on a
+/// page of another width the container's box takes that page's width while its items keep their
+/// sizes and offsets (`FrozenWidth`). `prev`: the widths frame `f` was laid out with.
+fn frozenWidths(a: Allocator, f: *const Frame, tok: layout.fragment.Start, prev: []const layout.fragment.FrozenWidth) Error![]const layout.fragment.FrozenWidth {
+    const t = &f.tree;
+    var out: std.ArrayList(layout.fragment.FrozenWidth) = .empty;
+    var points: std.ArrayList(u32) = .empty;
+    if (tok.node != rt.none) try points.append(a, tok.node);
+    for (tok.branches) |p| try points.append(a, p.node);
+    for (tok.side_flows) |p| try points.append(a, p.node);
+    for (points.items) |start| {
+        var n = start;
+        var guard: u32 = 0;
+        while (n < t.nodes.items.len and guard < layout.max_depth + 8) : (guard += 1) {
+            const d = t.nodes.items[n].style.display;
+            if (n != start and (d == .flex or d == .grid)) {
+                const known = for (out.items) |fw| {
+                    if (fw.node == n) break true;
+                } else false;
+                if (!known) {
+                    const w = for (prev) |fw| {
+                        if (fw.node == n) break fw.w;
+                    } else t.layout(n).w;
+                    try out.append(a, .{ .node = n, .w = w });
+                }
+            }
+            if (n == f.lroot) break;
+            n = t.nodes.items[n].parent;
+        }
+    }
+    return out.items;
 }
 
 /// takumi lays a table cell out at its row's block size and never breaks before its block-end
@@ -496,9 +560,31 @@ fn absTop(f: *const Frame, n: u32) f32 {
 }
 
 fn sameStart(a: layout.fragment.Start, b: layout.fragment.Start) bool {
-    if (a.node != b.node or a.line != b.line or a.forced != b.forced or a.branches.len != b.branches.len or a.side_flows.len != b.side_flows.len) return false;
-    for (a.branches, b.branches) |x, y| if (!std.meta.eql(x, y)) return false;
+    if (a.side_flows.len != b.side_flows.len) return false;
     for (a.side_flows, b.side_flows) |x, y| if (!std.meta.eql(x, y)) return false;
+    if (a.node == b.node and a.line == b.line and a.forced == b.forced and a.branches.len == b.branches.len) {
+        for (a.branches, b.branches) |x, y| if (!std.meta.eql(x, y)) return false;
+        return true;
+    }
+    // (parallel flows of which all but some ended resume where those go on: a band whose other
+    // items a new width ended earlier is the same start as its one flow still going)
+    if (a.branches.len == 0 and b.branches.len == 0) return false;
+    return samePoints(a, b) and samePoints(b, a);
+}
+
+/// Every flow `a` resumes (its unfinished branches, or its one point) resumes in `b` at the same place.
+fn samePoints(a: layout.fragment.Start, b: layout.fragment.Start) bool {
+    const one = [_]layout.fragment.ResumePoint{.{ .node = a.node, .line = a.line, .forced = a.forced }};
+    const pa: []const layout.fragment.ResumePoint = if (a.branches.len > 0) a.branches else if (a.node != rt.none) &one else &.{};
+    const one_b = [_]layout.fragment.ResumePoint{.{ .node = b.node, .line = b.line, .forced = b.forced }};
+    const pb: []const layout.fragment.ResumePoint = if (b.branches.len > 0) b.branches else if (b.node != rt.none) &one_b else &.{};
+    for (pa) |x| {
+        if (x.finished) continue;
+        const found = for (pb) |y| {
+            if (!y.finished and y.node == x.node and y.line == x.line and y.forced == x.forced) break true;
+        } else false;
+        if (!found) return false;
+    }
     return true;
 }
 

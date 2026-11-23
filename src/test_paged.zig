@@ -260,6 +260,259 @@ test "paged rowspans: independent cell continuations preserve assigned rows" {
     }
 }
 
+/// Absolute left edge of layout node `lid`'s border box in its frame.
+fn absLeft(f: *const rt.Frame, lid: u32) f32 {
+    var x: f32 = 0;
+    var cur = lid;
+    while (cur < f.tree.nodes.items.len) {
+        x += f.tree.layout(cur).x;
+        if (cur == f.lroot) break;
+        cur = f.tree.nodes.items[cur].parent;
+    }
+    return x;
+}
+
+/// Lays `src` out through the PDF pipeline (pages of their own widths) with Inter as the only font.
+fn pdfLayOut(r: *rt.Renderer, src: []const u8) !@import("pdf/paged.zig").Document {
+    const bytes = readFile("assets/fonts/Inter-Regular.ttf") orelse return error.FileNotFound;
+    _ = try r.registerFont(bytes, "Inter", 0, -1, null);
+    r.beginCall();
+    const pg = @import("pdf/paged.zig");
+    return pg.layOut(r, r.arena.allocator(), .{}, null, .html, src, @import("pdf/options.zig").Page.a4, null);
+}
+
+/// Every text line a page shows (its baseline in the page's window) was laid out in a frame as wide
+/// as that page's area and lies inside it: no page keeps the width of the run before it.
+fn expectLinesFitPages(d: *const @import("pdf/paged.zig").Document) !void {
+    for (d.pages, 0..) |page, i| {
+        const f = page.frame orelse d.frame;
+        const win = d.windows[i];
+        for (f.nodes.items) |n| if (n.tl) |tl| {
+            if (n.lid == rt.none) continue;
+            const box = f.tree.layout(n.lid);
+            const top = absTop(f, n.lid) + box.border.top + box.padding.top;
+            const left = absLeft(f, n.lid) + box.border.left + box.padding.left;
+            for (tl.lines) |line| {
+                if (line.glyph_start == line.glyph_end) continue;
+                const baseline = top + line.baseline;
+                if (baseline < win.top or baseline >= win.bottom) continue;
+                if (f.tree.paged.page_w != page.content.w or left + line.x + line.width > page.content.w + 0.5) {
+                    std.debug.print("page {d}: a line at x {d:.1}..{d:.1} (frame width {d:.1}) on a page area {d:.1} wide\n", .{ i, left + line.x, left + line.x + line.width, f.tree.paged.page_w, page.content.w });
+                    return error.LineOutsidePageWidth;
+                }
+            }
+        };
+    }
+}
+
+fn wordList(a: std.mem.Allocator, prefix: []const u8, n: usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (0..n) |i| try out.appendSlice(a, try std.fmt.allocPrint(a, "{s}{d} word{s}", .{ prefix, i, if (i + 1 == n) "" else " " }));
+    return out.items;
+}
+
+const alternating = "<style>@page{size:240px 140px;margin:10px}@page:left{size:360px 140px;margin:10px}p{margin:0}td{padding:0;vertical-align:top}table{border-spacing:0}</style>";
+
+test "paged continuation: a row resumed below a rowspan's finished rows takes the new page width" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    const a = r.arena.allocator();
+    const src = try std.fmt.allocPrint(T.allocator, "{s}<div style=\"font:14px/20px Inter\"><table style=\"width:100%\"><tr><td rowspan=\"2\" style=\"width:35%\">{s}</td><td>{s}</td></tr><tr><td>{s}</td></tr></table><p>AFTER</p></div>", .{ alternating, try wordList(a, "S", 10), try wordList(a, "R1", 30), try wordList(a, "R2", 30) });
+    defer T.allocator.free(src);
+    const d = try pdfLayOut(r, src);
+    defer d.release(r);
+    try T.expectEqual(@as(usize, 6), d.pages.len);
+    try expectLinesFitPages(&d);
+}
+
+test "paged continuation: a rowspan still running past its first row's end takes each page width" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    const a = r.arena.allocator();
+    const src = try std.fmt.allocPrint(T.allocator, "{s}<div style=\"font:14px/20px Inter\"><table style=\"width:100%\"><tr><td rowspan=\"3\" style=\"width:40%\">{s}</td><td>{s}</td></tr><tr><td>{s}</td></tr><tr><td>{s}</td></tr></table><p>AFTER</p></div>", .{ alternating, try wordList(a, "S", 40), try wordList(a, "R1", 8), try wordList(a, "R2", 8), try wordList(a, "R3", 8) });
+    defer T.allocator.free(src);
+    const d = try pdfLayOut(r, src);
+    defer d.release(r);
+    try T.expectEqual(@as(usize, 7), d.pages.len);
+    try expectLinesFitPages(&d);
+}
+
+/// `body` after the alternating 240 / 360 px page sheet, in 14px/20px Inter, followed by a long paragraph.
+fn alternatingDoc(a: std.mem.Allocator, body: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}<div style=\"font:14px/20px Inter\">{s}<p>{s}</p></div>", .{ alternating, body, try wordList(a, "AFTER", 40) });
+}
+
+test "paged continuation: flex and grid containers continue at each page width, their items at their first width" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    // (pinned takumi: the container's box and the content after it take each page's width; the
+    // items of a container broken inside keep the sizes and offsets of its first fragment)
+    const bodies = [_][]const u8{
+        "<div id=\"c\" style=\"display:flex;flex-direction:column\"><div id=\"i\">{s}</div><div>{s}</div></div>",
+        "<div id=\"c\" style=\"display:grid\"><div id=\"i\">{s}</div><div>{s}</div></div>",
+        "<div id=\"c\" style=\"display:flex\"><div id=\"i\" style=\"flex:1\">{s}</div><div style=\"flex:1\">{s}</div></div>",
+        "<div id=\"c\" style=\"display:grid;grid-template-columns:1fr 1fr\"><div id=\"i\">{s}</div><div>x</div><div>{s}</div><div>y</div></div>",
+    };
+    inline for (bodies) |body| {
+        const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+        defer r.destroy();
+        var arena = std.heap.ArenaAllocator.init(T.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const src = try alternatingDoc(a, try std.fmt.allocPrint(a, body, .{ try wordList(a, "A", 30), try wordList(a, "B", 30) }));
+        const d = try pdfLayOut(r, src);
+        defer d.release(r);
+        try expectLinesFitPages(&d);
+        // page 1 (360 px) continues the container: its box is 340 px wide, the first item as on page 0
+        const f0 = d.pages[0].frame orelse d.frame;
+        const f1 = d.pages[1].frame orelse d.frame;
+        try T.expect(f1 != f0);
+        const c1 = (try nodeOfFrameId(f1, "c")).lid;
+        try T.expectApproxEqAbs(@as(f32, 340), f1.tree.layout(c1).w, 0.01);
+        try T.expectApproxEqAbs(f0.tree.layout((try nodeOfFrameId(f0, "i")).lid).w, f1.tree.layout((try nodeOfFrameId(f1, "i")).lid).w, 0.01);
+    }
+}
+
+test "paged continuation: a table row starting on a page of another width keeps the block size its table gave it" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    // (pinned takumi: the second row starts on a 360 px page but keeps the block size of the table
+    // laid out at the 240 px page it starts on, so AFTER lands on page 7)
+    const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = try std.fmt.allocPrint(a, "{s}<div style=\"font:14px/20px Inter\"><table style=\"width:100%\"><tr><td style=\"width:50%\">{s}</td><td>{s}</td></tr><tr><td>{s}</td><td>{s}</td></tr></table><p id=\"after\">AFTER</p></div>", .{ alternating, try wordList(a, "A", 30), try wordList(a, "B", 20), try wordList(a, "C", 30), try wordList(a, "D", 30) });
+    const d = try pdfLayOut(r, src);
+    defer d.release(r);
+    try expectLinesFitPages(&d);
+    try T.expectEqual(@as(usize, 7), d.pages.len);
+}
+
+test "paged continuation: the content after an end-aligned grid row takes each page width" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = try alternatingDoc(a, try std.fmt.allocPrint(a, "<div style=\"display:grid;grid-template-columns:1fr 1fr;align-items:end\"><div>{s}</div><div>{s}</div></div>", .{ try wordList(a, "A", 30), try wordList(a, "B", 4) }));
+    const d = try pdfLayOut(r, src);
+    defer d.release(r);
+    try expectLinesFitPages(&d);
+    try T.expectEqual(@as(usize, 6), d.pages.len);
+}
+
+test "paged floats: a paragraph moved by orphans beside a deferred float wraps against it where it lands" {
+    if (!enabled) return error.SkipZigTest;
+    const rows = comptime blk: {
+        var out: [2][]const u8 = .{ "", "" };
+        for (&out, [_]usize{ 7, 4 }) |*o, n| {
+            for (0..n) |_| o.* = o.* ++ "<div style=\"height:20px\">LINE</div>";
+        }
+        break :blk out;
+    };
+    const words = comptime blk: {
+        @setEvalBranchQuota(100000);
+        var s: []const u8 = "";
+        for (0..36) |i| s = s ++ std.fmt.comptimePrint("w{d} ", .{i});
+        break :blk s;
+    };
+    // (the float does not fit below the seven lines and moves to page 2; two lines of the paragraph
+    // would stay on page 1, fewer than its orphans, so it moves too: pinned takumi wraps its first
+    // lines beside the float there, not across it)
+    const src = "<style>html,body{margin:0;padding:0} p{margin:0}</style>" ++ rows[0] ++ "<div id=\"f\" style=\"float:left;width:100px;break-inside:avoid\">" ++ rows[1] ++ "</div><p id=\"p\" style=\"widows:4;orphans:4\">" ++ words ++ "</p>";
+    const d = try open(.html, src, 300, 200, 10);
+    defer d.deinit();
+    try T.expectEqual(@as(usize, 2), d.count());
+    const f = try nodeOfId(d, "f");
+    try T.expectApproxEqAbs(@as(f32, 180), absTop(&d.f, f.lid), 0.02);
+    var q = try nodeOfId(d, "p");
+    try T.expectApproxEqAbs(@as(f32, 180), absTop(&d.f, q.lid), 0.02);
+    while (q.para == null and q.first_child != rt.none) q = &d.f.nodes.items[q.first_child];
+    const tl = q.tl orelse return error.MissingText;
+    try T.expect(tl.lines.len > 1);
+    // (every line in the float's block range starts right of it)
+    for (tl.lines) |ln| if (ln.top + ln.height <= 80) try T.expect(ln.x >= 100 - 0.02);
+}
+
+test "paged floats: the first line below a float wider than its container stays where the float leaves room" {
+    if (!enabled) return error.SkipZigTest;
+    const rows = comptime blk: {
+        var out: [2][]const u8 = .{ "", "" };
+        for (&out, [_]usize{ 3, 10 }) |*o, n| {
+            for (0..n) |_| o.* = o.* ++ "<div style=\"height:20px\">LINE</div>";
+        }
+        break :blk out;
+    };
+    // (pinned takumi: the float runs to 260 px on page 2, the paragraph's first line follows it
+    // there; the paragraph itself is not moved to page 2 first)
+    const src = "<style>html,body{margin:0;padding:0} body{font:12px/20px Inter} p{margin:0}</style>" ++ rows[0] ++ "<div id=\"f\" style=\"float:left;width:400px\">" ++ rows[1] ++ "</div><p id=\"p\">w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20</p>";
+    const d = try open(.html, src, 300, 200, 10);
+    defer d.deinit();
+    try T.expectEqual(@as(usize, 2), d.count());
+    const p = try nodeOfId(d, "p");
+    try T.expectApproxEqAbs(@as(f32, 60), absTop(&d.f, p.lid), 0.02);
+}
+
+test "paged floats: a clearing float after a split float shows on the page of another width it lands on" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ls: std.ArrayList(u8) = .empty;
+    for (1..6) |i| try ls.appendSlice(a, try std.fmt.allocPrint(a, "<div class=\"l\">L{d}</div>", .{i}));
+    var fs: std.ArrayList(u8) = .empty;
+    for (1..9) |i| try fs.appendSlice(a, try std.fmt.allocPrint(a, "<div class=\"l\">F{d}</div>", .{i}));
+    // (F runs from 100 to 260 px, G clears it to 260..300 px on the 360 px page 2; the paragraph
+    // beside them continues there from a cut, whose text before the cut is one line that must not
+    // move below the floats and with it the start of page 2)
+    const src = try std.fmt.allocPrint(a, "<style>@page{{size:300px 200px;margin:10px}}@page:left{{size:360px 200px;margin:10px}}html,body{{margin:0;padding:0}} body{{font:12px/20px Inter}} .l{{height:20px}} p{{margin:0}}</style>{s}<div style=\"float:left;width:100px\">{s}</div><div id=\"g\" style=\"float:left;width:100px;clear:left\"><div class=\"l\">G1</div><div class=\"l\">G2</div></div><p>{s}</p>", .{ ls.items, fs.items, try wordList(a, "w", 30) });
+    const d = try pdfLayOut(r, src);
+    defer d.release(r);
+    try T.expectEqual(@as(usize, 2), d.pages.len);
+    try expectLinesFitPages(&d);
+    const f = d.pages[1].frame orelse d.frame;
+    const g = try nodeOfFrameId(f, "g");
+    try T.expectApproxEqAbs(@as(f32, 260), absTop(f, g.lid), 0.02);
+    try T.expect(absTop(f, g.lid) >= d.windows[1].top);
+}
+
+fn nodeOfFrameId(f: *const rt.Frame, id: []const u8) !*const rt.Node {
+    for (f.nodes.items) |*n| {
+        if (n.el != rt.none and std.mem.eql(u8, f.dom.at(n.el).id, id)) return n;
+    }
+    return error.NoSuchId;
+}
+
+test "paged grid: an item spanning rows keeps its block size when a break moves a row's content down" {
+    if (!enabled) return error.SkipZigTest;
+    const rows = comptime blk: {
+        var out: [3][]const u8 = .{ "", "", "" };
+        for (&out, [_]usize{ 14, 3, 4 }) |*o, n| {
+            for (0..n) |_| o.* = o.* ++ "<div style=\"height:20px\">LINE</div>";
+        }
+        break :blk out;
+    };
+    // (pinned takumi: C's first line would cross the page end and moves down 10px, its row grows;
+    // the stretched B in one row grows with it, S spanning both rows ends where its content does)
+    const src = "<div style=\"height:40px\"></div><div style=\"display:grid;grid-template-columns:1fr 1fr\"><div id=\"s\" style=\"grid-row:span 2\">" ++ rows[0] ++ "</div><div id=\"b\">" ++ rows[1] ++ "</div><div id=\"c\">" ++ rows[2] ++ "</div></div>";
+    const d = try open(.html, src, 300, 200, 10);
+    defer d.deinit();
+    try T.expectEqual(@as(usize, 2), d.count());
+    const s = try nodeOfId(d, "s");
+    const c = try nodeOfId(d, "c");
+    try T.expectApproxEqAbs(@as(f32, 40), absTop(&d.f, s.lid), 0.02);
+    try T.expectApproxEqAbs(@as(f32, 280), d.f.tree.layout(s.lid).h, 0.02);
+    // (C starts at the top of page 2, the grid ends 10px below S)
+    try T.expectApproxEqAbs(@as(f32, 180), absTop(&d.f, c.lid), 0.02);
+    const grid = d.f.tree.nodes.items[s.lid].parent;
+    try T.expectApproxEqAbs(@as(f32, 330), absTop(&d.f, grid) + d.f.tree.layout(grid).h, 0.02);
+}
+
 test "paged continuation: aligned grid items resume without repeating the row offset" {
     if (!enabled) return error.SkipZigTest;
     const rows = comptime blk: {

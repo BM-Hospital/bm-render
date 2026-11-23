@@ -294,7 +294,12 @@ Cho style/selector bên trong inline SVG tham gia cascade đúng scope.
 
 ## 16 — Hoàn thiện continuation qua thay đổi chiều rộng trang (P1)
 
-**Trạng thái:** in progress — parallel table-cell tokens, glyph cuts và empty regions đã có; còn rowspan width-reflow và decoration overflow. Regression `pagination.continuation.rowspan-width-reflow` xác nhận BM/Takumi cùng 7 trang nhưng text tách khác từ trang 3 (BM 6 dòng, Takumi 3) và links lệch; chưa có fix. Cursor glyph riêng không đủ: frame mới còn phải giữ vertical offset của fragment trong cell. Các thử nghiệm chưa chứng minh được cải thiện đã hoàn tác.
+**Trạng thái:** in progress — `pagination.continuation.rowspan-width-reflow` đã pass (5/5) từ trước; lần này đối chiếu oracle pinned (build lại từ `ff9a5d4`) trên 52 case trang đổi width (240/360 px xen kẽ và named pages): baseline 24 case lệch text/vị trí chữ, nay còn 2, cả hai ghi lại bên dưới. Đã sửa (`src/pdf/paged.zig`, `src/layout/fragment.zig`, `src/layout/tree.zig`, `src/pdf/bands.zig`):
+- Container flex/grid bị cắt giữa chừng: box của nó lấy width trang mới, còn item giữ size/offset của fragment đầu (`FrozenWidth`, đúng như takumi đo bằng raster: nền container rộng theo trang, nền item giữ width cũ); start token qua flex column / grid một cột / flex line và grid row nhiều item (branches) giờ biểu diễn được, nên nội dung sau container lấy width của trang mới thay vì giữ width cũ cả trang (trước đây text bị cắt mất ở mép trang hẹp).
+- Ô của row đã hết nội dung nhưng row còn chạy (row đứng trước một rowspan): token cấp row với mọi ô finished; ô rowspan không lọt vào branches (là side flow). Trước đây trang đó giữ width cũ và mất chữ (`table-rowspan-tall-rows`).
+- Block size của row: lấy theo layout của bảng ở trang bảng bắt đầu (trước pagination), áp cho row bắt đầu sau điểm cắt; row đã xong trước điểm cắt giữ vị trí (`top`). Row bị cắt giữa vẫn theo `Start.row_height`. Bảng có rowspan giữ cách cũ.
+- `sameStart` so sánh theo tập điểm chưa xong (band mà item khác đã kết thúc sớm hơn ở width mới vẫn là cùng điểm bắt đầu); item đã xong theo token không bị đẩy qua trang 0 của start (`startFinished`).
+Regression: Zig `paged continuation: …` (6 test mới, đều fail trước fix) và probe `pagination.continuation.{flex-column, flex-column-between, grid-column, flex-row-after, grid-rows-after, table-rowspan-tall-rows, table-rowspan3, table-two-rows, grid-align-end-after, table-spacing-borders}` (8 fail trên baseline). Còn lệch, chưa sửa: (1) đoạn văn có dòng đầu bị float đẩy sang trang sau (token dòng 0 không biểu diễn được) — trang đó vẫn giữ width cũ; (2) `thead` lặp lại: takumi vẽ bản sao header ở width cũ (lệch cột so với body ở width mới) và đẩy row 2 sang trang sau, bm layout lại header theo width mới — không bắt chước. Chưa đo links/tags trên toàn bộ case mới (chỉ rowspan-width-reflow có assertion link).
 
 Bổ sung restart token/continuation cho row table hoặc flex line đang chạy qua named page đổi width.
 
@@ -302,7 +307,7 @@ Bổ sung restart token/continuation cho row table hoặc flex line đang chạy
 
 - [ ] Không giữ width cũ ngoài các trường hợp oracle cũng giữ; có case row/line đang dang dở.
 - [ ] Nội dung và links/tags không mất hoặc lặp khi chuyển frame.
-- [ ] Golden named-pages không được ép khớp các nét ngoài clip vô hình; đánh giá riêng output thấy được.
+- [x] Golden named-pages không được ép khớp các nét ngoài clip vô hình; đánh giá riêng output thấy được. (named-pages IDENTICAL, không thêm nét vô hình; output thấy được của các case mới so bằng raster màu + vị trí chữ.)
 
 **Kiểm tra:** Page widths alternating, named pages, table rowspan và flex row continuation; compare page count/text/geometry.
 
@@ -312,15 +317,15 @@ Bổ sung restart token/continuation cho row table hoặc flex line đang chạy
 
 ## 17 — Port grid-row fragments (P1)
 
-**Trạng thái:** in progress — aligned grid continuation đã sửa, 9/9 source probes; track/span state đầy đủ còn cần làm.
+**Trạng thái:** in progress — 25 probe `pagination.grid-fragments.*` (break-before/after item và row dưới align-items start/center/end/stretch, row cao hơn trang, nested grid, item span 2/3 row, text, bảng trong grid, row-gap, explicit rows, align-self:end, padding/border) khớp oracle pinned về text, vị trí chữ và paint. Sửa: item span nhiều row không giãn theo row bị break đẩy nội dung xuống (takumi chỉ giãn row đó; `Layout.grid_row_span`, `src/layout/grid.zig`, `src/layout/fragment.zig`); Zig `paged grid: an item spanning rows keeps its block size …` fail trước fix. Chưa hỗ trợ / lệch đã biết: row align-items:end cao hơn trang lệch paint dưới 1 px ở fragment tiếp theo của container (`tall-row-end`, text/vị trí chữ khớp); grid qua trang đổi width dùng cơ chế item giữ width của task 16.
 
 Bổ sung fragment của grid row cho item break và alignment qua trang.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Case align-items:end có item break-before khớp oracle.
-- [ ] Có nested grid, row span và nội dung text/table qua trang; định nghĩa rõ trường hợp chưa hỗ trợ.
-- [ ] Không đổi layout của grid không phân trang.
+- [x] Case align-items:end có item break-before khớp oracle. (`pagination.grid-fragments.break-before-item-end`, cùng start/center/stretch.)
+- [x] Có nested grid, row span và nội dung text/table qua trang; định nghĩa rõ trường hợp chưa hỗ trợ. (Ngoại lệ: paint sub-pixel của `tall-row-end`, ghi ở trạng thái.)
+- [x] Không đổi layout của grid không phân trang. (`grid_row_span` chỉ được đọc khi phân trang; `zig build test` 719 pass/21 skip, golden 125/10/1 như baseline.)
 
 **Kiểm tra:** Probe grid pagination và các fixture có grid break; đo layout không paged để bắt regression.
 
@@ -330,17 +335,17 @@ Bổ sung fragment của grid row cho item break và alignment qua trang.
 
 ## 18 — Port reflow cạnh float bị chuyển trang (P1)
 
-**Trạng thái:** in progress — whole-float reflow, split-float exclusion extent và side-flow resume qua run đổi width đã triển khai; còn thiếu ánh xạ đủ 138 test upstream và các tổ hợp lồng ít gặp.
+**Trạng thái:** in progress — đã ánh xạ 8 test float của `takumi-core/src/layout/fragmentation_tests.rs` thành probe `pagination.float.upstream.*` (assert đúng fragment page/offset/size như upstream trên nền màu, rồi so oracle), thêm nhóm `pagination.float.{clear, oversized, rtl, nested, widows-orphans}` (widows/orphans 2/3/4 cạnh float bị cắt và float bị hoãn; mỗi nhóm trên trang một width và trang đổi width xen kẽ). Baseline lệch 8/38 case, nay còn 1. Sửa: (1) dòng đầu của đoạn nằm dưới float rộng hơn container và chạy qua trang sau không làm cả đoạn bị dời trang (`src/layout/fragment.zig`); (2) đoạn bị dời xuống (orphans/widows, break giữa dòng) cạnh float được layout lại với float ở vị trí mới (`Frame.floatShiftedParagraph` → `inline_resume`, `src/render.zig`) — trước đây chữ đè lên float; (3) phần văn bản trước điểm cắt của đoạn tiếp tục ở width mới không bị đẩy xuống dưới float, nên float `clear` sau float bị cắt không còn mất ở trang width mới (`src/font/text.zig`). Zig: 3 test `paged floats: …` mới, đều fail trước fix. Còn lệch: float rộng hơn container + trang đổi width (thuộc giới hạn token dòng 0 của task 16). Các test float upstream không phân trang (inline_layout_algorithm, line_breaker, min_max_sizes, measure_tests) chưa ánh xạ case-level.
 
 Chuyển việc đặt float và line wrapping vào vòng lặp layout theo trang.
 
 **Tiêu chí nghiệm thu:**
 
 - [x] Float nguyên khối bị đẩy sang trang kế và split float cập nhật vùng exclusion để text wrap lại; strict float reflow probes pass 24/24, gồm run đổi page width.
-- [ ] Mở rộng ánh xạ case clear, oversized float, RTL và nested block tới đủ test upstream; hiện các probe hiện có pass nhưng chưa xác minh đủ widows/orphans cho mọi tổ hợp.
+- [x] Mở rộng ánh xạ case clear, oversized float, RTL và nested block tới đủ test upstream; widows/orphans 2/3/4 cạnh float bị cắt / bị hoãn, trên trang một width và đổi width. (Ngoại lệ đã ghi: float rộng hơn container ở trang đổi width.)
 - [x] Không giải bằng dịch pixel của một layout đã hoàn tất; pagination ghi nhận extent/resume state rồi layout lại.
 
-**Kiểm tra:** Pinned float probes hiện tại: 42/42 + 24/24; Zig focused float tests: 14/14. Còn cần map/review 138 khai báo float upstream và bổ sung các case chưa được assertion.
+**Kiểm tra:** `pagination.float*` 17/17 probe pass (oracle pinned); Zig `paged floats` 3 test mới + test cũ pass. Các test float không phân trang của upstream (measure/inline) chưa map case-level.
 
 **Phụ thuộc:** 02, 16. **Phạm vi:** M, tối đa 5 file logic mỗi lát; tách tiếp nếu vượt.
 
@@ -598,3 +603,7 @@ Full strict audit (pinned `ff9a5d4`), HEAD `67c0f36`: **1.571 probe, 1.548 pass,
 - **Đã kiểm tra, không phải lỗi:** với fragment source (không có phần tử `<html>`), mọi nguồn biến `:root` (`<style>`, `css`, `cssVariables`) đều không tới `@page`, ở cả bm lẫn takumi. bm nhất quán: `cssVariables` ≡ `css: [":root{…}"]`.
 - **Kết luận:** 0 lỗi thật của bm trong 23 probe fail.
 - **Tooling đã sửa:** `run.mjs` dùng `process.exit()` làm mất report trên pipe Windows, đổi sang `process.exitCode`; `pdftotext()` trong `lib.mjs` không xoá PDF tạm (~395.000 file trong `bench/out/pdf-audit`), giờ đã xoá sau mỗi lần gọi; thêm `PDF_AUDIT_TRACE=1` để in id probe trước khi chạy.
+
+## 2026-11-23 continuation đổi width, grid-row fragments, float reflow (task 16–18)
+
+Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, không docker; `bench/out/pdf-oracle`, provenance ghi `source-build-wasm-local-rustc-1.97`). Baseline (HEAD `1f40d98`, wasm): strict audit 1.571 probe, 1.548 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 732/732. Sau thay đổi: audit 1.619 probe (+48 mới), 1.596 pass, cùng 23 fail như baseline, giống hệt trên wasm và native; golden không đổi (125/10/1, cùng từng fixture); PDF Zig 741/741 (+9 test mới, mỗi test fail trước fix); `zig build test` 719 pass / 21 skip; `test:pdf` 399/399 trên wasm và native; `test:pdf:chunks` tương đương cả hai backend; `test:pdf:memory` pass (×1,036 / ×1,064). Khám phá ngoài audit (scratch, so text từng trang + vị trí chữ với oracle): 52 case đổi width 24 → 2 lệch, 27 case grid 0 lệch (paint: 1 lệch sub-pixel), 38 case float 8 → 1 lệch. Chi tiết và phần còn lại ở trạng thái task 16, 17, 18.

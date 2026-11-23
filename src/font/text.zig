@@ -1740,7 +1740,10 @@ pub const Paragraph = struct {
             }
             while (true) {
                 band = .{ .x0 = 0, .x1 = @max(full orelse 0, 0) };
-                if (full != null) if (flow.band_fn) |bf| {
+                // (the text before a cut is one line no page shows: it keeps its place, not moved
+                // below the floats it is too wide to sit beside, so the lines after it wrap where
+                // they did on the page before)
+                if (full != null and !cut_here) if (flow.band_fn) |bf| {
                     band = bf(flow, y, hq);
                     if (!std.math.isFinite(band.x0)) band.x0 = 0;
                     if (!(band.x1 >= band.x0) or !std.math.isFinite(band.x1)) band.x1 = band.x0;

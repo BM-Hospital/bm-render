@@ -319,6 +319,88 @@ probe("pagination.float.source-fit-split", "pinned upstream float fit/split asse
   t.note(`source test: a_float_breaks_only_when_it_does_not_fit_its_page; ${JSON.stringify(heights)}`);
 });
 
+// Floats split or deferred by a page, by kind (task 18): clearance after a split float, floats wider or
+// taller than the page, RTL, nested blocks and floats, widows / orphans beside a split or deferred
+// float; on pages of one width and of alternating widths.
+{
+  const W = (n, p = 'w') => Array.from({ length: n }, (_, i) => `${p}${i}`).join(' ');
+  const side = (s, style, inner) => `<div style="float:${s};width:100px;${style}">${inner}</div>`;
+  const F = (from, to, p) => lines(from, to, () => '', p);
+  const alt = '@page{size:300px 200px;margin:10px}@page:left{size:360px 200px;margin:10px}';
+  const groups = {
+    clear: (css) => [
+      ...['left', 'right', 'both'].map((c) => [`clear:${c} after a split float`, doc(lines(1, 5) + side('left', '', F(1, 8, 'F')) + side('right', '', F(1, 3, 'R')) + `<p>${W(30)}</p><div class="l" style="clear:${c}">CLR</div>` + lines(6, 8), css)]),
+      ['a clearing float after a split float', doc(lines(1, 5) + side('left', '', F(1, 8, 'F')) + side('left', 'clear:left', F(1, 2, 'G')) + `<p>${W(30)}</p>` + lines(6, 8), css)],
+    ],
+    oversized: (css, wide) => [
+      ...(wide ? [] : [['a float wider than its container and taller than the page', doc(lines(1, 3) + `<div style="float:left;width:400px">${F(1, 10, 'F')}</div><p>${W(30)}</p>`, css)]]),
+      ['a monolithic float taller than the page', doc(lines(1, 3) + `<div style="float:left;width:80px;height:400px;overflow:hidden">M</div><p>${W(60)}</p>`, css)],
+      ['a float of text taller than the page', doc(lines(1, 3) + side('left', '', F(1, 25, 'F')) + `<p>${W(80)}</p>`, css)],
+    ],
+    rtl: (css) => [
+      ['RTL right float split', doc(`<div dir="rtl">` + lines(1, 5) + side('right', '', F(1, 8, 'F')) + `<p>${W(40)}</p></div>`, css)],
+      ['RTL left float split', doc(`<div dir="rtl">` + lines(1, 5) + side('left', '', F(1, 8, 'F')) + `<p>${W(40)}</p></div>`, css)],
+    ],
+    nested: (css) => [
+      ['nested paragraphs beside a split float', doc(lines(1, 5) + side('left', '', F(1, 8, 'F')) + `<div><div style="margin-left:10px"><p>${W(15)}</p><p>${W(15, 'v')}</p></div><p>${W(20, 'u')}</p></div>`, css)],
+      ['a split float in nested blocks', doc(lines(1, 5) + `<div style="padding-left:10px"><div>` + side('left', '', F(1, 8, 'F')) + `<p>${W(40)}</p></div></div>`, css)],
+      ['a float in a split float', doc(lines(1, 5) + side('left', 'width:140px', side('left', 'width:60px', F(1, 6, 'I')) + F(1, 9, 'O')) + `<p>${W(40)}</p>`, css)],
+      ['floats on both sides', doc(lines(1, 4) + side('left', '', F(1, 9, 'F')) + side('right', '', F(1, 6, 'R')) + `<p>${W(50)}</p>`, css)],
+    ],
+    'widows-orphans': (css) => [2, 3, 4].flatMap((wo) => [
+      [`widows / orphans ${wo} beside a split float`, doc(lines(1, 6) + side('left', '', F(1, 6, 'F')) + `<p style="widows:${wo};orphans:${wo}">${W(36)}</p>`, css)],
+      [`widows / orphans ${wo} beside a deferred float`, doc(lines(1, 7) + side('left', 'break-inside:avoid', F(1, 4, 'F')) + `<p style="widows:${wo};orphans:${wo}">${W(36)}</p>`, css)],
+    ]),
+  };
+  for (const [name, make] of Object.entries(groups)) {
+    probe(`pagination.float.${name}`, `floats across pages: ${name}`, async (t) => {
+      await cmpAll(t, [
+        ...make('', false).map(([label, html]) => [label, html, SMALL]),
+        ...make(alt, true).map(([label, html]) => [`${label} (alternating page widths)`, html, {}]),
+      ], G);
+    });
+  }
+}
+
+// The float cases of takumi-core/src/layout/fragmentation_tests.rs (pinned upstream), on 200 px pages:
+// each upstream assertion on a box's fragments (page, block offset, block size) is checked against
+// the painted background of that box, then the two engines are compared.
+{
+  const FLOAT_CSS = `html,body{margin:0;padding:0} .block{display:block} p{display:block;margin:0;font:16px/20px Inter;white-space:pre-line}
+    .float{float:left;width:50px} .h10{height:10px;width:10px} .h20{height:20px} .h80{height:80px} .h110{height:110px} .h150{height:150px} .h300{height:300px}
+    .avoid{break-inside:avoid} .clear{clear:both} .m30{margin-top:30px} .after{break-after:page} .border{border-bottom:10px solid #000}
+    .rel{position:relative} .abs{position:absolute;top:150px;height:10px;width:10px} .forced-after{break-after:page}
+    #float,#next{background:#f00} #b,#c,#wrap{background:#0f0}`;
+  const page = { size: { width: 300, height: 200 }, margin: 0, tagged: false };
+  const box = (id, cls, inner = '') => `<div id="${id}" class="block ${cls}">${inner}</div>`;
+  // fragments of the box painted in `colour`: [page, block offset, block size] in px
+  const fragmentsOf = (render, colour) => render.pages.flatMap((p, i) => paintShapes(render, i)
+    .filter((shape) => shape.endsWith(`fill ${colour}`))
+    .map((shape) => { const [, y0, , y1] = shape.split(' ').map(Number); const top = p.media[3]; return [i, Math.round((top - y1) * 4 / 3), Math.round((y1 - y0) * 4 / 3)]; }));
+  const cases = [
+    ['a_resumed_float_drops_its_block_start_margin', box('float', 'float h300 m30'), { '1,0,0': [[0, 30, 170], [1, 0, 130]] }],
+    ['a_forced_break_before_a_float_leaves_the_container_unbroken_by_inflow_content', `<div id="wrap" class="block border">${box('a', 'h20 after')}${box('float', 'float h20')}</div>`, { '1,0,0': [[1, 0, 20]] }],
+    ['a_float_taller_than_a_page_breaks_across_pages', box('float', 'float h300'), { '1,0,0': [[0, 0, 200], [1, 0, 100]] }, 2],
+    ['a_float_that_avoids_breaking_moves_to_the_next_page_alone', box('a', 'h150') + box('float', 'float h80 avoid') + box('b', 'h20'), { '1,0,0': [[1, 0, 80]], '0,1,0': [[0, 150, 20]] }],
+    ['a_block_that_clears_a_broken_float_follows_it_to_the_next_page', box('float', 'float h300') + box('c', 'h20 clear'), { '0,1,0': [[1, 100, 20]] }],
+    ['a_float_among_lines_breaks_across_pages', `<p id="p">${box('float', 'float h300')}a</p>`, { '1,0,0': [[0, 0, 200], [1, 0, 100]] }, 2],
+    ['a_float_among_lines_that_avoids_breaking_moves_to_the_next_page_alone', box('a', 'h150') + `<p id="p">${box('float', 'float h80 avoid')}x</p>`, { '1,0,0': [[1, 0, 80]] }],
+    ['a_forced_break_after_a_box_whose_absolute_child_runs_on_puts_the_next_float_on_the_next_page', box('a', 'h110') + `<div id="rel" class="block rel forced-after">${box('abs', 'abs')}</div>` + box('next', 'h10 float'), { '1,0,0': [[1, 0, 10]] }, 2],
+  ];
+  for (const [name, body, expected, count] of cases) {
+    probe(`pagination.float.upstream.${name.replace(/_/g, '-')}`, `takumi-core fragmentation_tests.rs: ${name}`, async (t) => {
+      const html = `<style>${FLOAT_CSS}</style><div class="block">${body}</div>`;
+      const r = await cmp(t, name, html, page, { geom: true, paint: true, expect: 'render' });
+      if (r.bm.error) return;
+      if (count) t.same(`${name}: page count`, r.bm.pages.length, count);
+      // (the forced-break container keeps its block-end border on its first fragment: 20 + 10 px)
+      if (name.startsWith('a_forced_break_before_a_float')) t.ok(paintShapes(r.bm, 0).some((s) => s.endsWith('fill 0,1,0') && Math.round((s.split(' ')[3] - s.split(' ')[1]) * 4 / 3) === 30), `${name}: wrap's first fragment is 30 px tall`);
+      for (const [colour, frags] of Object.entries(expected)) t.same(`${name}: fragments of the box filled ${colour}`, fragmentsOf(r.bm, colour), frags);
+      if (name === 'a_float_among_lines_that_avoids_breaking_moves_to_the_next_page_alone') t.ok(r.bm.textPages[0].includes('x'), `${name}: the line beside the float stays on page 1`);
+    });
+  }
+}
+
 // ------------------------------------------------------------------------------------------------ positioned boxes
 
 const rel = (inner, style = "") => `<div style="position:relative;${style}">${inner}</div>`;

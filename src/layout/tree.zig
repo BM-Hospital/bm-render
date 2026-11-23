@@ -134,6 +134,8 @@ pub const Out = struct {
 pub const Layout = struct {
     /// Unaligned grid-area block start, relative to the grid, for PDF continuation.
     grid_block_start: if (st.frag_enabled) f32 else void = if (st.frag_enabled) NONE else {},
+    /// Grid rows the item's area spans (0: not a grid item), for PDF continuation.
+    grid_row_span: if (st.frag_enabled) u16 else void = if (st.frag_enabled) 0 else {},
     /// border-box position relative to the parent's border-box origin
     x: f32 = 0,
     y: f32 = 0,
@@ -1102,19 +1104,33 @@ pub fn TreeWith(comptime cfg: Config) type {
             defer self.depth -= 1;
             self.node_computes += 1;
 
+            // (a flex / grid container continued at another page width: its items keep the layout
+            // they had at its first fragment's width, its own box takes the new one)
+            var frozen_in: In = undefined;
+            const frozen_w: ?f32 = if (comptime st.frag_enabled) blk: {
+                if (algo != .flex and algo != .grid or as_flow or leaf or !has(in.known[0])) break :blk null;
+                for (self.paged.frozen_widths) |fw| if (fw.node == node) break :blk fw.w;
+                break :blk null;
+            } else null;
+            const in_used: *const In = if (frozen_w) |w| blk: {
+                frozen_in = in.*;
+                frozen_in.known[0] = w;
+                break :blk &frozen_in;
+            } else in;
             if (as_flow) {
                 try flow.compute(self, node, in, out, ictx);
             } else if (leaf) {
                 self.computeLeaf(node, in, out);
             } else switch (algo) {
-                .flex => try flex.compute(self, node, in, out),
+                .flex => try flex.compute(self, node, in_used, out),
                 .block => try block.compute(self, node, in, out),
-                .grid => try grid.compute(self, node, in, out),
+                .grid => try grid.compute(self, node, in_used, out),
                 .table => if (cfg.tables) try table.compute(self, node, in, out) else try block.compute(self, node, in, out),
                 .inline_row => if (cfg.inline_row and !cfg.inline_fn) try inline_row.compute(self, node, in, out) else try block.compute(self, node, in, out),
                 .none => out.* = .{ .size = .{ 0, 0 } },
             }
             if (in.layout and n.style.rtl and !leaf and !as_flow and mirrors(self.nodes.items[node].style)) self.flipChildren(node, out.size[0]);
+            if (frozen_w != null) out.size[0] = in.known[0];
 
             if (fctx) return;
             var e: *Entry = &c.final;
@@ -1366,6 +1382,7 @@ pub fn TreeWith(comptime cfg: Config) type {
                 const ry = rnd(o[1], k);
                 const r: Layout = .{
                     .grid_block_start = if (comptime st.frag_enabled) (if (has(l.grid_block_start)) rnd(cum[1] + l.grid_block_start, k) - rnd(cum[1], k) else NONE) else {},
+                    .grid_row_span = l.grid_row_span,
                     .x = rx - rnd(cum[0], k),
                     .y = ry - rnd(cum[1], k),
                     .w = rnd(o[0] + l.w, k) - rx,
