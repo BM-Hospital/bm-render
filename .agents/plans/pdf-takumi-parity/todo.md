@@ -240,15 +240,15 @@ Hỗ trợ ảnh trong ::before/::after qua content:url() dùng cùng resource l
 
 ## 13 — Port SVG position lists và rotation của text (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — 2/3 tiêu chí đóng. 37 probe `images.svg-text.*` (gồm `arabic-x-list-rotate`) và 4 fixture upstream (`images.svg-fixture.{svg_text_shaping, svg_text_baselines, svg_text_path_rotate, image_svg_text}`) khớp oracle pinned; 20 probe trong số đó fail ở HEAD `a8a41d4`. Sửa (`src/svg/text_position.zig`, `src/svg/dom.zig`, `src/svg/style.zig`, `src/pdf/emit_svg.zig`): list có phần tử không parse được bị bỏ cả list (như `length_list`/`number_list`); text-anchor căn theo tổng advance, không cộng `dx` (`clusters_length`); `letter-spacing`/`word-spacing`; `dominant-baseline`/`alignment-baseline`/`baseline-shift` (sub/super/length cộng dồn qua tspan, `FloatAscent` theo metric làm tròn); cluster xoay quanh gốc pen của cluster (offset GPOS của glyph đầu xoay theo, cần `item_origin`); kerning nối qua ranh giới tspan (bỏ việc tắt liga/clig khi có vị trí, takumi không tắt); `font-style` (oblique tổng hợp), `font-stretch`, `font-variant: small-caps`. Zig: `SVG text position lists with an invalid entry are dropped whole` (fail trước fix). Còn mở: (1) `svg_text_spacing` lệch 1 dòng: letter-spacing tại khoảng trắng trong văn bản Arabic — engine chữ chung (`src/font/text.zig`) bỏ letter-spacing cho cả run cursive, takumi vẫn cộng ở word separator (CSS Text 4 §8.2.1); không sửa vì file đó đang do task 08–10/28–29 sửa; (2) `svg_text_glyphs`: synthetic bold (takumi stroke outline bằng fill) và layer COLR của glyph trong SVG text chưa port; (3) khác biệt có chủ đích: `dx`/`dy` trong chunk RTL cộng dồn theo thứ tự logic (SVG 2 / Blink `SvgTextLayoutAlgorithm`), takumi cộng theo thứ tự visual — ghi ở `docs/PDF_AUDIT.md`.
 
 Thay cách chỉ lấy phần tử đầu x/y/dx/dy bằng xử lý theo character/cluster.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Danh sách x/y/dx/dy và rotate được áp đúng cho text/tspan và inheritance.
-- [ ] Tôn trọng text-anchor, spacing, baseline và shaping; không tách sai cluster phức tạp.
-- [ ] Text layer hoặc outlines tuân theo upstream trong các trường hợp transform.
+- [x] Danh sách x/y/dx/dy và rotate được áp đúng cho text/tspan và inheritance. (list dài/ngắn, rotate lặp phần tử cuối, tspan ghi đè/kế thừa/chỉ tspan có rotate, x lồng, đơn vị em/%, list sai bị bỏ.)
+- [ ] Tôn trọng text-anchor, spacing, baseline và shaping; không tách sai cluster phức tạp. (Anchor, spacing Latin, baseline, ligature, dấu kết hợp, cluster Arabic với x/rotate đã khớp; còn letter-spacing tại khoảng trắng Arabic và synthetic bold/COLR, xem trạng thái.)
+- [x] Text layer hoặc outlines tuân theo upstream trong các trường hợp transform. (SVG text là outline như takumi-pdf; `transform-rotate`, rotate trong `g`, skew/scale khớp.)
 
 **Kiểm tra:** Fixture svg_text_spacing, svg_text_glyphs, svg_text_shaping; thêm list ngắn/dài và rotate cuối lặp.
 
@@ -258,15 +258,15 @@ Thay cách chỉ lấy phần tử đầu x/y/dx/dy bằng xử lý theo charact
 
 ## 14 — Port SVG textPath và text decoration (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (chờ review) — 34 probe `images.svg-text-path.*` (19 textPath: `xlink:href`, path đảo chiều, path có transform, circle/rect, nhiều subpath, href thiếu, startOffset âm/quá cuối/%, anchor middle/end, dx/dy/rotate trên path, chữ tiếp sau textPath, 2 textPath, letter-spacing, `x` của text, `method`/`spacing`/`side` bị bỏ qua như upstream; 15 decoration) và fixture `images.svg-fixture.svg_text_path_rotate` khớp oracle pinned. Sửa: opacity của `tspan`/`textPath`/`a` (tích các opacity, không tính `text`) nhóm decoration + glyph của span thành một group như takumi `TextPainter::paint_span` (`deco-opacity-tspan` fail ở HEAD); letter-spacing trên path đi theo task 13.
 
 Hỗ trợ chữ bám path và decoration còn thiếu sau khi position lists ổn định.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] textPath/href/startOffset và hướng path được xử lý theo phạm vi upstream thực sự hỗ trợ.
-- [ ] Underline/overline/line-through của SVG text/tspan có test với transform và opacity.
-- [ ] Không dùng raster fallback cho toàn bộ SVG chỉ để che thiếu vector implementation.
+- [x] textPath/href/startOffset và hướng path được xử lý theo phạm vi upstream thực sự hỗ trợ. (`images.svg-text-path.*`; `method`, `spacing`, `side`, thuộc tính `path` không có trong phạm vi takumi và cho cùng kết quả.)
+- [x] Underline/overline/line-through của SVG text/tspan có test với transform và opacity. (`deco-line-through-transform`, `deco-skewed-text`, `deco-opacity-text`, `deco-opacity-tspan`, `deco-fill-opacity`, `deco-path`, …)
+- [x] Không dùng raster fallback cho toàn bộ SVG chỉ để che thiếu vector implementation. (So sánh draw list với oracle: glyph và decoration là path vector, không có image XObject.)
 
 **Kiểm tra:** Fixture svg_text_path_rotate; đối chiếu outline/glyph placement và raster cùng reference.
 
@@ -276,15 +276,15 @@ Hỗ trợ chữ bám path và decoration còn thiếu sau khi position lists �
 
 ## 15 — Port stylesheet bên trong inline SVG (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — 3/3 tiêu chí đóng; còn fixture `svg_style_selectors`. 36 probe `images.svg-inline-css.*`, `images.svg-inline.css-fill-paints` và fixture `images.svg-fixture.svg_inline_page_styles` khớp oracle pinned; 13 trong số đó fail ở HEAD. Sửa (`src/svg/html_cascade.zig`, `src/style/style.zig`): root của inline SVG kế thừa thuộc tính SVG (fill, stroke, stroke-width, fill-opacity, text-anchor, …) mà tổ tiên HTML khai báo qua rule hoặc thuộc tính `style`, cùng font đã tính của host (takumi layout SVG trong style context của host); `var()` trong rule, `style` và presentation attribute được thay theo custom property của host và của các phần tử SVG phía trên (`style.substituteVars`); cascade chạy cả khi trang không có rule CSS. Zig: `var() substitution for declarations outside the cascade (inline SVG)`. Còn mở: `svg_style_selectors` là SVG nguồn ảnh độc lập (`<img>`) với `<style>` riêng dùng `:nth-child`, `:not`, `:lang`, `~`, `:is`, `:nth-last-of-type` — bộ selector tối giản của `src/svg/css.zig` bỏ các rule đó; cần cascade đầy đủ cho SVG độc lập (cũng ảnh hưởng render ảnh), chưa làm.
 
 Cho style/selector bên trong inline SVG tham gia cascade đúng scope.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Case images.svg-inline.css-fill có style thay đổi paint thật sự.
-- [ ] Test selector specificity, inherited/currentColor, SVG lồng nhau và không rò CSS ra HTML ngoài SVG.
-- [ ] Phân biệt inline SVG với SVG nguồn ảnh độc lập và CSS của trang theo oracle.
+- [x] Case images.svg-inline.css-fill có style thay đổi paint thật sự. (`images.svg-inline.css-fill-paints`: rect không có fill được tô `#0a0`, không phải đen.)
+- [x] Test selector specificity, inherited/currentColor, SVG lồng nhau và không rò CSS ra HTML ngoài SVG. (`images.svg-inline-css.*`: specificity class/id, rule sau thắng, rule thắng presentation attribute, kế thừa qua `g`/root/tổ tiên HTML, currentColor, `svg svg`, `svg > svg > rect`, `<style>` trong SVG không tác động HTML trước/sau.)
+- [x] Phân biệt inline SVG với SVG nguồn ảnh độc lập và CSS của trang theo oracle. (`page-css-not-in-img-svg`, `img-svg-own-style`, `images.svg-inline.css-image-isolation`.)
 
 **Kiểm tra:** Probe images.svg-inline.css-fill và fixture svg_inline_page_styles/svg_style_selectors.
 
@@ -425,15 +425,15 @@ Không suy từ việc krilla có helper SVG glyph rằng public takumi-pdf đã
 
 ## 23 — Port relative colors (P2)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (chờ review) — 32 probe `paint.color-relative.*` khớp oracle pinned (đã khớp từ HEAD: parser `parseRelative` trong `src/style/color.zig` theo đúng `parse_relative_color`), thêm 2 probe chỉ kiểm bm: `paint.color-relative.values` (giá trị kênh ghi ra) và `paint.color-relative.gradient-interpolation` (fail ở HEAD). Policy: kênh keyword/số/%/góc hue (deg/grad/rad/turn)/`none`/`alpha`, origin lồng nhau, alpha clamp, gamut clip; `calc()` trong kênh, `color(from …)`, origin `currentColor` và token thừa là không hợp lệ → bỏ khai báo (như takumi). Sửa một chỗ: màu relative không phải màu legacy, nên gradient có nó nội suy trong Oklab như takumi-core (`peeks_modern_color_function`); takumi-pdf vẫn ghi mọi gradient bằng sRGB (khác biệt có chủ đích `linear-in-*`), nên probe này so bm với gradient `in oklab` tường minh. Zig: `relative colour syntax counts as a modern colour for gradient interpolation` (fail trước fix).
 
 Bổ sung relative color syntax mà upstream có, bắt đầu rgb(from ...).
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Có probe chứng minh syntax và phép channel/calc được pinned Takumi hỗ trợ.
-- [ ] Chuyển đúng alpha, clipping và currentColor/variables; unsupported syntax có policy rõ.
-- [ ] Không thay đổi hành vi gradient interpolation theo CSS hiện đang đúng chỉ để bắt chước hạn chế upstream.
+- [x] Có probe chứng minh syntax và phép channel/calc được pinned Takumi hỗ trợ. (`paint.color-relative.*`; `calc()` không được pinned takumi hỗ trợ: `calc-channel-invalid` khớp.)
+- [x] Chuyển đúng alpha, clipping và currentColor/variables; unsupported syntax có policy rõ. (alpha keyword/%/clamp, `oklch-out-of-gamut-clipped`, `var-origin`/`var-channel`/`var-whole-colour`, `inherited-as-current-color`, `current-color-origin-invalid`; policy ở trạng thái và `docs/PDF_AUDIT.md`.)
+- [x] Không thay đổi hành vi gradient interpolation theo CSS hiện đang đúng chỉ để bắt chước hạn chế upstream. (4 probe `paint.gradient.linear-in-*` giữ nguyên là khác biệt có chủ đích.)
 
 **Kiểm tra:** Case relative colors upstream, test màu numeric và raster PDF với nguồn currentColor/var().
 
@@ -443,15 +443,15 @@ Bổ sung relative color syntax mà upstream có, bắt đầu rgb(from ...).
 
 ## 24 — Port offset-path (P2)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — 2/3 tiêu chí đóng. 20 probe mới `paint.motion.*` (box + text + link annotation so oracle; 12 viewport, 8 phân trang) cùng 10 probe cũ và 4 fixture `images.svg-fixture.offset_path_*` khớp oracle pinned; 7 probe phân trang fail ở HEAD. Sửa (`src/style/motion_path.zig`, `src/style/values.zig`, `src/style/style.zig`, `src/style/computed.zig`, `src/render.zig`): takumi lấy reference box là query container, rồi kích thước viewport, rồi chính phần tử (`local_transform`); takumi-pdf layout trên column không có chiều cao, nên khi phân trang (hoặc render không có height) chiều cao reference là border box của phần tử: ray dùng chiều cao phần tử, shape/coord box được đo lười theo từng chiều cao (`motion_path.Lazy`). Trước fix bm dùng chiều cao vùng trang (vd `ray(… farthest-side)` đẩy box sang trang sau, thừa 1 trang). Zig: `motion paths without a viewport height take the element's height as the reference box` (fail trước fix). Còn lệch ở ranh giới trang, chung cho mọi transform xoay chứ không riêng offset-path (`transform: rotate()` cho cùng kết quả): box xoay có fragment bắt đầu ở trang sau vẫn mở một region marked-content rỗng `/P` ở trang trước; box transform chạy tiếp sang trang sau được vẽ sau fragment border của cha thay vì trước — thuộc task 03/05. Link rect `circle()` lệch 0,02 pt (làm tròn cung).
 
 Port phạm vi motion-path upstream thực sự hỗ trợ vào shared transform pipeline.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Coverage map liệt kê path/ray/shape và offset-distance/rotate/anchor được reference chấp nhận trước khi code.
-- [ ] Box, glyph và link rectangle dùng cùng transform, kể cả page boundary.
-- [ ] Không thêm các cú pháp mà Takumi không hỗ trợ vào phạm vi parity bắt buộc.
+- [x] Coverage map liệt kê path/ray/shape và offset-distance/rotate/anchor được reference chấp nhận trước khi code. (`scripts/pdf-coverage-map.json` chỉ chứa khai báo test Rust của takumi-pdf, không có case offset-path; phạm vi cú pháp pinned — `offset_path.rs`: `ray()` với size/`contain`/`at`, `path()`, basic shape, coord box, `offset-position`/`-anchor`/`-rotate`/`-distance` — ghi ở `docs/PDF_AUDIT.md` và có probe từng loại.)
+- [ ] Box, glyph và link rectangle dùng cùng transform, kể cả page boundary. (Box/chữ/link khớp oracle cả viewport lẫn phân trang; còn region rỗng và thứ tự vẽ ở ranh giới trang chung cho transform xoay, xem trạng thái.)
+- [x] Không thêm các cú pháp mà Takumi không hỗ trợ vào phạm vi parity bắt buộc. (`url()` không phải motion path ở cả hai, `paint.motion.url-not-a-path`.)
 
 **Kiểm tra:** Fixture offset_path_ray_burst và các fixture offset_path khác; compare visual bounds, text ownership và links.
 
@@ -611,3 +611,7 @@ Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.
 ## 2026-11-23 form-control text, unicode-bidi, ellipsis/RTL, tabs/soft hyphen (task 08–10, 28, 29)
 
 Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, provenance `source-build-wasm-local-rustc-1.97`). Lưu ý: chạy audit phải đặt `BM_RENDER_BACKEND=wasm` khi chưa build native trong worktree — nếu không `js/node-pdf.mjs` lấy addon native của gói npm đã publish (bản cũ) và báo 36 fail thay vì 23. Baseline (HEAD `a8a41d4`, wasm): strict audit 1.619 probe, 1.596 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER. Probe mới `scripts/pdf-audit/text-tails.probe.mjs` (151 probe: `text.form.*`, `text.bidi-override.*`, `text.overflow-tail.*`, `text.whitespace.*`; draw list + pdftotext + pdf.js + raster 2x): 103/151 pass trên wasm baseline, 151/151 sau sửa. Sau thay đổi: audit 1.770 probe, 1.747 pass, cùng 23 fail như baseline, giống hệt trên wasm và native; golden không đổi (125/10/1 trên cả hai backend); PDF Zig 745/745 (+4 test mới trong `src/pdf/filelayer_tests.zig`, mỗi test fail trước fix); `zig build test` 723 pass / 21 skip; `test:pdf` 399/399 trên wasm và native; `test:pdf:chunks` tương đương cả hai backend; `test:pdf:memory` pass (×1,036 / ×1,064). File đổi: `src/text_control.zig`, `src/font/text.zig`, `src/render.zig`, `src/pdf/emit_text.zig`, `src/pdf/filelayer_tests.zig`, `scripts/pdf-audit/text-tails.probe.mjs` (mới), `scripts/pdf-audit/text-semantics.probe.mjs` (tolerance soft hyphen về 0), `docs/PDF_AUDIT.md`. Khác biệt còn lại (đều có probe `differs` và dòng trong `PDF_AUDIT.md`): width của text field block-level/flex (bm theo Blink), textarea cao hơn trang (lỗi upstream), marker sau span cao hơn (lỗi upstream), truncate run RTL trong dòng LTR (chưa sửa), `tab-size: <length>` (takumi không hỗ trợ), màu hyphen của soft hyphen mở đầu span (chưa sửa).
+
+## 2026-11-23 SVG text, textPath, CSS của inline SVG, relative colors, offset-path (task 13–15, 23–24)
+
+Oracle pinned build lại từ `ff9a5d4` như mốc trên (rustc 1.97, wasm-bindgen 0.2.129). Baseline (HEAD `a8a41d4`, wasm): strict audit 1.619 probe, 1.596 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 741/741; `zig build test` 719 pass / 21 skip; `test:pdf` 399/399; `test:pdf:chunks` tương đương. Sau thay đổi: audit 1.790 probe (+171 mới), 1.767 pass, cùng đúng 23 fail của baseline (không fail mới); 44 probe mới fail ở HEAD (đo bằng cùng file probe trên wasm build từ HEAD), nay pass. Golden không đổi (125/10/1, cùng từng fixture); PDF Zig 745/745 (+4 test mới, mỗi test fail trước fix); `zig build test` 723 pass / 21 skip (oracle ảnh 850/850); `test:pdf` 399/399; `test:pdf:chunks` tương đương. Renderer ảnh: bench equivalence với `@takumi-rs/wasm` 250 case, không case nào đổi verdict (81 identical, còn lại equivalent). Chỉ đo wasm; native chưa build lại ở mốc này. Phần còn mở ghi ở trạng thái task 13, 15, 24: letter-spacing tại khoảng trắng Arabic (engine chữ chung), synthetic bold / COLR trong SVG text, selector đầy đủ cho `<style>` của SVG độc lập, region rỗng và thứ tự vẽ của box xoay ở ranh giới trang (task 03/05).

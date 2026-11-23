@@ -5,6 +5,7 @@
 // do different pixels.
 import zlib from "node:zlib";
 import { cases, cmp, dataUri, fileBytes, probeAs, summary, svgUri, vp } from "./paint.probe.mjs";
+import { INTER } from "./lib.mjs";
 
 const b64 = (buf, mime) => `data:${mime};base64,${Buffer.from(buf).toString("base64")}`;
 // inside a <div>: an <img> that is the only top-level element is stretched to the viewport by bm-render (images.root-img)
@@ -429,6 +430,162 @@ cases("images.svg-background", "SVG as background-image / mask / border-image", 
   ["as-mask-image", `<div style="margin:10px;width:60px;height:40px;background:#06c;mask-image:url(${svgUri(svg(`<circle cx="20" cy="20" r="15"/>`))});mask-repeat:no-repeat"></div>`],
   ["as-list-style-image", `<ul style="font:14px Inter;list-style-image:url(${svgUri(svg(`<circle cx="20" cy="20" r="15" fill="#c00"/>`, `width="8" height="8" viewBox="0 0 40 40"`))})"><li>a</li></ul>`],
 ], vp(100, 80));
+
+// ------------------------------------------------------------------------------------------------ SVG text (tasks 13-14)
+
+// Per-character position lists, rotation, anchors, spacing, baselines and shaping (takumi-core
+// svg/layout/text/*.rs). Glyphs are outlines, so the draw lists compare glyph placement.
+const textSvg = (body) => svgImg(body, `width="80" height="40" viewBox="0 0 80 40"`);
+const T = (attrs, inner) => `<text y="24" font-family="Inter" font-size="10" ${attrs}>${inner}</text>`;
+cases("images.svg-text", "SVG text: position lists, rotation, anchor, spacing, baselines", [
+  ["x-long", T(`x="2 12 22 32 42 52 62"`, "abc")],
+  ["x-short", T(`x="2 30"`, "abcdef")],
+  ["y-list", T(`x="2" y="10 20 30 15"`, "abcde")],
+  ["dx-long-dy-short", T(`x="2" dx="1 2 3 4 5 6 7 8" dy="3"`, "abcd")],
+  ["invalid-list-dropped", T(`x="2 junk 30" y="24"`, "abcd")],
+  ["units-em-percent", T(`x="2 10% 2em" dx="0 0 0 .5em"`, "abcde")],
+  ["rotate-single", T(`x="2" rotate="25"`, "abcd")],
+  ["rotate-short-repeats-last", T(`x="2" rotate="0 10 40"`, "abcdef")],
+  ["rotate-long", T(`x="2" rotate="5 10 15 20 25 30 35 40 45"`, "abc")],
+  ["rotate-tspan-override", T(`x="2" rotate="10 20 30"`, `ab<tspan rotate="-40">cde</tspan>fg`)],
+  ["rotate-tspan-inherit", T(`x="2" rotate="10 20 30 40 50 60"`, `ab<tspan fill="red">cd</tspan>ef`)],
+  ["rotate-tspan-only", T(`x="2"`, `ab<tspan rotate="30 -30">cdef</tspan>gh`)],
+  ["dx-tspan-override", T(`x="2" dx="1 1 1 1 1 1"`, `ab<tspan dx="6">cd</tspan>ef`)],
+  ["x-tspan-nested", T(`x="2 10 20 30 40 50 60"`, `a<tspan>b<tspan x="45">c</tspan>d</tspan>e`)],
+  ["y-tspan-inherit", T(`x="2" y="12 16 20 24 28 32"`, `ab<tspan dy="2">cd</tspan>ef`)],
+  ["anchor-middle-dx", T(`x="40" text-anchor="middle" dx="0 4 4"`, "abcd")],
+  ["anchor-end-x-list", T(`x="70 20" text-anchor="end"`, "abcd")],
+  ["anchor-middle-rotate", T(`x="40" text-anchor="middle" rotate="0 20 40"`, "abcd")],
+  ["letter-spacing-x", T(`x="2 30" letter-spacing="3"`, "abcdef")],
+  ["letter-spacing-anchor-end", T(`x="78" letter-spacing="2" text-anchor="end"`, "abcd")],
+  ["word-spacing-dx", T(`x="2" word-spacing="8" dx="0 0 2"`, "ab cd ef")],
+  ["word-spacing-nbsp-middle", T(`x="40" word-spacing="6" text-anchor="middle"`, "&#160;nb and a")],
+  ["ligature-dx", T(`x="2" dx="0 3"`, "ffia")],
+  ["ligature-letter-spacing", T(`x="2" letter-spacing="1"`, "ffia")],
+  ["kern-span-boundary", T(`x="2"`, `Av<tspan fill="red">AV</tspan>A`)],
+  ["combining-mark-x", T(`x="2 20 40 60"`, "éab")],
+  ["combining-mark-rotate", T(`x="2" rotate="0 60 0"`, "éab")],
+  ["transform-rotate", `<g transform="rotate(10 40 20)">${T(`x="2" rotate="0 30" dy="0 2"`, "abcd")}</g>`],
+  ["baseline-shift-super-dy", T(`x="2" dy="0 -3"`, `ab<tspan baseline-shift="super">cd</tspan>`)],
+  ["baseline-shift-sub-length", T(`x="2"`, `a<tspan baseline-shift="sub">b<tspan baseline-shift="3">c</tspan></tspan>d`)],
+  ["dominant-baseline-x", T(`x="2 20 40" dominant-baseline="middle"`, "abc")],
+  ["dominant-baseline-kinds", ["central", "hanging", "mathematical", "text-before-edge", "text-after-edge", "ideographic"].map((b, i) => `<text x="${2 + i * 13}" y="20" font-family="Inter" font-size="8" dominant-baseline="${b}">x</text>`).join("")],
+  ["alignment-baseline-tspan", T(`x="2"`, `a<tspan alignment-baseline="central">b</tspan><tspan alignment-baseline="before-edge">c</tspan>d`)],
+  ["space-collapse-x", T(`x="2 12 22 32 42"`, "a  b c")],
+  ["font-style-italic", T(`x="2" font-style="italic"`, "slant")],
+  ["font-variant-small-caps", T(`x="2" font-variant="small-caps"`, "Caps")],
+].map(([id, body]) => [id, textSvg(body)]), vp(120, 70));
+
+probeAs("images.svg-text.arabic-x-list-rotate", "SVG text: Arabic clusters with position lists and rotation", async (t) => {
+  const arabic = "tests/upstream/takumi/assets/fonts/sil/scheherazade-new-v17-arabic-regular.woff2";
+  for (const [label, attrs] of [["x list", `x="70 50 30"`], ["rotate", `x="40" rotate="0 20"`]])
+    await cmp(t, label, textSvg(`<text y="24" font-family="Scheherazade New Test" font-size="14" ${attrs}>مرحبا</text>`), vp(120, 70), { fonts: [INTER, arabic] });
+});
+
+const P = `<defs><path id="p" d="M4 30 Q40 0 76 30"/><path id="r" d="M76 30 Q40 0 4 30"/><path id="t" d="M0 0 L60 0" transform="translate(10 25) rotate(-10)"/><circle id="c" cx="40" cy="20" r="14"/><rect id="q" x="10" y="10" width="60" height="20"/><path id="m" d="M4 10 L30 10 M40 30 L76 30"/></defs>`;
+const TP = (attrs, inner) => `<text font-family="Inter" font-size="9" ${attrs}>${inner}</text>`;
+cases("images.svg-text-path", "SVG textPath and text decorations", [
+  ["xlink-href", P + TP("", `<textPath xlink:href="#p">xlink href</textPath>`)],
+  ["reversed-path", P + TP("", `<textPath href="#r">reversed</textPath>`)],
+  ["transformed-path", P + TP("", `<textPath href="#t">transformed</textPath>`)],
+  ["circle", P + TP("", `<textPath href="#c">around circle text</textPath>`)],
+  ["rect", P + TP("", `<textPath href="#q">rectangle path text</textPath>`)],
+  ["subpaths", P + TP("", `<textPath href="#m">two subpaths here</textPath>`)],
+  ["missing-href", P + TP(`x="4" y="20"`, `a<textPath href="#nope">bc</textPath>d`)],
+  ["offset-negative", P + TP("", `<textPath href="#p" startOffset="-10">negative</textPath>`)],
+  ["offset-beyond-end", P + TP("", `<textPath href="#p" startOffset="70">beyond end</textPath>`)],
+  ["offset-percent-middle", P + TP(`text-anchor="middle"`, `<textPath href="#p" startOffset="50%">centered</textPath>`)],
+  ["anchor-end", P + TP(`text-anchor="end"`, `<textPath href="#p" startOffset="100%">at end</textPath>`)],
+  ["tspan-dy", P + TP("", `<textPath href="#p">ab<tspan dy="-3">cd</tspan>ef</textPath>`)],
+  ["dx-list", P + TP(`dx="0 3 3"`, `<textPath href="#p">abcd</textPath>`)],
+  ["rotate-list", P + TP(`rotate="0 45 90"`, `<textPath href="#p">abcd</textPath>`)],
+  ["then-linear-text", P + TP("", `<textPath href="#p">ab</textPath>cd`)],
+  ["two-paths", P + TP("", `<textPath href="#p">top</textPath><textPath href="#m">low</textPath>`)],
+  ["letter-spacing", P + TP(`letter-spacing="2"`, `<textPath href="#p">spaced</textPath>`)],
+  ["text-x-offset", P + TP(`x="10"`, `<textPath href="#p">abc</textPath>`)],
+  ["method-side-ignored", P + TP("", `<textPath href="#p" method="stretch" spacing="auto" side="right">method</textPath>`)],
+  ["deco-tspan", TP(`x="4" y="20"`, `ab<tspan text-decoration="underline" fill="red">cd</tspan>ef`)],
+  ["deco-overline-tspan-stroke", TP(`x="4" y="20" text-decoration="overline"`, `ab<tspan stroke="blue" stroke-width=".5">cd</tspan>`)],
+  ["deco-line-through-transform", `<g transform="translate(40 20) rotate(20) scale(1.5)">${TP(`x="-20" y="3" text-decoration="line-through" fill="green"`, "struck")}</g>`],
+  ["deco-skewed-text", TP(`x="4" y="20" transform="skewX(-20)" text-decoration="underline"`, "skewed")],
+  ["deco-opacity-text", TP(`x="4" y="20" opacity=".5" text-decoration="underline"`, "half")],
+  ["deco-opacity-tspan", TP(`x="4" y="20" text-decoration="underline"`, `ab<tspan opacity=".4">cd</tspan>ef`)],
+  ["deco-fill-opacity", TP(`x="4" y="20" fill-opacity=".3" text-decoration="underline overline"`, "faint")],
+  ["deco-tspan-dy", TP(`x="4" y="20" text-decoration="underline"`, `ab<tspan dy="4">cd</tspan>ef`)],
+  ["deco-letter-spacing", TP(`x="4" y="20" text-decoration="underline" letter-spacing="2"`, "abc")],
+  ["deco-anchor-middle", TP(`x="40" y="20" text-anchor="middle" text-decoration="underline"`, "mid")],
+  ["deco-x-list", TP(`x="4 20 40" y="20" text-decoration="underline"`, "abc")],
+  ["deco-none-child", TP(`x="4" y="20" text-decoration="underline"`, `ab<tspan text-decoration="none">cd</tspan>`)],
+  ["deco-style-css", TP(`x="4" y="20" style="text-decoration:underline"`, "css")],
+  ["deco-stroke-only", TP(`x="4" y="20" fill="none" stroke="red" stroke-width=".4" text-decoration="underline"`, "stroke")],
+  ["deco-path", P + TP(`text-decoration="underline line-through"`, `<textPath href="#p">on a curve</textPath>`)],
+].map(([id, body]) => [id, textSvg(body)]), vp(120, 70));
+
+// The upstream takumi fixtures of SVG text and motion paths, rendered by both PDF engines (the
+// fixture fonts registered under their shared.css names).
+{
+  const F = (name, file) => ({ name, data: new Uint8Array(fileBytes("tests/upstream/takumi/assets/fonts/" + file)) });
+  const fonts = () => [F("Geist", "geist/Geist[wght].woff2"), F("Geist Mono", "geist/GeistMono[wght].woff2"), F("Archivo", "archivo/Archivo-VariableFont_wdth,wght.ttf"),
+    F("Scheherazade New Test", "sil/scheherazade-new-v17-arabic-regular.woff2"), F("Noto Sans Devanagari", "noto-sans/noto-sans-devanagari-v30-devanagari-regular.woff2")];
+  for (const name of ["svg_text_shaping", "svg_text_baselines", "svg_text_path_rotate", "image_svg_text", "svg_inline_page_styles", "offset_path_along_curve", "offset_path_circular_text", "offset_path_ray_burst", "offset_path_wave_text"]) {
+    probeAs(`images.svg-fixture.${name}`, "upstream takumi fixtures-html (SVG text, inline SVG, motion paths)", async (t) => {
+      const html = fileBytes(`takumi/tests/fixtures-html/${name}.html`).toString("utf8").replace(/<link[^>]*>/g, "").replace(/<base[^>]*>/g, "");
+      await cmp(t, "", html, { viewport: { width: 1200, height: 630 }, tagged: false }, { fonts: fonts() });
+    });
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ inline SVG and page CSS (task 15)
+
+probeAs("images.svg-inline.css-fill-paints", "inline <svg>: a page rule changes the paint", async (t) => {
+  // the rect has no fill of its own: black without the rule, #0a0 (0 0.667 0) with it
+  const html = `<style>svg rect{fill:#0a0}</style><div style="margin:10px"><svg width="40" height="40"><rect width="40" height="40"/></svg></div>`;
+  const r = await t.bm(html, vp(100, 80));
+  if (r.error) return t.ok(false, r.error);
+  t.ok(/\b0 0\.667?\d* 0 rg/.test(r.content(0)) && !/\b0 0 0 rg/.test(r.content(0)), "the rect is filled #0a0, not black");
+});
+
+const inl = (body, attrs = `width="40" height="40" viewBox="0 0 40 40"`) => `<svg xmlns="http://www.w3.org/2000/svg" ${attrs}>${body}</svg>`;
+const R = (a = "") => `<rect width="20" height="20" ${a}/>`;
+const host = (inner, style = "") => `<div style="margin:10px;color:#909;font:12px Inter;${style}">${inner}</div>`;
+cases("images.svg-inline-css", "inline <svg>: selectors, inheritance, var() and isolation", [
+  ["specificity-class-vs-tag", `<style>svg .a{fill:#0a0} svg rect{fill:red}</style>` + host(inl(R(`class="a"`)))],
+  ["specificity-id-vs-classes", `<style>#r{fill:#0a0} .a.b{fill:red}</style>` + host(inl(R(`id="r" class="a b"`)))],
+  ["later-rule-wins", `<style>rect{fill:red} rect{fill:#0a0}</style>` + host(inl(R()))],
+  ["rule-over-presentation-attribute", `<style>rect{fill:#0a0}</style>` + host(inl(R(`fill="red"`)))],
+  ["inherited-through-g", `<style>g.p{fill:#0a0}</style>` + host(inl(`<g class="p">${R()}</g>`))],
+  ["inherited-from-svg-root", `<style>svg{fill:#0a0}</style>` + host(inl(R()))],
+  ["current-color-from-css", `<style>rect{fill:currentColor;color:#00c}</style>` + host(inl(R()))],
+  ["current-color-svg-root", `<style>svg{color:#0a0}</style>` + host(inl(R(`fill="currentColor"`)))],
+  ["html-ancestor-fill-rule", `<style>.h{fill:#0a0}</style><div class="h" style="margin:10px">${inl(R())}</div>`],
+  ["html-ancestor-fill-style-attribute", `<div style="margin:10px;fill:#0a0">${inl(R())}</div>`],
+  ["html-grandparent-fill", `<style>section{fill:#0a0}</style><section style="margin:10px"><div>${inl(R())}</div></section>`],
+  ["html-fill-under-svg-rule", `<style>div{fill:red} svg{fill:#0a0}</style><div style="margin:10px">${inl(R())}</div>`],
+  ["html-stroke", `<style>div{stroke:#00c;stroke-width:4px}</style><div style="margin:10px">${inl(R(`fill="none" x="5" y="5"`))}</div>`],
+  ["html-fill-opacity", `<style>div{fill-opacity:.4}</style><div style="margin:10px">${inl(R(`fill="#0a0"`))}</div>`],
+  ["html-text-anchor", `<style>div{text-anchor:middle}</style><div style="margin:10px">${inl(`<text x="20" y="20" font-family="Inter" font-size="8">mid</text>`)}</div>`],
+  ["html-font-size", `<div style="margin:10px;font-size:6px;font-family:Inter">${inl(`<text x="2" y="20">size</text>`)}</div>`],
+  ["html-visibility", `<style>div{visibility:hidden}</style><div style="margin:10px">${inl(R(`fill="#0a0"`))}</div>`],
+  ["nested-svg", `<style>svg svg rect{fill:#0a0}</style>` + host(inl(`<svg x="5" y="5" width="20" height="20">${R()}</svg>`))],
+  ["nested-svg-child-combinator", `<style>svg > rect{fill:red} svg > svg > rect{fill:#0a0}</style>` + host(inl(`<svg x="5" y="5" width="20" height="20">${R()}</svg>`))],
+  ["internal-style-scoped-to-svgs", host(inl(`<style>rect{fill:#0a0}</style>` + R()) + inl(R()))],
+  ["internal-style-no-html-leak", host(inl(`<style>div{background:#f00} p{color:red}</style>` + R(`fill="#00c"`)) + `<p style="margin:0">text</p>`)],
+  ["internal-style-no-html-leak-earlier", `<div class="x" style="margin:10px;width:40px;height:10px"></div>` + host(inl(`<style>.x{background:#f00}</style>` + R(`fill="#00c"`)))],
+  ["page-css-not-in-img-svg", `<style>rect{fill:red!important}</style><div style="margin:10px"><img src="${svgUri(inl(R(`fill="#0a0"`)))}"></div>`],
+  ["img-svg-own-style", `<div style="margin:10px"><img src="${svgUri(inl(`<style>rect{fill:#0a0}</style>` + R(`fill="red"`)))}"></div>`],
+  ["structural-pseudo-class", `<style>rect:nth-child(2){fill:#0a0}</style>` + host(inl(R() + R(`x="20"`)))],
+  ["attribute-selector", `<style>rect[data-k="v"]{fill:#0a0}</style>` + host(inl(R(`data-k="v"`)))],
+  ["print-media", `<style>@media print{rect{fill:#0a0}}</style>` + host(inl(R()))],
+  ["hover-never-matches", `<style>rect:hover{fill:red}</style>` + host(inl(R(`fill="#0a0"`)))],
+  ["text-font-from-css", `<style>text{font-size:8px;fill:#0a0}</style>` + host(inl(`<text x="2" y="20" font-family="Inter">css</text>`))],
+  ["css-transform-and-stroke", `<style>rect{stroke:#00c;stroke-width:3;transform:translate(5px,5px)}</style>` + host(inl(R(`fill="#0a0"`)))],
+  ["var-root-rule", `<style>:root{--c:#0a0} rect{fill:var(--c)}</style>` + host(inl(R()))],
+  ["var-host-style-attribute", `<div style="margin:10px;--c:#0a0">${inl(R(`style="fill:var(--c)"`))}</div>`],
+  ["var-declared-on-svg", `<style>svg{--c:#0a0} rect{fill:var(--c)}</style>` + host(inl(R()))],
+  ["var-fallback", `<style>rect{fill:var(--nope, #0a0)}</style>` + host(inl(R()))],
+  ["var-in-internal-style", `<div style="margin:10px;--c:#0a0">${inl(`<style>rect{fill:var(--c)}</style>` + R())}</div>`],
+  ["var-in-presentation-attribute", `<div style="margin:10px;--c:#0a0">${inl(R(`fill="var(--c)"`))}</div>`],
+], vp(120, 80));
 
 // ------------------------------------------------------------------------------------------------ colour spaces of what is written
 

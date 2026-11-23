@@ -855,6 +855,48 @@ cases("paint.motion", "CSS motion paths", [
   ["composition", tf(`translate:5px 8px;rotate:10deg;scale:.8;offset-path:path('M0 0 L160 80');offset-distance:30%;transform:translateX(5px)`)],
 ]);
 
+// Motion paths (task 24) with the pinned reference's syntax: path() / ray() (size, `contain`, `at`) /
+// basic shapes / a coordinate box, offset-distance / -rotate / -anchor / -position. The box, its
+// text and its link annotation take one transform. A viewport with a height is the reference box;
+// paged output has none (takumi-pdf's unbounded column): the box's own height stands in.
+{
+  const mp = (s, inner = "Tx") => `<div style="position:relative;width:200px;height:120px;margin:10px;border:1px solid #999"><div style="width:60px;height:24px;background:#c33;font:14px Inter;${s}">${inner}</div></div>`;
+  const mlink = (s) => mp(s, `<a href="https://example.com/m" style="color:#fff">go</a>`);
+  const mblock = (s) => `<div style="position:relative;width:200px;height:120px;margin:10px"><a href="https://example.com/b" style="display:block;width:60px;height:24px;background:#36c;${s}">blk</a></div>`;
+  const motion = async (t, html, options) => {
+    const r = await cmp(t, "paint", html, options);
+    if (r.bm && r.ref && !r.bm.error && !r.ref.error) {
+      const { annots, sameWithin } = await import("./filelayer.util.mjs");
+      sameWithin(t, "link annotations", annots(r.bm), annots(r.ref));
+      t.same("text", r.bm.text, r.ref.text);
+    }
+  };
+  const viewport = { viewport: { width: 240, height: 160 }, tagged: false };
+  const paged = { size: { width: 300, height: 400 }, margin: 20 };
+  for (const [id, html, options] of [
+    ["path-curve-auto-text", mp("offset-path:path('M10 100 C 60 0 140 0 190 100');offset-distance:40%;offset-rotate:auto"), viewport],
+    ["ray-closest-side", mp("offset-path:ray(60deg closest-side);offset-distance:80%"), viewport],
+    ["ray-contain-at", mp("offset-path:ray(120deg farthest-corner contain at 50% 50%);offset-distance:100%"), viewport],
+    ["ray-offset-position", mp("offset-path:ray(30deg);offset-position:20% 30%;offset-distance:50%"), viewport],
+    ["circle-fixed-rotate", mp("offset-path:circle(40px at 100px 60px);offset-distance:70%;offset-rotate:45deg"), viewport],
+    ["inset-anchor-keywords", mp("offset-path:inset(10px round 10px);offset-distance:55%;offset-anchor:right bottom"), viewport],
+    ["polygon-reverse", mp("offset-path:polygon(0 0,100% 0,100% 100%);offset-distance:60%;offset-rotate:reverse"), viewport],
+    ["coord-box", mp("offset-path:border-box;offset-distance:30%"), viewport],
+    ["url-not-a-path", mp("offset-path:url(#p);offset-distance:30%"), viewport],
+    ["distance-calc", mp("offset-path:path('M0 0 H180');offset-distance:calc(20% + 10px)"), viewport],
+    ["inline-link", mlink("offset-path:path('M0 0 L160 80');offset-distance:50%;offset-rotate:auto"), viewport],
+    ["block-link-ray", mblock("offset-path:ray(45deg sides);offset-distance:40%;offset-rotate:0deg"), viewport],
+    ["paged-circle-default", `<p>x</p>${mblock("offset-path:circle();offset-distance:30%")}`, paged],
+    ["paged-polygon-percent", `<p>x</p>${mblock("offset-path:polygon(0 0,100% 0,100% 100%);offset-distance:60%")}`, paged],
+    ["paged-inset-percent", `<p>x</p>${mblock("offset-path:inset(10%);offset-distance:60%")}`, paged],
+    ["paged-coord-box", `<p>x</p>${mblock("offset-path:border-box;offset-distance:60%")}`, paged],
+    ["paged-ray-farthest-corner", `<p>x</p>${mblock("offset-path:ray(100deg farthest-corner);offset-distance:30%")}`, paged],
+    ["paged-ray-sides-at", `<p>x</p>${mblock("offset-path:ray(200deg sides at 30% 40%);offset-distance:30%")}`, paged],
+    ["paged-ray-on-first-page", `<div style="height:20px"></div>${mblock("offset-path:ray(135deg closest-side);offset-distance:70%")}`, paged],
+    ["paged-path-vh-distance", `<p>x</p>${mblock("offset-path:path('M0 0 L100 50');offset-distance:10vh")}`, paged],
+  ]) probeAs(`paint.motion.${id}`, "CSS motion paths: box, text and link transform", async (t) => { await motion(t, html, options); });
+}
+
 for (const overflow of ["scroll", "auto"]) {
   probeAs(`paint.overflow.${overflow}`, `overflow:${overflow} clips at the padding box`, async (t) => {
     const r = await t.bm(box(`overflow:${overflow};background:#eee`, scroll), vp());
@@ -975,6 +1017,72 @@ cases("paint.color", "colour spaces", [
   ["rgb-float", col("rgb(12.5% 50% 87.5%)")],
   ["rgb-none", col("rgb(none 128 0)")],
 ]);
+
+// Relative colours (task 23): pinned takumi `parse_relative_color` takes keyword channels, numbers,
+// percentages, hue angles and `none`, from an origin computed to rgba8; `calc()` channels,
+// `color(from ...)` and a `currentColor` origin are invalid (the declaration is dropped). The
+// colours resolve before gradients see them, so a stop does not change the interpolation space.
+const rel = (c, extra = "") => `<div style="width:60px;height:30px;margin:10px;background:${c};border:4px solid ${c};color:${c};font:14px Inter;${extra}">Tx</div>`;
+cases("paint.color-relative", "relative colour syntax", [
+  ["channel-swap", rel("rgb(from #336699 b g r)")],
+  ["rgba-alias-alpha", rel("rgba(from #336699 r g b / .5)")],
+  ["alpha-keyword", rel("rgb(from rgb(10 20 30 / .5) r g b / alpha)")],
+  ["alpha-from-origin", rel("rgb(from #33669980 r g b)")],
+  ["alpha-percent", rel("rgb(from red r g b / 25%)")],
+  ["alpha-clamped", rel("rgb(from red r g b / 3)")],
+  ["channel-percent", rel("rgb(from red 50% g b)")],
+  ["channel-out-of-range", rel("rgb(from red 300 g -20)")],
+  ["none-channel", rel("rgb(from red none g b)")],
+  ["hsl", rel("hsl(from #336699 h s 70%)")],
+  ["hsl-hue-units", rel("hsl(from #336699 .5turn s l)") + rel("hsl(from #336699 1rad s l)") + rel("hsl(from #336699 100grad s l)")],
+  ["hwb", rel("hwb(from #336699 h w 40%)")],
+  ["lab", rel("lab(from #336699 l a 40)")],
+  ["lch-chroma-percent", rel("lch(from #336699 l 50% h)")],
+  ["oklab", rel("oklab(from #336699 l a b)")],
+  ["oklch-out-of-gamut-clipped", rel("oklch(from #336699 .9 .4 h)")],
+  ["nested-origin", rel("rgb(from hsl(from red 120deg s l) r g b)")],
+  ["origin-transparent", rel("rgb(from transparent r g 255 / 1)")],
+  ["origin-color-mix", rel("rgb(from color-mix(in srgb, red, blue) r g b)")],
+  ["origin-oklch", rel("rgb(from oklch(.7 .1 200) r g b)")],
+  ["calc-channel-invalid", rel("rgb(from red calc(r - 100) g b)")],
+  ["current-color-origin-invalid", rel("rgb(from currentColor r g b)", "color:#0a0")],
+  ["color-function-from-invalid", rel("color(from red srgb r g b)")],
+  ["trailing-junk-invalid", rel("rgb(from red r g b junk)")],
+  ["var-origin", rel("rgb(from var(--c) r g b)", "--c:#0a0")],
+  ["var-channel", rel("rgb(from red var(--g) g b)", "--g:20")],
+  ["var-whole-colour", rel("var(--rc)", "--rc:rgb(from #336699 b g r)")],
+  ["inherited-as-current-color", `<div style="color:rgb(from #336699 b g r)"><div style="width:60px;height:30px;margin:10px;border:4px solid currentColor;font:14px Inter">Tx</div></div>`],
+  ["box-shadow", `<div style="width:40px;height:20px;margin:20px;box-shadow:4px 4px 0 rgb(from #336699 b g r / .5)"></div>`],
+  ["text-shadow", `<div style="margin:10px;font:20px Inter;text-shadow:2px 2px 0 rgb(from red r 200 b)">Tx</div>`],
+  ["svg-fill-inline", `<div style="margin:10px"><svg width="20" height="20"><rect width="20" height="20" fill="rgb(from #336699 b g r)"/></svg></div>`],
+  ["svg-fill-image", `<div style="margin:10px"><img src="${svgUri(`<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="rgb(from #336699 b g r)"/></svg>`)}"></div>`],
+], vp(140, 80));
+
+probeAs("paint.color-relative.values", "relative colours: the written colour values", async (t) => {
+  const r = await t.bm(rel("rgb(from #336699 b g r / .5)"), vp(140, 80));
+  if (r.error) return t.ok(false, r.error);
+  // b g r of #336699 = 153 102 51 at half alpha: 0.6 0.4 0.2 rg with a 0.5 fill alpha
+  t.ok(/0\.6 0\.4 0\.2 rg/.test(r.content(0)), "channels swapped (0.6 0.4 0.2 rg)");
+  const bad = await t.bm(rel("rgb(from red calc(r - 100) g b)", "background:#0a0"), vp(140, 80));
+  if (!bad.error) t.ok(!/1 0 0 rg/.test(bad.content(0)), "an unsupported calc() channel drops the declaration (no red)");
+});
+
+// A relative colour is not a legacy colour: a gradient with one interpolates in Oklab, as takumi-core
+// decides (`peeks_modern_color_function`). takumi-pdf then writes every gradient in sRGB, the
+// deliberate difference of paint.gradient.linear-in-oklab (docs/PDF_AUDIT.md), so this probe checks
+// bm-render against its own explicit `in oklab` gradient instead of against the reference.
+probeAs("paint.color-relative.gradient-interpolation", "relative colours in gradients: Oklab interpolation", async (t) => {
+  const grad = (g) => `<div style="width:80px;height:30px;margin:10px;background:linear-gradient(${g})"></div>`;
+  for (const [label, relative, explicit] of [
+    ["rgb(from)", "90deg, rgb(from red r g 200), rgb(from blue r 128 b)", "90deg in oklab, rgb(255 0 200), rgb(0 128 255)"],
+    ["oklch(from)", "90deg, oklch(from red l c h), blue", "90deg in oklab, red, blue"],
+  ]) {
+    const a = await t.bm(grad(relative), vp(140, 80));
+    const b = await t.bm(grad(explicit), vp(140, 80));
+    if (a.error || b.error) { t.ok(false, `${label}: ${a.error || b.error}`); continue; }
+    t.ok(JSON.stringify(canonPages(a)) === JSON.stringify(canonPages(b)), `${label}: same gradient as an explicit \`in oklab\` one`);
+  }
+});
 
 // ------------------------------------------------------------------------------------------------ form controls, misc
 

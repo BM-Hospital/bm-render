@@ -14,11 +14,14 @@
 //! `currentColor`, linear / radial gradients and patterns (`href` chains, both unit systems),
 //! `paint-order`, `vector-effect: non-scaling-stroke`, `visibility`, `display`.
 //!
-//! Text uses shaped glyph outlines, inherited position lists, per-character rotation,
-//! textPath placement and text decorations with their declaring element's paint.
+//! Text uses shaped glyph outlines, inherited position lists, per-character rotation about the
+//! cluster origin, anchors over the advances, letter / word spacing, dominant / alignment
+//! baselines and `baseline-shift`, synthetic oblique, textPath placement, text decorations with
+//! their declaring element's paint, and `tspan` opacity groups.
 //! Not ported:
-//! `context-fill` / `context-stroke`, `transform-origin`, the root's `background-color`, and
-//! takumi's op budget. Markup that is not SVG makes `draw` return false (nothing drawn).
+//! `context-fill` / `context-stroke`, `transform-origin`, the root's `background-color`, synthetic
+//! bold and COLR layers of text glyphs, and takumi's op budget. Markup that is not SVG makes
+//! `draw` return false (nothing drawn).
 const std = @import("std");
 const sf = @import("emit_surface.zig");
 const geom = @import("emit_geom.zig");
@@ -1444,17 +1447,91 @@ const Layout = struct {
         positions: std.ArrayList(text_position.Position) = .empty,
         st: sstyle.Style,
         flow: u32 = NONE,
+        span: SpanCtx = .{},
+        /// `alignment-baseline` of the element holding the characters (not inherited).
+        alignment: []const u8 = "",
     };
+    /// What a `tspan` / `textPath` / `a` passes to the characters below it (takumi `TextElement`):
+    /// the product of their opacities and their stacked `baseline-shift`s. The `text` element's own
+    /// opacity groups the whole text and its `baseline-shift` does not apply.
+    const SpanCtx = struct {
+        opacity: f32 = 1,
+        /// `baseline-shift` lengths, in user units
+        shift: f32 = 0,
+        /// superscripts less subscripts, each half the height of the font
+        supers: i32 = 0,
+
+        fn enter(ctx: SpanCtx, n: *const dom.Node, font_size: f32, in_clip: bool) SpanCtx {
+            var out = ctx;
+            if (!in_clip) if (n.decl(.opacity)) |v| {
+                out.opacity *= sstyle.opacity(v) orelse 1;
+            };
+            const v = num.trim(n.decl(.baseline_shift) orelse return out);
+            if (std.mem.eql(u8, v, "sub")) {
+                out.supers -= 1;
+            } else if (std.mem.eql(u8, v, "super")) {
+                out.supers += 1;
+            } else if (num.parseLength(v)) |length| {
+                const px = num.resolve(length, font_size, font_size);
+                if (std.math.isFinite(px)) out.shift += px;
+            }
+            return out;
+        }
+    };
+
+    /// How far a span's text moves down: its stacked `baseline-shift`, and the baseline that
+    /// `alignment-baseline` (else `dominant-baseline`) names put where the alphabetic one was
+    /// (takumi `SpanStyle::baseline_shift`, Blink `FontMetrics::FloatAscent`).
+    fn baselineShift(face: *const font.Font, size: f32, sg: *const Seg) f32 {
+        const m = face.lineMetrics();
+        const upem: f32 = @floatFromInt(@max(face.units_per_em, 1));
+        const ascent = @round(@as(f32, @floatFromInt(m.ascent)) * size / upem);
+        const descent = @round(@as(f32, @floatFromInt(@abs(m.descent))) * size / upem);
+        const height = ascent + descent;
+        const xh_units = face.xHeight();
+        const x_height = if (xh_units > 0) @as(f32, @floatFromInt(xh_units)) * size / upem else ascent * 0.56;
+        const Baseline = enum { alphabetic, central, under, x_middle, math, hanging, over };
+        const keyword = struct {
+            fn of(v: []const u8, alignment: bool) ?Baseline {
+                const t = num.trim(v);
+                const eq = std.mem.eql;
+                if (alignment and (eq(u8, t, "before-edge") or eq(u8, t, "text-before-edge"))) return .over;
+                if (alignment and (eq(u8, t, "after-edge") or eq(u8, t, "text-after-edge"))) return .under;
+                if (alignment) {
+                    if (eq(u8, t, "alphabetic")) return .alphabetic;
+                } else if (eq(u8, t, "text-before-edge")) return .over else if (eq(u8, t, "text-after-edge")) return .under;
+                if (eq(u8, t, "middle")) return .x_middle;
+                if (eq(u8, t, "central")) return .central;
+                if (eq(u8, t, "ideographic")) return .under;
+                if (eq(u8, t, "hanging")) return .hanging;
+                if (eq(u8, t, "mathematical")) return .math;
+                return if (alignment) null else .alphabetic;
+            }
+        };
+        const baseline = keyword.of(sg.alignment, true) orelse keyword.of(sg.st.dominant_baseline, false).?;
+        const float_ascent = switch (baseline) {
+            .alphabetic => ascent,
+            .central => height / 2,
+            .under => height,
+            .x_middle => ascent - x_height / 2,
+            .math => ascent * 0.5,
+            .hanging => ascent * 0.2,
+            .over => 0,
+        };
+        const shift = sg.span.shift + @as(f32, @floatFromInt(sg.span.supers)) * height / 2;
+        return -shift + (ascent - float_ascent);
+    }
     const DecorationSpan = struct { seg: usize, face: font.FaceId, size: f32, width: f32, tf: Affine, dx: f32, dy: f32, rotate: f32 };
 
-    fn collectText(l: *Layout, idx: u32, st: *const sstyle.Style, sc: *const Scope, segs: *std.ArrayList(Seg), prev_space: *bool, scopes: *[17]text_position.Scope, flow: u32, depth: u32) Error!void {
+    fn collectText(l: *Layout, idx: u32, st: *const sstyle.Style, sc: *const Scope, segs: *std.ArrayList(Seg), prev_space: *bool, scopes: *[17]text_position.Scope, flow: u32, depth: u32, span: SpanCtx) Error!void {
         if (depth > 16) return;
         scopes[depth] = text_position.Scope.init(l.node(idx), st.font_size);
+        const alignment = l.node(idx).decl(.alignment_baseline) orelse "";
         var ch = l.node(idx).first_child;
         while (ch != NONE) : (ch = l.node(ch).next_sibling) {
             const c = l.node(ch);
             if (c.tag == .textnode) {
-                var seg: Seg = .{ .st = st.*, .flow = flow };
+                var seg: Seg = .{ .st = st.*, .flow = flow, .span = span, .alignment = alignment };
                 var at: usize = 0;
                 while (at < c.text.len) {
                     const b = c.text[at];
@@ -1472,7 +1549,7 @@ const Layout = struct {
                     // An absolute character position starts a separately anchored text chunk.
                     if ((pos.x != null or pos.y != null) and seg.text.items.len > 0) {
                         try segs.append(l.a, seg);
-                        seg = .{ .st = st.*, .flow = flow };
+                        seg = .{ .st = st.*, .flow = flow, .span = span, .alignment = alignment };
                     }
                     pos.byte = @intCast(seg.text.items.len);
                     try seg.positions.append(l.a, pos);
@@ -1484,7 +1561,7 @@ const Layout = struct {
             } else if (c.tag == .tspan or c.tag == .a or (c.tag == .textPath and depth == 0)) {
                 if (!display(c)) continue;
                 const cst = l.styleOf(c, st);
-                try l.collectText(ch, &cst, sc, segs, prev_space, scopes, if (c.tag == .textPath) ch else flow, depth + 1);
+                try l.collectText(ch, &cst, sc, segs, prev_space, scopes, if (c.tag == .textPath) ch else flow, depth + 1, span.enter(c, cst.font_size, sc.in_clip));
             }
         }
     }
@@ -1499,7 +1576,7 @@ const Layout = struct {
         var segs: std.ArrayList(Seg) = .empty;
         var prev_space = true;
         var scopes: [17]text_position.Scope = undefined;
-        try l.collectText(idx, st, sc, &segs, &prev_space, &scopes, NONE, 0);
+        try l.collectText(idx, st, sc, &segs, &prev_space, &scopes, NONE, 0, .{});
         // strip the trailing space
         while (segs.items.len > 0) {
             const last = &segs.items[segs.items.len - 1];
@@ -1540,13 +1617,21 @@ const Layout = struct {
                     fams[k][nf] = t;
                     nf += 1;
                 }
-                var positioned = false;
-                for (sg.positions.items) |p| if (p.byte > 0 and p.addressed) {
-                    positioned = true;
-                };
-                runs[k] = .{ .text = sg.text.items, .style = .{ .families = fams[k][0..nf], .weight = weightOf(sg.st.font_weight), .size = sg.st.font_size, .user = @intCast(k), .features = if (positioned) &.{ .{ .tag = "liga".*, .value = 0 }, .{ .tag = "clig".*, .value = 0 } } else &.{} } };
+                // Spans of one font shape as one run, so kerning joins characters across a span
+                // boundary; positioned characters keep their ligatures (takumi `TextChunk::shape`).
+                runs[k] = .{ .text = sg.text.items, .style = .{
+                    .families = fams[k][0..nf],
+                    .weight = weightOf(sg.st.font_weight),
+                    .italic = italicOf(sg.st.font_style),
+                    .stretch = stretchOf(sg.st.font_stretch),
+                    .caps = if (std.mem.eql(u8, num.trim(sg.st.font_variant), "small-caps")) .small else .normal,
+                    .size = sg.st.font_size,
+                    .user = @intCast(k),
+                    .letter_spacing = sg.st.letter_spacing,
+                    .word_spacing = sg.st.word_spacing,
+                } };
             }
-            const tl = font.layoutText(l.a, fonts, runs, .{ .white_space = .pre }) catch return;
+            const tl = font.layoutText(l.a, fonts, runs, .{ .white_space = .pre, .item_origin = true }) catch return;
             if (tl.lines.len == 0) {
                 i = j;
                 continue;
@@ -1574,8 +1659,13 @@ const Layout = struct {
             }
             var shift: f32 = 0;
             const anchor = num.trim(chunk[0].st.text_anchor);
-            const width = line.width + acc[0];
+            // The anchor aligns the advances of the chunk's clusters, without their `dx`
+            // (takumi `clusters_length`).
+            const width = line.width;
             if (std.mem.eql(u8, anchor, "middle")) shift = -width / 2 else if (std.mem.eql(u8, anchor, "end")) shift = -width;
+            // each span's baseline shift, from the primary face of its first glyph
+            const baseline = try l.a.alloc(?f32, chunk.len);
+            @memset(baseline, null);
             const paths = try l.a.alloc(Path, chunk.len);
             for (paths) |*p| p.* = .{};
             var decoration_spans: std.ArrayList(DecorationSpan) = .empty;
@@ -1590,9 +1680,11 @@ const Layout = struct {
                 const face = fonts.face(g.face);
                 const s = g.size / @as(f32, @floatFromInt(face.font.units_per_em));
                 const pos = off[@min(g.cluster, off.len - 1)];
-                const gx = pen_x + shift + g.x + pos.dx;
-                const gy = pen_y + (g.y - line.baseline) + pos.dy;
-                var tf = Affine.translate(gx, gy).mul(Affine.rotate(pos.rotate * (std.math.pi / 180.0))).mul(Affine.scale(s, -s));
+                const bs = baseline[k] orelse blk: {
+                    const v = baselineShift(&face.font, chunk[k].st.font_size, &chunk[k]);
+                    baseline[k] = v;
+                    break :blk v;
+                };
                 if (gi >= cluster_end) {
                     cluster_start = gi;
                     cluster_end = gi + 1;
@@ -1600,12 +1692,20 @@ const Layout = struct {
                     const end_x = if (cluster_end < glyphs.len) glyphs[cluster_end].x else line.width;
                     cluster_advance = @max(0, end_x - g.x);
                 }
+                // A rotated cluster turns around its own origin, carrying the offsets of its later
+                // glyphs (marks, decomposed parts) with it (takumi `cluster.transform`).
+                // (the pen before the cluster: its first glyph's own offset turns with it)
+                const pen_before = if (cluster_start > 0) glyphs[cluster_start - 1].x_end else line.x;
+                const cluster_x = if (std.math.isFinite(pen_before)) pen_before else glyphs[cluster_start].x;
+                var tf = Affine.translate(pen_x + shift + cluster_x + pos.dx, pen_y + pos.dy + bs)
+                    .mul(Affine.rotate(pos.rotate * (std.math.pi / 180.0)))
+                    .mul(Affine.translate(g.x - cluster_x, g.y - line.baseline)).mul(Affine.scale(s, -s));
                 if (flow) |along| {
                     if (gi == cluster_start) {
                         const advance = cluster_advance;
                         const half = advance / 2;
                         if (along.path.sampleSvg(pen_x + shift + along.offset + g.x + pos.dx + half)) |sample| {
-                            cluster_tf = Affine.translate(sample.x, sample.y).mul(Affine.rotate(sample.angle)).mul(Affine.translate(-half, pos.dy)).mul(Affine.rotate(pos.rotate * (std.math.pi / 180.0)));
+                            cluster_tf = Affine.translate(sample.x, sample.y).mul(Affine.rotate(sample.angle)).mul(Affine.translate(-half, pos.dy + bs)).mul(Affine.rotate(pos.rotate * (std.math.pi / 180.0)));
                             next_pen = .{ sample.x + advance, sample.y };
                         } else cluster_tf = null;
                     }
@@ -1625,7 +1725,10 @@ const Layout = struct {
                 var sink: raster.PathSink = .{ .path = &raw, .alloc = l.a };
                 _ = face.font.outlineResolved(g.gid, g.size, &sink);
                 if (sink.err) return error.OutOfMemory;
-                try gp.addPath(l.a, &raw, tf);
+                // synthetic oblique of a face that is not italic (the shear of text runs,
+                // emit_text.zig `synthetic_italic`, in the outline's y-up units)
+                const oblique = runs[k].style.italic and !face.italic;
+                try gp.addPath(l.a, &raw, if (oblique) tf.mul(.{ .c = 0.25 }) else tf);
                 try paths[k].addPath(l.a, &gp, .identity);
             }
             var bounds: ?Rect = null;
@@ -1648,8 +1751,15 @@ const Layout = struct {
                 };
             }
             for (chunk, paths, decorations) |*sg, *glyph_path, *lines| {
-                if (!sg.st.visible) continue;
+                if (!sg.st.visible or sg.span.opacity <= 0) continue;
                 const b = bounds orelse continue;
+                // A span under a translucent `tspan` / `textPath` / `a` paints its decorations and
+                // glyphs as one group with that opacity (takumi `TextPainter::paint_span`).
+                const target = if (sg.span.opacity < 1) blk: {
+                    const g = try l.newGroup(out.abs);
+                    g.opacity = sg.span.opacity;
+                    break :blk g;
+                } else out;
                 for (0..4) |part| {
                     var text_style = sg.st;
                     const p = if (part == 2) glyph_path else &lines[if (part == 3) 2 else part];
@@ -1675,14 +1785,18 @@ const Layout = struct {
                     if (fill == null and stroke == null) continue;
                     const sh = try l.a.create(Shape);
                     sh.* = .{ .path = p.*, .bounds = b, .visible = true, .fill = fill, .stroke = stroke, .stroke_first = (sg.st.paint_order & 3) == 1 };
-                    try out.kids.append(l.a, .{ .shape = sh });
+                    try target.kids.append(l.a, .{ .shape = sh });
+                }
+                if (target != out and target.kids.items.len > 0) {
+                    target.finish();
+                    try out.kids.append(l.a, .{ .group = target });
                 }
             }
             if (next_pen) |p| {
                 pen_x = p[0];
                 pen_y = p[1];
             } else {
-                pen_x += shift + width;
+                pen_x += shift + width + acc[0];
                 pen_y += acc[1];
             }
             i = j;
@@ -1717,6 +1831,24 @@ const Layout = struct {
         const measure = measured orelse return null;
         const offset = num.parseLength(n.attr("startOffset") orelse "0") orelse num.Length.px(0);
         return .{ .path = measure, .offset = num.resolve(offset, @floatCast(measure.length), st.font_size) };
+    }
+
+    fn italicOf(v: []const u8) bool {
+        const t = num.trim(v);
+        return std.mem.eql(u8, t, "italic") or std.mem.startsWith(u8, t, "oblique");
+    }
+
+    /// `font-stretch` in percent (keywords as CSS Fonts 4 maps them).
+    fn stretchOf(v: []const u8) f32 {
+        const t = num.trim(v);
+        const keywords = [_]struct { []const u8, f32 }{
+            .{ "ultra-condensed", 50 },  .{ "extra-condensed", 62.5 }, .{ "condensed", 75 },
+            .{ "semi-condensed", 87.5 }, .{ "normal", 100 },           .{ "semi-expanded", 112.5 },
+            .{ "expanded", 125 },        .{ "extra-expanded", 150 },   .{ "ultra-expanded", 200 },
+        };
+        for (keywords) |kw| if (std.mem.eql(u8, t, kw[0])) return kw[1];
+        if (std.mem.endsWith(u8, t, "%")) if (num.parseNumber(t[0 .. t.len - 1])) |p| if (p > 0) return p;
+        return 100;
     }
 
     fn weightOf(v: []const u8) u16 {

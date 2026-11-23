@@ -1755,6 +1755,7 @@ pub const Frame = struct {
             .dpr = o.dpr,
             .viewport_w = if (o.width) |w| @floatFromInt(w) else 0,
             .viewport_h = if (o.height) |h| @floatFromInt(h) else 0,
+            .viewport_h_unbounded = o.height == null,
             .root_font_size = 16 * o.dpr,
         };
         // (the paged-output properties are computed for the frames a PDF is drawn from only)

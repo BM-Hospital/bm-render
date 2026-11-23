@@ -72,6 +72,8 @@ pub const Context = struct {
     /// Output pixels; vw/vh resolve against these directly (not divided by dpr). Missing dimension = 0.
     viewport_w: f32,
     viewport_h: f32,
+    /// The viewport has no height (a render without one, paged output): see `Env.vh_unbounded`.
+    viewport_h_unbounded: bool = false,
     /// Root element font-size in device px (16*dpr until the root computes its own); `rem` base.
     root_font_size: f32,
     /// Font metrics for `ch` / `ex` / `cap` / `ic` units as fractions of the element's font-size
@@ -279,6 +281,7 @@ pub fn computeLayers(
             .dpr = dpr,
             .vw = if (ctx.viewport_w > 0) ctx.viewport_w else 0,
             .vh = if (ctx.viewport_h > 0) ctx.viewport_h else 0,
+            .vh_unbounded = ctx.viewport_h_unbounded,
             .em = pfs,
             .rem = rem,
             .ch = ctx.ch_width_ratio,
@@ -421,6 +424,22 @@ fn applyParsed(cx: *props.Cx, st: *const State, it: Item, p: Prop, l: *tokenizer
 
 const max_var_depth = 32;
 const max_subst_len = 64 * 1024;
+
+/// Replaces every `var()` in `text` from `list` (resolved custom properties sorted by name, as
+/// `ComputedStyle.custom_props`); `text` itself when it has none, null when a reference is
+/// invalid (inline SVG declarations, src/svg/html_cascade.zig).
+pub fn substituteVars(a: std.mem.Allocator, list: []const computed.CustomProp, text: []const u8) error{OutOfMemory}!?[]const u8 {
+    var sc: SubCtx = .{ .a = a, .list = list };
+    return sc.substitute(text, 0) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+}
+
+/// Whether `text` holds a `var()` reference.
+pub fn hasVar(text: []const u8) bool {
+    return findVar(text, 0) != null;
+}
 
 /// var() substitution against a name-sorted custom property list. While the element's own custom
 /// properties are being resolved, `state` tracks per-entry progress (cycle detection).
@@ -883,6 +902,48 @@ test "motion paths share distance wrapping, anchors and ray geometry across back
     try t.bad("offsetAnchor", "left top");
     try t.bad("offsetPath", "ray(sides)");
     try t.bad("offsetRotate", "auto reverse");
+}
+
+test "motion paths without a viewport height take the element's height as the reference box" {
+    var t = TestCx.init();
+    defer t.deinit();
+    const motion = @import("motion_path.zig");
+    t.ctx.viewport_w = 200;
+    t.ctx.viewport_h = 100;
+    // a viewport of its own height: the border box reference is 200 x 100 (300px is half its edge)
+    var s = try t.style(null,
+        \\{"offsetPath":"border-box","offsetDistance":"50%"}
+    );
+    var p = motion.sample(&s, 60, 24).?;
+    try T.expectApproxEqAbs(@as(f32, 200), p.x, 0.001);
+    try T.expectApproxEqAbs(@as(f32, 100), p.y, 0.001);
+    // paged output (takumi-pdf's unbounded column): 200 wide, as tall as the element
+    t.ctx.viewport_h_unbounded = true;
+    s = try t.style(null,
+        \\{"offsetPath":"border-box","offsetDistance":"50%"}
+    );
+    p = motion.sample(&s, 60, 24).?;
+    try T.expectApproxEqAbs(@as(f32, 200), p.x, 0.001);
+    try T.expectApproxEqAbs(@as(f32, 24), p.y, 0.001);
+    // measured once per height
+    try T.expectApproxEqAbs(@as(f32, 40), motion.sample(&s, 60, 40).?.y, 0.001);
+    // a ray's sides take the element's height too: from (100, 12) straight down to y = 24
+    s = try t.style(null,
+        \\{"offsetPath":"ray(180deg closest-side at 50% 50%)","offsetDistance":"100%"}
+    );
+    p = motion.sample(&s, 60, 24).?;
+    try T.expectApproxEqAbs(@as(f32, 24), p.y, 0.001);
+}
+
+test "var() substitution for declarations outside the cascade (inline SVG)" {
+    var t = TestCx.init();
+    defer t.deinit();
+    const list = [_]computed.CustomProp{ .{ .name = "--a", .value = "#0a0" }, .{ .name = "--b", .value = "2px" } };
+    try T.expectEqualStrings("#0a0", (try substituteVars(t.a(), &list, "var(--a)")).?);
+    try T.expectEqualStrings("2px solid", (try substituteVars(t.a(), &list, "var(--b) solid")).?);
+    try T.expectEqualStrings("red", (try substituteVars(t.a(), &list, "var(--missing, red)")).?);
+    try T.expect((try substituteVars(t.a(), &list, "var(--missing)")) == null);
+    try T.expect(hasVar("rgb(var(--x) 0 0)") and !hasVar("variable"));
 }
 
 test "initial values" {

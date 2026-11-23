@@ -105,6 +105,9 @@ pub const Env = struct {
     dpr: f32 = 1,
     vw: f32 = 0, // viewport width, output px
     vh: f32 = 0,
+    /// The viewport has no height of its own (paged output, or a render without a height): `vh`
+    /// is only the unit. CSS motion paths then take the element's height (motion_path.zig `Lazy`).
+    vh_unbounded: bool = false,
     em: f32 = 16, // font-size the `em` unit refers to (device px)
     rem: f32 = 16, // root font-size (device px)
     /// font-metric ratios relative to `em` (ch = advance of "0", ex = x-height, cap = cap height,
