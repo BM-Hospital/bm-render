@@ -15,6 +15,7 @@ const font = @import("font/font.zig");
 const raster = @import("raster/raster.zig");
 const pm = @import("paint.zig");
 const pborder = @import("paint_border.zig");
+const wmode = @import("writing_mode.zig");
 const color = if (pm.enable_color_glyphs) @import("font/color.zig") else struct {};
 const cex = if (pm.enable_color_glyphs) @import("font/color_example.zig") else struct {};
 
@@ -105,8 +106,11 @@ pub const Pass = enum(u2) { fill = 0, embolden = 1, stroke = 2 };
 /// centred stroke of width `stroke`. Untransformed fills / fake-bold strokes come from the
 /// renderer's glyph cache; everything else is rasterized into the arena.
 pub noinline fn glyphPassMask(p: *Painter, ctx: *const Ctx, g: *const font.PositionedGlyph, gx: f32, gy: f32, italic: bool, pass: Pass, stroke: f32) ?raster.Mask {
-    const bk = bucketOf(ctx.tf.mul(Affine.translate(gx, gy))) orelse return null;
-    if (ctx.plain() and g.size <= 400 and pass != .stroke) {
+    // (an upright glyph of vertical text is turned back against its line's turn: writing_mode.zig)
+    const gt = if (g.upright) uprightAffine(p, g, gx - g.x, gy - g.y) else Affine.translate(gx, gy);
+    const net = ctx.tf.mul(gt);
+    const bk = bucketOf(net) orelse return null;
+    if ((ctx.plain() or (g.upright and net.isTranslateOnly())) and g.size <= 400 and pass != .stroke) {
         const synth: u2 = @as(u2, @intFromBool(italic)) | (@as(u2, @intFromEnum(pass)) << 1);
         const gm = glyphMask(p, g.face, g.gid, g.size, bk.sx, synth) orelse return null;
         if (gm.w == 0 or gm.h == 0) return null;
@@ -120,6 +124,12 @@ pub noinline fn glyphPassMask(p: *Painter, ctx: *const Ctx, g: *const font.Posit
     m.bounds.x +|= bk.ox;
     m.bounds.y +|= bk.oy;
     return m;
+}
+
+/// Glyph-space transform of upright glyph `g` of a vertical line layout drawn at offset (`ox`, `oy`).
+fn uprightAffine(p: *Painter, g: *const font.PositionedGlyph, ox: f32, oy: f32) Affine {
+    const t = wmode.uprightTf(p.f, g);
+    return .{ .a = t.a, .b = t.b, .c = t.c, .d = t.d, .e = t.e + ox, .f = t.f + oy };
 }
 
 /// takumi 2.20.0 (the oracle) always paints the text stroke after the fill, whatever `paint-order`
@@ -635,7 +645,21 @@ noinline fn paintGlyphPhase(p: *Painter, ctx: *const Ctx, tl: *const font.TextLa
 
 pub noinline fn paintText(p: *Painter, ctx: *const Ctx, n: *const Node, x: f32, y: f32, cw: f32) Error!void {
     const f = p.f;
+    if (wmode.vmOf(n.cs) != 0) {
+        // vertical text: the logical lines drawn turned 90 degrees clockwise
+        const id = f.nodeId(n);
+        const tl = (try f.textLayout(id, cw)) orelse return;
+        const t = wmode.lineTransform(f, id, tl, x, y, cw);
+        var vc = ctx.*;
+        vc.tf = ctx.tf.mul(.{ .a = t.a, .b = t.b, .c = t.c, .d = t.d, .e = t.e, .f = t.f });
+        return paintLines(p, &vc, n, tl, 0, 0, wmode.logicalContent(f, id)[0]);
+    }
     const tl = (try f.textLayout(f.nodeId(n), cw)) orelse return;
+    return paintLines(p, ctx, n, tl, x, y, cw);
+}
+
+noinline fn paintLines(p: *Painter, ctx: *const Ctx, n: *const Node, tl: *const font.TextLayout, x: f32, y: f32, cw: f32) Error!void {
+    const f = p.f;
     if (tl.boxes.len > 0) try paintInlineBoxes(p, ctx, n, tl, x, y);
     if (n.cs.text_shadow.len > 0 and n.cs.visibility == .visible) try paintTextShadows(p, ctx, n, tl, x, y, cw);
 

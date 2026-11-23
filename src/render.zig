@@ -19,6 +19,7 @@ const paint = @import("paint.zig");
 const bump = @import("bump.zig");
 const config = @import("config.zig");
 const dom_mod = @import("dom.zig");
+const wmode = @import("writing_mode.zig");
 const css = @import("css/css.zig");
 const twc = @import("tw/tw.zig");
 const html = @import("html/html.zig");
@@ -1807,6 +1808,8 @@ pub const Frame = struct {
         // (PDF list markers: src/pdf/markers.zig, gated by `listMarkers`)
         if (comptime config.enable_pdf) if (f.listMarkers()) try @import("pdf/markers.zig").generate(f);
         try @import("generated_content.zig").generate(f);
+        // (vertical writing modes holding unsupported content are laid out horizontally)
+        try wmode.fallback(f);
         // (PDF: named pages, the `page` property: src/pdf/page_names.zig)
         if (comptime config.enable_pdf) if (f.tree.paged.pdf) try @import("pdf/page_names.zig").collect(f);
     }
@@ -1863,11 +1866,15 @@ pub const Frame = struct {
             },
             if (o.height) |h| .{ .definite = @floatFromInt(h) } else .max_content,
         };
+        // (orthogonal flows in a containing block of indefinite block size: the viewport, CSS Writing
+        // Modes 4 §7.3)
+        f.tree.ortho_avail = .{ if (o.width) |w| @floatFromInt(w) else std.math.nan(f32), if (o.height) |h| @floatFromInt(h) else std.math.nan(f32) };
         f.tree.compute(f.lroot, avail, f, measureCb, .{ .quantize64 = true, .baseline = baselineCb, .inline_fn = inlineCb }) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return f.fail("node tree is nested too deeply", ""),
         };
         if (f.layout_oom) return error.OutOfMemory;
+        wmode.physicalize(f);
         @import("memtrace.zig").mark("frame: laid out");
         if (comptime layout.fragment.enabled) if (f.tree.paged.page_h > 0) {
             // (any length of content, even none, makes pages: the canvas is one page area)
@@ -3444,7 +3451,19 @@ pub const Frame = struct {
         // the root element establishes a block formatting context (its margins never collapse with
         // its children's)
         if (id == f.root) st.flow_root = true;
+        // vertical writing modes: the box is placed in its parent's logical space; an orthogonal flow
+        // root lays its content out in its own (writing_mode.zig)
+        const space = wmode.spaceOf(f, id);
+        const own = wmode.vmOf(n.cs);
+        var inner: ?*layout.Style = null;
+        if ((space == 0) != (own == 0)) {
+            inner = try f.a.create(layout.Style);
+            inner.?.* = st;
+            wmode.transpose(inner.?, own);
+        }
+        wmode.transpose(&st, space);
         const lid = f.tree.addNode(st) catch return error.OutOfMemory;
+        if (inner) |s| f.tree.setOrtho(lid, s, own != 0);
         f.nodes.items[id].lid = lid;
         while (f.lid_node.items.len <= lid) try f.lid_node.append(f.a, none);
         f.lid_node.items[lid] = id;
@@ -3502,22 +3521,16 @@ pub const Frame = struct {
         const id = f.lid_node.items[lid];
         if (id == none) return .{ 0, 0 };
         const n = &f.nodes.items[id];
-        if (n.kind == .image) {
-            const iw = n.img_w;
-            const ih = n.img_h;
-            const r = n.img_ratio;
-            if (known[0]) |w| {
-                if (known[1]) |h| return .{ w, h };
-                return .{ w, if (r > 0) w / r else ih };
-            }
-            if (known[1]) |h| return .{ if (r > 0) h * r else iw, h };
-            if (iw > 0 or ih > 0 or !(r > 0)) return .{ iw, ih };
-            // ratio only (SVG with just a viewBox): fill the available width
-            return switch (avail[0]) {
-                .definite => |w| .{ w, w / r },
-                else => .{ 0, 0 },
-            };
+        if (n.kind == .image and wmode.vmOf(n.cs) != 0) {
+            // (an image laid out in a vertical space: its natural size transposed)
+            var w = n.*;
+            w.img_w = n.img_h;
+            w.img_h = n.img_w;
+            if (n.img_ratio > 0) w.img_ratio = 1 / n.img_ratio;
+            const r = measureImage(&w, .{ known[1], known[0] }, .{ avail[1], avail[0] });
+            return .{ r[1], r[0] };
         }
+        if (n.kind == .image) return measureImage(n, known, avail);
         const p = n.para orelse return .{ known[0] orelse 0, known[1] orelse 0 };
         // (percentage edges of inline boxes: against the width once it is known, 0 in intrinsic sizing)
         p.setPercentBase(known[0] orelse 0);
@@ -3533,6 +3546,24 @@ pub const Frame = struct {
         // (the min-content width may exceed the widest line it produces: inline edges, see text.zig)
         const w = if (avail[0] == .min_content) @max(sz.width, limit orelse 0) else sz.width;
         return .{ known[0] orelse w, known[1] orelse sz.height };
+    }
+
+    /// Size of image node `n` (`measureCb`).
+    fn measureImage(n: *const Node, known: [2]?f32, avail: [2]layout.AvailableSpace) [2]f32 {
+        const iw = n.img_w;
+        const ih = n.img_h;
+        const r = n.img_ratio;
+        if (known[0]) |w| {
+            if (known[1]) |h| return .{ w, h };
+            return .{ w, if (r > 0) w / r else ih };
+        }
+        if (known[1]) |h| return .{ if (r > 0) h * r else iw, h };
+        if (iw > 0 or ih > 0 or !(r > 0)) return .{ iw, ih };
+        // ratio only (SVG with just a viewBox): fill the available width
+        return switch (avail[0]) {
+            .definite => |w| .{ w, w / r },
+            else => .{ 0, 0 },
+        };
     }
 
     /// First / last baseline of a text leaf (NaN for a leaf without line boxes, e.g. an image: the
@@ -3616,6 +3647,7 @@ pub const Frame = struct {
         }
         const tl = try f.a.create(font.TextLayout);
         tl.* = p.layoutFlow(f.a, &flow, w) catch return error.OutOfMemory;
+        if (wmode.vmOf(n.cs) == 2) wmode.mirrorLines(tl);
         if (p.has_pct_edges) try f.resolveBoxPadding(n, tl);
         n.tl = tl;
         n.tl_w = std.math.nan(f32);
@@ -3688,15 +3720,19 @@ pub const Frame = struct {
 
     /// Line layout of paragraph node `id` for painting / reporting: the one its layout pass left
     /// (inline content in a formatting context), else computed for content width `cw` (and kept).
-    pub fn textLayout(f: *Frame, id: u32, cw: f32) Error!?*const font.TextLayout {
+    pub fn textLayout(f: *Frame, id: u32, cw_in: f32) Error!?*const font.TextLayout {
         const n = &f.nodes.items[id];
         const p = n.para orelse return null;
+        // (vertical text: the lines run along the content box's height)
+        const vm = wmode.vmOf(n.cs);
+        const cw = if (vm != 0 and n.lid != none) wmode.logicalContent(f, id)[0] else cw_in;
         if (n.tl) |tl| {
             if (n.tl_w != n.tl_w or n.tl_w == cw) return tl;
         }
         const tl = try f.a.create(font.TextLayout);
         p.setPercentBase(cw);
         tl.* = p.layout(f.a, cw) catch return error.OutOfMemory;
+        if (vm == 2) wmode.mirrorLines(tl);
         if (p.has_pct_edges) try f.resolveBoxPadding(n, tl);
         n.tl = tl;
         n.tl_w = cw;
@@ -4066,6 +4102,7 @@ pub const Frame = struct {
             else => f.fail("node tree is nested too deeply", ""),
         };
         if (f.layout_oom) return error.OutOfMemory;
+        wmode.physicalize(f);
     }
 
     fn recordRowspanStarts(f: *Frame, pages: *layout.fragment.Pages) Error!void {
@@ -4603,6 +4640,8 @@ pub fn textStyle(cs: *const CS, user: u32) font.TextStyle {
         // (same member order: normal, small, all-small, petite, all-petite, unicase, titling)
         .caps = @fromBackingInt(@intCast(@backingInt(cs.font_variant_caps))),
         .synth_small_caps = cs.font_synthesis.small_caps,
+        .vertical = wmode.textOrient(cs),
+        .combine = wmode.textCombine(cs),
     };
     // style.FontVariation and font.AxisValue are both { tag: [4]u8, value: f32 }
     const V = @typeInfo(@TypeOf(ts.variations)).pointer.child;
@@ -5957,4 +5996,137 @@ test "layout2: measure() tree shape follows takumi (inline content = the block's
     out = try r.measure("{\"type\":\"text\",\"text\":\"hi\",\"style\":{\"display\":\"flex\",\"padding\":4}}", opts);
     try std.testing.expect(std.mem.startsWith(u8, out, "{\"width\":200,\"height\":"));
     try std.testing.expect(std.mem.indexOf(u8, out, "\"children\":[{\"width\":") != null);
+}
+
+// ---- vertical writing modes (writing_mode.zig)
+
+/// (the source must outlive the frame: `buf` is the caller's)
+fn wmFrame(buf: []u8, body: []const u8, opts: []const u8) !*TestFrame {
+    const src = try std.fmt.bufPrint(buf, "<!doctype html><html><head></head><body style=\"margin:0;font-size:20px;line-height:30px\">{s}</body></html>", .{body});
+    return TestFrame.init(.html, src, opts);
+}
+
+/// The paragraph node (anonymous text) inside the element with `id`.
+fn wmPara(t: *TestFrame, id: []const u8) u32 {
+    const e = nodeOfId(t, id);
+    var c = t.f.nodes.items[e].first_child;
+    while (c != none) : (c = t.f.nodes.items[c].next) if (t.f.nodes.items[c].para != null) return c;
+    return e;
+}
+
+test "writing-mode vertical-rl: lines run top to bottom, stacked right to left" {
+    var src_buf: [2048]u8 = undefined;
+    const t = try wmFrame(&src_buf, "<div id=\"v\" style=\"writing-mode:vertical-rl;height:100px;padding:5px 7px\">aaa bbb ccc ddd eee fff</div>", "{\"width\":300,\"height\":200}");
+    defer t.deinit();
+    const v = t.f.tree.layout(t.f.nodes.items[nodeOfId(t, "v")].lid);
+    const pid = wmPara(t, "v");
+    const tl = (try t.f.textLayout(pid, 0)).?;
+    try std.testing.expect(tl.lines.len >= 3);
+    // the box: its width is its block size (the lines: 30 px each, plus the padding), its height
+    // the given inline size (box-sizing: border-box)
+    try std.testing.expectEqual(@as(f32, 100), v.h);
+    try std.testing.expectEqual(@as(f32, 30) * @as(f32, @floatFromInt(tl.lines.len)) + 14, v.w);
+    try std.testing.expectEqual(@as(f32, 0), v.x);
+    // the lines are broken at the content box's height
+    for (tl.lines) |ln| try std.testing.expect(ln.width <= 90);
+    // the text sits in the content box: physical x from the left padding, y from the top one
+    const pl = t.f.tree.layout(t.f.nodes.items[pid].lid);
+    const off: [2]f32 = if (pid == nodeOfId(t, "v")) .{ pl.border.left + pl.padding.left, pl.border.top + pl.padding.top } else .{ pl.x, pl.y };
+    try std.testing.expectEqual(@as(f32, 7), off[0]);
+    try std.testing.expectEqual(@as(f32, 5), off[1]);
+    try std.testing.expectEqual(@as(f32, 90), wmode.logicalContent(&t.f, pid)[0]);
+    // the first line is the rightmost: the painters turn the line layout 90 degrees clockwise
+    const m = wmode.lineTransform(&t.f, pid, tl, 7, 5, pl.w);
+    const x0 = m.c * tl.lines[0].baseline + m.e;
+    const x1 = m.c * tl.lines[1].baseline + m.e;
+    try std.testing.expect(x0 > x1 and x0 < v.w);
+    // Latin text is turned with the line, not set upright
+    for (tl.glyphs) |g| try std.testing.expect(!g.upright);
+}
+
+test "writing-mode vertical-lr: the lines stack from left to right" {
+    var src_buf: [2048]u8 = undefined;
+    const t = try wmFrame(&src_buf, "<div id=\"v\" style=\"writing-mode:vertical-lr;height:100px\">aaa bbb ccc ddd eee fff</div>", "{\"width\":300,\"height\":200}");
+    defer t.deinit();
+    const pid = wmPara(t, "v");
+    const pl = t.f.tree.layout(t.f.nodes.items[pid].lid);
+    const tl = (try t.f.textLayout(pid, 0)).?;
+    try std.testing.expect(tl.lines.len >= 3);
+    // mirrored line layout (`mirrorLines`): the first line at the far block end of the logical space,
+    // the leftmost once turned like vertical-rl
+    try std.testing.expect(tl.lines[0].top > tl.lines[1].top);
+    const m = wmode.lineTransform(&t.f, pid, tl, 0, 0, pl.w);
+    const x0 = m.c * tl.lines[0].baseline + m.e;
+    const x1 = m.c * tl.lines[1].baseline + m.e;
+    try std.testing.expect(x0 < x1 and x0 > 0 and x0 < 30);
+}
+
+test "writing-mode: orthogonal flow roots take their available inline size from the viewport" {
+    var src_buf: [2048]u8 = undefined;
+    // (CSS Writing Modes 4 §7.3: a vertical box in a horizontal page of indefinite height)
+    const long = "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www";
+    var buf: [512]u8 = undefined;
+    {
+        const t = try wmFrame(&src_buf, try std.fmt.bufPrint(&buf, "<div id=\"v\" style=\"writing-mode:vertical-rl\">{s}</div><p id=\"after\" style=\"margin:0\">x</p>", .{long}), "{\"width\":300,\"height\":200}");
+        defer t.deinit();
+        const v = t.f.tree.layout(t.f.nodes.items[nodeOfId(t, "v")].lid);
+        // long text: fills the viewport's height, and the box is only as wide as its lines
+        try std.testing.expectEqual(@as(f32, 200), v.h);
+        try std.testing.expect(v.w >= 60 and v.w < 300);
+        const a = t.f.tree.layout(t.f.nodes.items[nodeOfId(t, "after")].lid);
+        try std.testing.expectEqual(v.h, a.y);
+    }
+    {
+        const t = try wmFrame(&src_buf, "<div id=\"v\" style=\"writing-mode:vertical-rl\">abc</div>", "{\"width\":300,\"height\":200}");
+        defer t.deinit();
+        const v = t.f.tree.layout(t.f.nodes.items[nodeOfId(t, "v")].lid);
+        // short text: max-content
+        try std.testing.expect(v.h > 10 and v.h < 60);
+        try std.testing.expectEqual(@as(f32, 30), v.w);
+    }
+    {
+        // a horizontal box in a vertical page: its width from the viewport width
+        const t = try wmFrame(&src_buf, try std.fmt.bufPrint(&buf, "<div style=\"writing-mode:vertical-rl;height:150px\"><p id=\"h\" style=\"writing-mode:horizontal-tb;margin:0\">{s}</p></div>", .{long}), "{\"width\":300,\"height\":200}");
+        defer t.deinit();
+        const h = t.f.tree.layout(t.f.nodes.items[nodeOfId(t, "h")].lid);
+        try std.testing.expectEqual(@as(f32, 300), h.w);
+        try std.testing.expect(h.h >= 60);
+        // ... placed at the block start (right) of its vertical parent
+        try std.testing.expectEqual(@as(f32, 0), h.x);
+    }
+}
+
+test "writing-mode: a vertical body is the principal writing mode; vertical-rl content starts at the right" {
+    const t = try TestFrame.init(.html, "<!doctype html><html><body style=\"writing-mode:vertical-rl;margin:0;font-size:20px;line-height:30px\">abc</body></html>", "{\"width\":300,\"height\":200}");
+    defer t.deinit();
+    const root = &t.f.nodes.items[t.f.root];
+    try std.testing.expectEqual(style.computed.WritingMode.vertical_rl, root.cs.writing_mode);
+    const rl = t.f.tree.layout(root.lid);
+    try std.testing.expectEqual(@as(f32, 30), rl.w);
+    try std.testing.expectEqual(@as(f32, 270), rl.x);
+    try std.testing.expectEqual(@as(f32, 200), rl.h);
+}
+
+test "writing-mode: logical properties map through the writing mode" {
+    var src_buf: [2048]u8 = undefined;
+    const t = try wmFrame(&src_buf, "<div id=\"rl\" style=\"writing-mode:vertical-rl;margin-block-start:7px;padding-inline-start:3px;inline-size:50px\">a</div><div id=\"lr\" style=\"writing-mode:vertical-lr;margin-block-start:7px;padding-inline-end:3px;border-block-end:2px solid red\">a</div>", "{\"width\":300,\"height\":200}");
+    defer t.deinit();
+    const rl = t.f.nodes.items[nodeOfId(t, "rl")].cs;
+    try std.testing.expectEqual(@as(f32, 7), rl.margin[1].lp.px);
+    try std.testing.expectEqual(@as(f32, 3), rl.padding[0].px);
+    try std.testing.expect(rl.height == .lp and rl.width != .lp);
+    const lr = t.f.nodes.items[nodeOfId(t, "lr")].cs;
+    try std.testing.expectEqual(@as(f32, 7), lr.margin[3].lp.px);
+    try std.testing.expectEqual(@as(f32, 3), lr.padding[2].px);
+    try std.testing.expectEqual(@as(f32, 2), lr.usedBorderWidths()[1]);
+}
+
+test "writing-mode: unsupported content falls back to horizontal layout" {
+    var src_buf: [2048]u8 = undefined;
+    const t = try wmFrame(&src_buf, "<div id=\"v\" style=\"writing-mode:vertical-rl;height:100px\">abc<table><tr><td>x</td></tr></table></div><div id=\"ok\" style=\"writing-mode:vertical-rl;height:100px\">abc</div>", "{\"width\":300,\"height\":200}");
+    defer t.deinit();
+    try std.testing.expectEqual(style.computed.WritingMode.horizontal_tb, t.f.nodes.items[nodeOfId(t, "v")].cs.writing_mode);
+    try std.testing.expectEqual(style.computed.WritingMode.vertical_rl, t.f.nodes.items[nodeOfId(t, "ok")].cs.writing_mode);
+    // (the fallen-back box is laid out as before: it fills the width)
+    try std.testing.expectEqual(@as(f32, 300), t.f.tree.layout(t.f.nodes.items[nodeOfId(t, "v")].lid).w);
 }

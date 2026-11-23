@@ -255,3 +255,81 @@ test "relatively positioned inline box: its glyphs, fragments and atomic inlines
     try t.expectEqual(a.boxes[1].x0 + 3, b.boxes[1].x0);
     try t.expectEqual(a.boxes[1].baseline + 4, b.boxes[1].baseline);
 }
+
+// ---- vertical text (writing-mode / text-orientation, src/writing_mode.zig)
+
+const cjk = @embedFile("testdata/CJKLoclTest.otf");
+
+test "vertical text: Unicode vertical orientation (UAX #50 subset)" {
+    const up = font.text.isUprightMixed;
+    try t.expect(!up('A') and !up('1') and !up(' ') and !up(0x2014) and !up(0x0410));
+    try t.expect(up(0x3042) and up(0x30ab) and up(0x76f4) and up(0xac00) and up(0xff21) and up(0x3001) and up(0x20000));
+    try t.expect(up(0xa9) and up(0xd7) and !up(0xab));
+}
+
+test "vertical text: orientation per character, vertical advances, upright segments" {
+    var fc: font.FontCollection = .{};
+    defer fc.deinit(t.allocator);
+    _ = try fc.register(t.allocator, inter, .{});
+    _ = try fc.register(t.allocator, cjk, .{});
+    const txt = "A\u{76f4}B";
+    const Case = struct { o: font.text.VOrient, up: [3]bool };
+    for ([_]Case{
+        .{ .o = .none, .up = .{ false, false, false } },
+        .{ .o = .mixed, .up = .{ false, true, false } },
+        .{ .o = .upright, .up = .{ true, true, true } },
+        .{ .o = .sideways, .up = .{ false, false, false } },
+    }) |c| {
+        var p = try font.Paragraph.init(t.allocator, &fc, &.{.{ .text = txt, .style = .{ .size = 20, .vertical = c.o } }}, .{});
+        defer p.deinit();
+        try t.expectEqual(@as(usize, 3), p.glyphs.len);
+        for (p.glyphs, c.up) |g, want| try t.expectEqual(want, g.upright);
+        var tl = try p.layout(t.allocator, null);
+        defer tl.deinit(t.allocator);
+        for (tl.glyphs, c.up) |g, want| try t.expectEqual(want, g.upright);
+        // an upright glyph advances by its vertical advance (`vmtx`), not its horizontal one
+        const f = fc.font(p.glyphs[1].face);
+        const s: f32 = 20 / @as(f32, @floatFromInt(f.units_per_em));
+        const vadv = @as(f32, @floatFromInt(f.advanceHeight(p.glyphs[1].gid))) * s;
+        const hadv = @as(f32, @floatFromInt(f.advanceWidth(p.glyphs[1].gid))) * s;
+        try t.expectApproxEqAbs(if (c.up[1]) vadv else hadv, p.glyphs[1].x_advance, 0.01);
+    }
+}
+
+test "vertical metrics fall back without vhea / vmtx / VORG" {
+    const f = try font.Font.init(inter, 0);
+    try t.expect(!f.hasVerticalMetrics());
+    const lm = f.lineMetrics();
+    const g = f.glyphIndex('A');
+    try t.expectEqual(@as(u16, @intCast(lm.ascent + lm.descent)), f.advanceHeight(g));
+    try t.expectEqual(lm.ascent, f.verticalOriginY(g));
+}
+
+test "vertical text: text-combine-upright sets a unit upright in one em" {
+    var fc: font.FontCollection = .{};
+    defer fc.deinit(t.allocator);
+    _ = try fc.register(t.allocator, inter, .{});
+    const v: font.TextStyle = .{ .size = 20, .vertical = .mixed };
+    var c = v;
+    c.combine = true;
+    var p = try font.Paragraph.init(t.allocator, &fc, &.{ .{ .text = "ab", .style = v }, .{ .text = "2024", .style = c }, .{ .text = "cd", .style = v } }, .{});
+    defer p.deinit();
+    try t.expectEqual(@as(usize, 8), p.glyphs.len);
+    // the unit: upright, compressed to one em, advancing by one em in all
+    var adv: f32 = 0;
+    for (p.glyphs[2..6]) |g| {
+        try t.expect(g.upright and g.combine > 0 and g.combine < 1);
+        adv += g.x_advance;
+    }
+    try t.expectEqual(@as(f32, 20), adv);
+    for (p.glyphs[3..6]) |g| try t.expect(g.flags & font.text.ShapedGlyph.NO_SPLIT != 0);
+    var tl = try p.layout(t.allocator, null);
+    defer tl.deinit(t.allocator);
+    // its glyphs share the unit's start, set left to right across the line (decreasing y offsets)
+    for (tl.glyphs[3..6], tl.glyphs[2..5]) |g, prev| {
+        try t.expectEqual(prev.x, g.x);
+        try t.expect(g.y < prev.y);
+    }
+    try t.expectEqual(tl.glyphs[2].x + 20, tl.glyphs[6].x);
+    for ([_]usize{ 0, 1, 6, 7 }) |k| try t.expect(!tl.glyphs[k].upright and tl.glyphs[k].combine == 0);
+}

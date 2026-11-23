@@ -411,7 +411,8 @@ pub noinline fn compute(t: anytype, node: u32, in_: *const In, out: *Out) Error!
         const ckw = orElse(cb.size[0], band_w - ms);
         // (width: min-/max-/fit-content does not fill: the child sizes itself against the available width;
         // so does a child whose width follows from its height through the aspect ratio)
-        const self_sized = cs.size[0].isKeyword() or t.nodes.items[ch].replaced or (!has(cb.size[0]) and has(t.ratio(cs, cb, 0, ckh)));
+        // (so does an orthogonal flow root: its width is its block size, content-based)
+        const self_sized = cs.size[0].isKeyword() or t.nodes.items[ch].replaced or t.nodes.items[ch].ortho != null or (!has(cb.size[0]) and has(t.ratio(cs, cb, 0, ckh)));
         c.ci = .{
             .known = .{ if (self_sized) NONE else @max(clampO(ckw, cb.min[0], cb.max[0]), cb.pb[0]), ckh },
             .parent = c.parent,

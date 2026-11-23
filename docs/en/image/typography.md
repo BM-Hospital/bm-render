@@ -4,7 +4,8 @@
 
 How bm-render lays out and paints text: wrapping and `white-space`, breaking long words, line height and
 spacing, alignment, truncation with ellipsis and `line-clamp`, balanced headlines, decorations, shadows
-and strokes, case transforms, mixing spans, inline-blocks and images in a line, OpenType features, and
+and strokes, case transforms, mixing spans, inline-blocks and images in a line, OpenType features,
+vertical text (`writing-mode`, `text-combine-upright`), and
 which [profile](../profiles-and-size.md) you need for bidirectional and complex scripts. Text needs a
 registered font: see [Fonts](./fonts.md) first. Every example was run by `docs/examples/typography.mjs`
 and the images are its output.
@@ -448,6 +449,94 @@ Sans, Roboto, Be Vietnam Pro, ...). Text in decomposed form (NFD, common in inpu
 the font's mark positioning and is normalised automatically only on `full`; call `normalize("NFC")`
 on user input to be safe. Lines break at spaces, which is what Vietnamese needs.
 
+## Vertical text
+
+`writingMode: "vertical-rl"` (Japanese, Chinese and Korean books) and `"vertical-lr"` (Mongolian, some
+headings) turn a block on its side: the lines run from top to bottom, and they stack from right to left
+(`vertical-rl`) or from left to right (`vertical-lr`). `"sideways-rl"` is `vertical-rl` with every
+character turned. It works on every profile, in PNG / JPEG / WebP, `renderSvg` and PDF output.
+
+```js
+// Noto Sans TC (or any CJK font with vertical metrics) registered as "Noto Sans TC"
+const vertical = renderer.renderSync(
+  `<!doctype html><html><body style="margin:0;font-family:'Noto Sans TC';font-size:20px">
+    <div style="writing-mode:vertical-rl;height:200px;padding:10px;line-height:1.5;background:#eef">
+      日本語の書き方。CSS 2024年、ABC と 123 を含む。<span style="color:#c00">赤い文字</span>
+    </div>
+  </body></html>`,
+  { width: 300, height: 240 },
+);
+```
+
+What is supported:
+
+- **Orientation** (`textOrientation`). `mixed` (the default) sets CJK ideographs, kana, Hangul,
+  full-width forms and the other characters Unicode gives an upright vertical orientation (UAX #50,
+  approximated by ranges) upright, and turns Latin letters, digits and the rest 90 degrees clockwise.
+  `upright` sets every character upright, `sideways` turns every character. Upright characters are shaped
+  with the font's `vert` feature (vertical punctuation such as `、` `。` `「」` `（）`), advance by their
+  vertical advance (`vhea` / `vmtx`) and hang from their vertical origin (`VORG`, else `vmtx` + the glyph
+  box); a font without vertical metrics falls back to its height and an em box centred on the line, as
+  Chrome does.
+- **Tate-chu-yoko** (`textCombineUpright: "all"` on a span): the span's text (`"12"`, `"2024"`, `"!?"`)
+  is set horizontally in one upright em, compressed horizontally when it is wider, and centred on the line.
+- **Inline content**: font sizes, colours, spans with backgrounds, borders and padding, decorations
+  (`underline` is drawn on the left, the line-under side), `text-align` along the line (`start` = top,
+  `end` = bottom, `center`), `text-indent`, `line-height`, wrapping and every `white-space` /
+  `word-break` value, inline-blocks and images in the line.
+- **Boxes**: padding, borders, backgrounds and margins of the vertical box and of its block children,
+  which stack along the block axis (right to left in `vertical-rl`); flex and grid containers lay out
+  along the logical axes (a `flex-direction: row` runs top to bottom); `float: left` / `right` mean
+  line-left / line-right (top / bottom). Logical properties (`marginBlockStart`, `paddingInlineStart`,
+  `inlineSize`, `borderBlockEnd`, ...) map through the writing mode.
+- **Orthogonal flows** (CSS Writing Modes 4 §7): a vertical box in a horizontal page (a vertical heading
+  beside horizontal text) is as wide as its lines and as tall as its content, at most the parent's
+  definite height, else the viewport height; a horizontal box inside a vertical one takes its width the
+  same way from the viewport width. A `writing-mode` on `<body>` applies to the whole document (the root
+  takes it, as in browsers), so `<body style="writing-mode:vertical-rl">` starts at the top right corner.
+- **PDF**: the turned lines are text in content order. Upright characters are drawn as outlines with an
+  invisible copy of the line's text in the line's direction on top, so that copying and text extraction
+  follow the line: `pdftotext` reads a `vertical-rl` page column by column from the right; in
+  `vertical-lr` its reading-order mode lists the columns from the right as well (`pdftotext -raw` keeps
+  the logical order in both modes).
+
+Compared with Chrome (`npm run test:writing-mode`: Noto Sans TC, Chrome screenshots at device scale 1).
+The element rectangles of the block, orthogonal-flow and logical-property fixtures are the same as
+Chrome's; "differing" is the share of pixels whose luma differs by more than 48 after a 3 x 3 blur (it
+leaves anti-aliasing out), mostly sub-pixel glyph positions:
+
+| Fixture | Differing pixels |
+|:--|--:|
+| `vertical-rl`, CJK + Latin + digits, padding, background | 0.47 % |
+| `vertical-rl` on `<body>` (a page of text) | 2.29 % |
+| `vertical-lr`, border | 0.05 % |
+| `text-orientation: upright` / `sideways` | 0.05 % / 0.00 % |
+| vertical heading in a horizontal page | 0.19 % |
+| spans: colour, background, underline, larger font | 2.47 % |
+| `text-align` per paragraph | 0.00 % |
+| `text-combine-upright` (`12`, `2024`, `!?`) | 1.16 % (see the limits) |
+| Chinese with full-width punctuation | 3.01 % (Chrome trims `。（`) |
+| horizontal box in a vertical page | 0.90 % |
+| block children, logical properties, flex | 0.69 %, 0.38 %, 0.27 % |
+
+Limits:
+
+- A vertical flow holding a table, an absolutely / fixed positioned box, `sideways-lr`, or both
+  `vertical-rl` and `vertical-lr` is laid out horizontally instead (its logical properties keep their
+  vertical mapping).
+- `textCombineUpright: "digits <n>"` is not supported, and a combined unit is compressed by scaling rather
+  than with the font's half / third / quarter-width forms (`hwid`, `twid`, `qwid`) Chrome tries first;
+  Chrome also sets the unit a few pixels right of the line's centre.
+- Chrome's `text-spacing-trim` (adjacent full-width punctuation such as `。（` set half-width) is not
+  applied, in horizontal text either.
+- Runs of different fonts or sizes on one line align on the alphabetic baseline, not on the central one
+  Chrome uses for vertical text (a few pixels with a fallback font or a larger span).
+- `underline` is always on the left; Chrome draws it on the right for `lang="ja"` / `"ko"`.
+- A vertical flow is not split across PDF pages; `text-shadow` on upright characters is not drawn in PDF
+  output, and `background-clip: text` does not follow vertical text.
+- Percentage padding and margins of an orthogonal box resolve against its own inline axis.
+- The baseline of a vertical inline-block in a horizontal line is its bottom margin edge.
+
 ## Bidirectional text and complex scripts
 
 The `full` profile runs the Unicode bidirectional algorithm (UAX #9) and the complex shapers for Arabic,
@@ -490,13 +579,13 @@ laid out left to right. CJK and other scripts that need no reordering look the s
 | Colour emoji | no | bitmap fonts (CBDT / sbix) | yes (with a colour font) |
 
 `direction: rtl` also mirrors flex rows, grid columns and tables (see [Styles](./styles.md#right-to-left)).
-Known gaps (also in [CSS support](./css-support.md#known-gaps)): `writing-mode` (vertical text) is not
-supported, and hanging spaces of RTL text with `white-space: pre-wrap` are not handled.
+Known gap (also in [CSS support](./css-support.md#known-gaps)): hanging spaces of RTL text with
+`white-space: pre-wrap` are not handled. Vertical text: see [Vertical text](#vertical-text).
 
 ## Properties that do nothing in 0.1.0
 
 Parsed and accepted, without visible effect: `textAlignLast`, `hyphens` (except soft hyphens in the
-text), `lineBreak`, `writingMode`, `fontSynthesisWeight` / `fontSynthesisStyle` and the weight / style parts
+text), `lineBreak`, `fontSynthesisWeight` / `fontSynthesisStyle` and the weight / style parts
 of `fontSynthesis` (bold and italic are always synthesised), and `paintOrder` on text (ignored; SVG images
 honour it). The full list of supported properties is in
 [CSS support](./css-support.md#text).

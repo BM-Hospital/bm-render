@@ -18,6 +18,7 @@ const ptext = @import("paint_text.zig");
 const pborder = @import("paint_border.zig");
 const so = @import("svg_out.zig");
 const sborder = @import("svg_out_border.zig");
+const wmode = @import("writing_mode.zig");
 const color = if (pm.enable_color_glyphs) @import("font/color.zig") else struct {};
 const cex = if (pm.enable_color_glyphs) @import("font/color_example.zig") else struct {};
 
@@ -79,6 +80,17 @@ fn useOpen(s: *S, id: u32, x: f32, y: f32) Error!void {
     s.attrNum("y", so.qp(y));
 }
 
+/// `useOpen` for glyph `g` at (`x`, `y`); an upright glyph of vertical text is turned back against
+/// its line's turn (writing_mode.zig).
+fn useGlyph(s: *S, id: u32, g: *const font.PositionedGlyph, x: f32, y: f32) Error!void {
+    if (!g.upright) return useOpen(s, id, x, y);
+    const t = wmode.uprightTf(s.f, g);
+    s.raw("<use href=\"#g");
+    s.uint(id);
+    s.raw("\"");
+    s.attrMatrix(.{ .a = t.a, .b = t.b, .c = t.c, .d = t.d, .e = so.qp(t.e + x - g.x), .f = so.qp(t.f + y - g.y) });
+}
+
 // ---- painter mirrors
 
 const Synth = struct { italic: bool, bold: bool, colored: bool };
@@ -133,7 +145,7 @@ noinline fn glyphUses(s: *S, n: *const Node, tl: *const font.TextLayout, x: f32,
         if (rcs.visibility != .visible) continue;
         const sy = synthOf(s, rcs, g);
         const id = (try glyphDef(s, g.face, g.gid, g.size, sy.italic)) orelse continue;
-        try useOpen(s, id, x + g.x, y + g.y);
+        try useGlyph(s, id, g, x + g.x, y + g.y);
         const sw = rcs.webkit_text_stroke_width;
         const bold_w: f32 = if (sy.bold and with_bold) ptext.emboldenWidth(g.size) else 0;
         const stroke_w = @max(bold_w, if (sw > 0 and !sy.colored) sw else 0);
@@ -217,7 +229,7 @@ noinline fn paintGlyphPhase(s: *S, tl: *const font.TextLayout, x: f32, y: f32, r
             const sy = synthOf(s, rcs, g);
             if (sy.colored) continue;
             const id = (try glyphDef(s, g.face, g.gid, g.size, sy.italic)) orelse continue;
-            try useOpen(s, id, x + g.x, y + g.y);
+            try useGlyph(s, id, g, x + g.x, y + g.y);
             s.raw("/>\n");
         }
         return s.closeG();
@@ -234,7 +246,7 @@ noinline fn paintGlyphPhase(s: *S, tl: *const font.TextLayout, x: f32, y: f32, r
             continue;
         }
         const id = (try glyphDef(s, g.face, g.gid, g.size, sy.italic)) orelse continue;
-        try useOpen(s, id, x + g.x, y + g.y);
+        try useGlyph(s, id, g, x + g.x, y + g.y);
         if (sy.bold) {
             s.attrColor("stroke", "stroke-opacity", fill);
             s.attrNum("stroke-width", ptext.emboldenWidth(g.size));
@@ -567,7 +579,24 @@ noinline fn paintFragment(s: *S, ctx: *const Ctx, cs: *const CS, face: font.Face
 /// line-through.
 pub noinline fn paintText(s: *S, ctx: *const Ctx, n: *const Node, x: f32, y: f32, cw: f32) Error!void {
     const f = s.f;
+    if (wmode.vmOf(n.cs) != 0) {
+        // vertical text: the logical lines in a group turned 90 degrees clockwise
+        const id = f.nodeId(n);
+        const tl = (try f.textLayout(id, cw)) orelse return;
+        const t = wmode.lineTransform(f, id, tl, x, y, cw);
+        const m: Affine = .{ .a = t.a, .b = t.b, .c = t.c, .d = t.d, .e = t.e, .f = t.f };
+        var vc = ctx.*;
+        vc.tf = ctx.tf.mul(m);
+        s.gTransform(m);
+        try paintLines(s, &vc, n, tl, 0, 0, wmode.logicalContent(f, id)[0]);
+        return s.closeG();
+    }
     const tl = (try f.textLayout(f.nodeId(n), cw)) orelse return;
+    return paintLines(s, ctx, n, tl, x, y, cw);
+}
+
+noinline fn paintLines(s: *S, ctx: *const Ctx, n: *const Node, tl: *const font.TextLayout, x: f32, y: f32, cw: f32) Error!void {
+    const f = s.f;
     if (tl.boxes.len > 0) try paintInlineBoxes(s, ctx, n, tl, x, y);
     if (n.cs.text_shadow.len > 0 and n.cs.visibility == .visible) try paintTextShadows(s, n, tl, x, y, cw);
 

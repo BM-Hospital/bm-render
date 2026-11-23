@@ -29,6 +29,7 @@ const sf = @import("emit_surface.zig");
 const text = @import("text.zig");
 const etag = @import("emit_tag.zig"); // [tagging]
 const markers = @import("markers.zig");
+const wmode = @import("../writing_mode.zig");
 
 const Emitter = emit.Emitter;
 const Node = render.Node;
@@ -230,7 +231,7 @@ fn glyphPass(e: *Emitter, n: *const Node, tl: *const font.TextLayout, x: f32, y:
         const in_marker = i >= mk0 and i < mk1;
         const stop = if (in_marker) mk1 else if (mk1 > mk0 and i < mk0) mk0 else run.g1;
         var j = i + 1;
-        while (j < run.g1 and j < stop and tl.glyphs[j].size == g0.size) j += 1;
+        while (j < run.g1 and j < stop and tl.glyphs[j].size == g0.size and tl.glyphs[j].upright == g0.upright) j += 1;
         const fc = e.f.r.fonts.face(g0.face);
         const colored = coloredFace(e, g0.face);
         const syn = if (in_marker) n.cs else rcs;
@@ -259,10 +260,42 @@ fn glyphPass(e: *Emitter, n: *const Node, tl: *const font.TextLayout, x: f32, y:
             .fills = o.fills,
             .with_paint = o.with_paint,
         };
-        try emitTextRun(e, &tr);
+        if (g0.upright and !colored) {
+            try uprightRun(e, &tr);
+        } else try emitTextRun(e, &tr);
         i = j;
         if (marker_prefix and !marker_pending) break;
     }
+}
+
+/// Upright glyphs of vertical text (writing_mode.zig): the text layer gets them as invisible text in
+/// their line's (turned) orientation, so that extraction and selection follow the line in logical
+/// order; what shows is their outlines, turned back upright.
+fn uprightRun(e: *Emitter, tr: *const TextRun) Error!void {
+    // (a shadow pass, a `background-clip: text` pass: not drawn)
+    if (tr.shadow != null or !tr.with_paint) return;
+    var inv = tr.*;
+    inv.fill = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+    inv.stroke = null;
+    inv.synthetic_bold = 0;
+    inv.fills = &.{};
+    try emitTextRun(e, &inv);
+    const fnt = e.f.r.fonts.font(tr.face);
+    var path: Path = .empty;
+    for (tr.glyphs) |*g| {
+        const t = wmode.uprightTf(e.f, g);
+        const m: Affine = .{ .a = t.a, .b = t.b, .c = t.c, .d = t.d, .e = t.e + tr.x, .f = t.f + tr.y };
+        var sink: raster.PathSink = .{ .path = &path, .alloc = e.a, .transform = if (tr.synthetic_italic) m.mul(.{ .c = -0.25 }) else m };
+        _ = font.emitGlyph(fnt, g.gid, tr.size, 0, 0, &sink);
+        if (sink.err) return error.OutOfMemory;
+    }
+    if (path.isEmpty()) return;
+    if (tr.stroke_first) if (tr.stroke) |st| if (st.color.a != 0) e.d.strokePath(&path, 0, 0, st.width, null, false, st.color);
+    if (tr.fill.a != 0) {
+        e.d.fillPath(&path, 0, 0, .nonzero, tr.fill);
+        if (tr.synthetic_bold > 0) e.d.strokePath(&path, 0, 0, tr.synthetic_bold, null, false, tr.fill);
+    }
+    if (!tr.stroke_first) if (tr.stroke) |st| if (st.color.a != 0) e.d.strokePath(&path, 0, 0, st.width, null, false, st.color);
 }
 
 // ---- pagination (takumi-pdf window.rs)
@@ -971,6 +1004,24 @@ fn paintInlineOutlines(e: *Emitter, n: *const Node, tl: *const font.TextLayout, 
 /// text shadows, then per run: underline / overline, glyphs (fill + stroke), line-through. Only
 /// the runs this page shows (pagination).
 pub fn paintText(e: *Emitter, n: *const Node, x: f32, y: f32, cw: f32) Error!void {
+    const f = e.f;
+    if (wmode.vmOf(n.cs) != 0) {
+        // vertical text: the logical lines drawn turned 90 degrees clockwise
+        const id = f.nodeId(n);
+        const tl = (try f.textLayout(id, cw)) orelse return paintLines(e, n, x, y, cw);
+        const t = wmode.lineTransform(f, id, tl, x, y, cw);
+        const m: Affine = .{ .a = t.a, .b = t.b, .c = t.c, .d = t.d, .e = t.e, .f = t.f };
+        e.s.pushTransform(sf.Tf.fromAffine(m));
+        defer e.s.pop();
+        const saved = e.tf;
+        defer e.tf = saved;
+        e.tf = e.tf.mul(m);
+        return paintLines(e, n, 0, 0, wmode.logicalContent(f, id)[0]);
+    }
+    return paintLines(e, n, x, y, cw);
+}
+
+fn paintLines(e: *Emitter, n: *const Node, x: f32, y: f32, cw: f32) Error!void {
     const f = e.f;
     const saved_span = e.line_span;
     defer e.line_span = saved_span;

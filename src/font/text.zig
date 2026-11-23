@@ -63,7 +63,61 @@ pub const TextStyle = struct {
     caps: Caps = .normal,
     /// font-synthesis-small-caps: auto (false = none: no synthesized small caps).
     synth_small_caps: bool = true,
+    /// Vertical writing mode (`writing-mode: vertical-*`): the `text-orientation` of the run;
+    /// `none` = horizontal text. Upright characters are shaped with the `vert` feature and advance
+    /// by their vertical advance (`ShapedGlyph.upright`); the rest stay horizontal glyphs that
+    /// the painters turn 90 degrees clockwise with their line.
+    vertical: VOrient = .none,
+    /// Vertical text, `text-combine-upright: all`: each shaping segment of the run is set
+    /// horizontally in one upright em (compressed horizontally when wider), `ShapedGlyph.combine`.
+    combine: bool = false,
 };
+
+/// `text-orientation` in a vertical writing mode (`none`: horizontal text).
+pub const VOrient = enum(u2) { none, mixed, upright, sideways };
+
+/// Whether `cp` is set upright in `text-orientation: mixed`: its Unicode Vertical_Orientation
+/// (UAX #50) is not R. Blink treats U, Tu and Tr alike (`Character::IsUprightInMixedVertical`).
+/// The ranges below approximate UAX #50: CJK scripts and symbols, Hangul, kana, Yi, full-width
+/// forms, Canadian syllabics, the common upright symbols and emoji.
+pub fn isUprightMixed(cp: u21) bool {
+    if (cp < 0xa7) return false;
+    const R = struct { u21, u21 };
+    const ranges = [_]R{
+        .{ 0xa7, 0xa7 },       .{ 0xa9, 0xa9 },       .{ 0xae, 0xae },       .{ 0xb1, 0xb1 },
+        .{ 0xbc, 0xbe },       .{ 0xd7, 0xd7 },       .{ 0xf7, 0xf7 },       .{ 0x2ea, 0x2eb },
+        .{ 0x1100, 0x11ff },   .{ 0x1400, 0x167f },   .{ 0x18b0, 0x18ff },   .{ 0x2016, 0x2016 },
+        .{ 0x2020, 0x2021 },   .{ 0x2030, 0x2031 },   .{ 0x203b, 0x203c },   .{ 0x2042, 0x2042 },
+        .{ 0x2047, 0x2049 },   .{ 0x2051, 0x2051 },   .{ 0x20dd, 0x20e0 },   .{ 0x20e2, 0x20e4 },
+        .{ 0x2100, 0x2101 },   .{ 0x2103, 0x2109 },   .{ 0x210f, 0x210f },   .{ 0x2113, 0x2114 },
+        .{ 0x2116, 0x2117 },   .{ 0x211e, 0x2123 },   .{ 0x2125, 0x2125 },   .{ 0x2127, 0x2127 },
+        .{ 0x2129, 0x2129 },   .{ 0x212e, 0x212e },   .{ 0x2135, 0x213f },   .{ 0x2145, 0x214a },
+        .{ 0x214c, 0x214d },   .{ 0x214f, 0x2189 },   .{ 0x218c, 0x218f },   .{ 0x221e, 0x221e },
+        .{ 0x2234, 0x2235 },   .{ 0x2300, 0x2307 },   .{ 0x230c, 0x231f },   .{ 0x2322, 0x232b },
+        .{ 0x237d, 0x239a },   .{ 0x23be, 0x23cd },   .{ 0x23cf, 0x23cf },   .{ 0x23d1, 0x23db },
+        .{ 0x23e2, 0x2422 },   .{ 0x2424, 0x24ff },   .{ 0x25a0, 0x2619 },   .{ 0x2620, 0x2767 },
+        .{ 0x2776, 0x2793 },   .{ 0x2b12, 0x2b2f },   .{ 0x2b50, 0x2b59 },   .{ 0x2bb8, 0x2bff },
+        .{ 0x2e50, 0x2e51 },   .{ 0x2e80, 0xa4cf },   .{ 0xa830, 0xa83f },   .{ 0xa960, 0xa97f },
+        .{ 0xac00, 0xd7ff },   .{ 0xe000, 0xfaff },   .{ 0xfe10, 0xfe1f },   .{ 0xfe30, 0xfe48 },
+        .{ 0xfe50, 0xfe57 },   .{ 0xfe59, 0xfe62 },   .{ 0xfe67, 0xfe6f },   .{ 0xff01, 0xff0c },
+        .{ 0xff0e, 0xff1b },   .{ 0xff1f, 0xff60 },   .{ 0xffe0, 0xffe7 },   .{ 0xfff0, 0xfff8 },
+        .{ 0xfffc, 0xfffd },   .{ 0x10980, 0x1099f }, .{ 0x11580, 0x115ff }, .{ 0x11a00, 0x11aaf },
+        .{ 0x13000, 0x1345f }, .{ 0x14400, 0x1467f }, .{ 0x16fe0, 0x18aff }, .{ 0x1b000, 0x1b2ff },
+        .{ 0x1d000, 0x1d1ff }, .{ 0x1d2e0, 0x1d37f }, .{ 0x1d800, 0x1daaf }, .{ 0x1f000, 0x1f7ff },
+        .{ 0x1f900, 0x1faff }, .{ 0x20000, 0x3fffd },
+    };
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (cp < ranges[mid][0]) {
+            hi = mid;
+        } else if (cp > ranges[mid][1]) {
+            lo = mid + 1;
+        } else return true;
+    }
+    return false;
+}
 
 pub const BidiMode = enum { normal, embed, isolate, bidi_override, isolate_override, plaintext };
 
@@ -365,6 +419,12 @@ pub const ShapedGlyph = struct {
     item: u16 = 0,
     /// Minimum tab advance (half the space width), independent of a run's tab count.
     tab_min: f32 = 0,
+    /// Vertical text: an upright glyph (`x_advance` is its vertical advance; see `TextStyle.vertical`).
+    upright: bool = false,
+    /// `TextStyle.combine`: the horizontal scale (0 < s <= 1) of a glyph of a combined (tate-chu-yoko)
+    /// unit; 0 = not combined. The unit's last glyph advances by one em, the others by nothing,
+    /// and `y_offset` holds the glyph's horizontal place in the unit (see writing_mode.zig).
+    combine: f32 = 0,
 
     /// Soft wrap opportunity before this glyph.
     pub const BREAK_BEFORE: u8 = 1;
@@ -408,6 +468,12 @@ pub const PositionedGlyph = struct {
     cluster: u32,
     /// Bidi embedding level of the glyph (odd = part of a right-to-left run).
     bidi_level: u8 = 0,
+    /// Vertical text: the glyph is set upright (its em box centred on the line's central
+    /// baseline, `x` is the top of its vertical advance); otherwise a vertical line's glyphs are
+    /// turned 90 degrees clockwise with the line.
+    upright: bool = false,
+    /// See `ShapedGlyph.combine` (the glyph is upright too).
+    combine: f32 = 0,
     /// Text generated by layout (a hyphen at a discretionary break), with its own mapping.
     generated: ?u21 = null,
     /// (PDF builds, `ParagraphOptions.item_origin`) the pen position after the glyph's advance and
@@ -3001,6 +3067,8 @@ pub const Paragraph = struct {
                     .user = mt.user,
                     .cluster = g.cluster,
                     .bidi_level = g.level,
+                    .upright = g.upright,
+                    .combine = g.combine,
                 });
                 if (item_origin) {
                     _ = ip.add(self.advanceOf(g, x - line_x, null));
@@ -3629,6 +3697,8 @@ const Builder = struct {
     seg_metric: u16 = 0,
     seg_script: u8 = 0,
     seg_level: u8 = 0,
+    /// The pending segment is upright vertical text (`TextStyle.vertical`).
+    seg_upright: bool = false,
     /// Running starter of the current cluster (for composition-aware font fallback).
     starter: u21 = 0,
     prev_cp: u21 = 0,
@@ -4061,8 +4131,17 @@ const Builder = struct {
                     }
                 }
             }
+            // vertical text: upright and rotated characters are shaped apart (cluster continuations
+            // and joiners follow their base)
+            const upright = if (style.combine) false else switch (style.vertical) {
+                .none, .sideways => false,
+                .upright => true,
+                .mixed => if (pending and (joiner or uni.isMark(c.cp))) b.seg_upright else isUprightMixed(c.cp),
+            };
             if (pending) {
                 if (face != b.seg_face or (metric != b.seg_metric and !sameShapeStyle(runs[b.metrics.items[b.seg_metric].run].style, style))) {
+                    try b.flush(complex, style);
+                } else if (upright != b.seg_upright) {
                     try b.flush(complex, style);
                 } else if (script != b.seg_script) {
                     // a segment that has seen no strong character yet adopts the script
@@ -4078,6 +4157,7 @@ const Builder = struct {
                 b.seg_metric = metric;
                 b.seg_script = script;
                 b.seg_level = c.level;
+                b.seg_upright = upright;
             }
             try b.buf.list.append(b.tmp, .{ .cp = c.cp, .cluster = @intCast(ci), .gid = gid });
         }
@@ -4109,7 +4189,7 @@ const Builder = struct {
     fn sameShapeStyle(a: TextStyle, b: TextStyle) bool {
         if (a.size != b.size or a.weight != b.weight or a.italic != b.italic or a.stretch != b.stretch or
             a.optical_sizing != b.optical_sizing or a.letter_spacing != b.letter_spacing or a.word_spacing != b.word_spacing or
-            a.caps != b.caps or a.synth_small_caps != b.synth_small_caps or a.unicode_bidi != b.unicode_bidi or a.rtl != b.rtl or
+            a.caps != b.caps or a.synth_small_caps != b.synth_small_caps or a.unicode_bidi != b.unicode_bidi or a.rtl != b.rtl or a.vertical != b.vertical or a.combine != b.combine or
             a.families.len != b.families.len or a.features.len != b.features.len or a.variations.len != b.variations.len) return false;
         for (a.families, b.families) |x, y| if (!std.mem.eql(u8, x, y)) return false;
         for (a.features, b.features) |x, y| if (!std.meta.eql(x, y)) return false;
@@ -4287,9 +4367,12 @@ const Builder = struct {
     }
 
     /// Shapes the pending buffer with features at size and appends its glyphs (spacing from style).
-    fn shapeOut(b: *Builder, comptime complex: bool, style: TextStyle, features: []const shp.FeatureSetting, size: f32, metric: u16) !void {
+    fn shapeOut(b: *Builder, comptime complex: bool, style: TextStyle, features_in: []const shp.FeatureSetting, size: f32, metric: u16) !void {
         const f = b.fonts.font(b.seg_face);
         const rtl = b.seg_level & 1 != 0;
+        const upright = b.seg_upright;
+        var vfeats: [40]shp.FeatureSetting = undefined;
+        const features = if (upright) vertFeatures(&vfeats, features_in) else features_in;
         try shp.shapeCached(complex, b.cache, f, &b.buf, .{
             .script = b.seg_script,
             .rtl = rtl,
@@ -4300,6 +4383,8 @@ const Builder = struct {
         const gs = b.buf.g();
         defer b.buf.list.clearRetainingCapacity();
         try b.glyphs.ensureUnusedCapacity(b.alloc, gs.len);
+        const seg_start = b.glyphs.items.len;
+        defer if (style.combine and style.vertical != .none) combineUnit(b.glyphs.items[seg_start..], size);
         const scale = @as(f64, size) * 65536.0 / @as(f64, @floatFromInt(f.units_per_em));
         const hang = b.hang;
         // CSS Text 4 §8.2.1: no letter-spacing inside a cursive script, but still at its word
@@ -4337,8 +4422,10 @@ const Builder = struct {
             paint_style.size = size;
             const paint_metric = if (b.metrics.items[metric].run == c.run) metric else try b.metricFor(c.run, b.seg_face, paint_style);
             var flags: u8 = 0;
-            var adv: f32 = scaleAdvance(g.x_adv, scale);
-            const kern: f32 = if (g.kern != 0 and g.x_adv != 0) adv - scaleAdvance(g.x_adv - g.kern, scale) else 0;
+            // (upright vertical glyphs advance by their vertical advance, as HarfBuzz's TTB shaping;
+            // zero-advance marks keep none)
+            var adv: f32 = if (upright) (if (g.x_adv != 0) scaleAdvance(f.advanceHeight(g.gid), scale) else 0) else scaleAdvance(g.x_adv, scale);
+            const kern: f32 = if (!upright and g.kern != 0 and g.x_adv != 0) adv - scaleAdvance(g.x_adv - g.kern, scale) else 0;
             // letter-spacing goes after every cluster (on its last glyph; the first one in a
             // right-to-left run, where it is the visually last)
             if (if (rtl) first else last) {
@@ -4363,14 +4450,52 @@ const Builder = struct {
                 .gid = g.gid,
                 .cluster = c.cluster,
                 .x_advance = adv,
-                .x_offset = if (g.x_off != 0) scaleAdvance(g.x_off, scale) else 0,
-                .y_offset = if (g.y_off != 0) scaleAdvance(g.y_off, scale) else 0,
+                .x_offset = if (g.x_off != 0 and !upright) scaleAdvance(g.x_off, scale) else 0,
+                .y_offset = if (g.y_off != 0 and !upright) scaleAdvance(g.y_off, scale) else 0,
                 .kern = kern,
                 .metric = paint_metric,
                 .flags = flags,
                 .level = b.seg_level,
                 .item = b.item,
+                .upright = upright,
             });
         }
+    }
+
+    /// `text-combine-upright: all`: the glyphs of a horizontally shaped segment become one upright unit
+    /// one em long, compressed horizontally to fit (Blink `LayoutTextCombine`, without the half-,
+    /// third- and quarter-width font variants it tries first).
+    fn combineUnit(gs: []ShapedGlyph, em: f32) void {
+        if (gs.len == 0) return;
+        var w: f32 = 0;
+        for (gs) |g| w += g.x_advance;
+        const s: f32 = if (w > em and w > 0) em / w else 1;
+        var at: f32 = 0;
+        for (gs, 0..) |*g, k| {
+            const off = at + g.x_offset;
+            at += g.x_advance;
+            // (y grows to the line's under side, which is the left once turned: the unit's start)
+            g.y_offset = -(w * s / 2 - off * s);
+            g.x_offset = 0;
+            g.x_advance = if (k + 1 == gs.len) em else 0;
+            g.kern = 0;
+            g.upright = true;
+            g.combine = s;
+            if (k > 0) g.flags = (g.flags & ~ShapedGlyph.BREAK_BEFORE) | ShapedGlyph.NO_SPLIT;
+        }
+    }
+
+    /// The features of an upright vertical segment: HarfBuzz's vertical (TTB) plan switches the
+    /// horizontal-only features off and `vert` on; the run's own settings follow.
+    fn vertFeatures(buf: *[40]shp.FeatureSetting, run_feats: []const shp.FeatureSetting) []const shp.FeatureSetting {
+        const fixed = [_]shp.FeatureSetting{
+            .{ .tag = "vert".*, .value = 1 }, .{ .tag = "kern".*, .value = 0 }, .{ .tag = "liga".*, .value = 0 },
+            .{ .tag = "clig".*, .value = 0 }, .{ .tag = "calt".*, .value = 0 }, .{ .tag = "curs".*, .value = 0 },
+            .{ .tag = "dist".*, .value = 0 }, .{ .tag = "rclt".*, .value = 0 },
+        };
+        @memcpy(buf[0..fixed.len], &fixed);
+        const n = @min(run_feats.len, buf.len - fixed.len);
+        @memcpy(buf[fixed.len..][0..n], run_feats[0..n]);
+        return buf[0 .. fixed.len + n];
     }
 };

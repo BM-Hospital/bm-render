@@ -151,6 +151,10 @@ pub const VariantPosition = enum(u8) { normal, sub, super };
 pub const VerticalAlign = union(enum) { baseline, sub, super, top, middle, bottom, text_top, text_bottom, lp: LP };
 pub const UnicodeBidi = enum(u8) { normal, embed, isolate, bidi_override, isolate_override, plaintext };
 pub const WritingMode = enum(u8) { horizontal_tb, vertical_rl, vertical_lr, sideways_rl, sideways_lr };
+/// `text-orientation` (`sideways-right` is the legacy alias of `sideways`).
+pub const TextOrientation = enum(u8) { mixed, upright, sideways, sideways_right };
+/// `text-combine-upright` (`digits <n>` is not supported).
+pub const TextCombineUpright = enum(u8) { none, all };
 /// SVG/text `paint-order` (only the first component matters for text: stroke under fill when `.stroke`).
 pub const PaintOrder = enum(u8) { normal, fill, stroke, markers };
 
@@ -476,6 +480,8 @@ pub const ComputedStyle = struct {
     vertical_align: VerticalAlign = .baseline,
     unicode_bidi: UnicodeBidi = .normal,
     writing_mode: WritingMode = .horizontal_tb, // inherited
+    text_orientation: TextOrientation = .mixed, // inherited
+    text_combine_upright: TextCombineUpright = .none, // inherited
     isolation: Isolation = .auto,
     background_blend_mode: []const BlendMode = &.{},
     backdrop_filter: []const Filter = &.{},

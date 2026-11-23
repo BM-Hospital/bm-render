@@ -302,6 +302,7 @@ pub const Prop = enum(u16) {
     tableLayout,
     textAlign,
     textAlignLast,
+    textCombineUpright,
     textDecoration,
     textDecorationColor,
     textDecorationLine,
@@ -309,6 +310,7 @@ pub const Prop = enum(u16) {
     textDecorationStyle,
     textDecorationThickness,
     textIndent,
+    textOrientation,
     textOverflow,
     textShadow,
     textTransform,
@@ -586,6 +588,8 @@ fn fieldsOf(comptime p: Prop) []const FieldRef {
         .verticalAlign => &.{fr("vertical_align")},
         .unicodeBidi => &.{fr("unicode_bidi")},
         .writingMode => &.{fr("writing_mode")},
+        .textOrientation => &.{fr("text_orientation")},
+        .textCombineUpright => &.{fr("text_combine_upright")},
         .backdropFilter, .WebkitBackdropFilter => &.{fr("backdrop_filter")},
         .clipPath, .WebkitClipPath => &.{fr("clip_path")},
         .mask, .WebkitMask => &.{ fr("mask_image"), fr("mask_size"), fr("mask_position"), fr("mask_repeat"), fr("mask_clip"), fr("mask_origin"), fr("mask_mode") },
@@ -636,7 +640,7 @@ fn fieldsOf(comptime p: Prop) []const FieldRef {
 
 pub fn isInherited(p: Prop) bool {
     return switch (p) {
-        .WebkitTextStroke, .WebkitTextStrokeColor, .WebkitTextStrokeWidth, .color, .direction, .font, .fontFamily, .fontSize, .fontStyle, .fontWeight, .imageRendering, .letterSpacing, .lineHeight, .overflowWrap, .wordWrap, .tabSize, .textAlign, .textIndent, .textShadow, .textTransform, .textWrap, .textWrapMode, .textWrapStyle, .visibility, .whiteSpace, .whiteSpaceCollapse, .wordBreak, .wordSpacing, .borderCollapse, .borderSpacing, .captionSide, .emptyCells, .listStyle, .listStyleType, .listStylePosition, .listStyleImage, .writingMode, .textAlignLast, .hyphens, .WebkitHyphens, .lineBreak, .textDecorationSkipInk, .textUnderlineOffset, .textUnderlinePosition, .WebkitTextFillColor, .paintOrder, .fontStretch, .fontVariationSettings, .fontFeatureSettings, .fontVariant, .fontVariantLigatures, .fontVariantNumeric, .fontVariantCaps, .fontVariantPosition, .fontVariantEastAsian, .fontKerning, .fontOpticalSizing, .fontSynthesis, .fontSynthesisWeight, .fontSynthesisStyle, .fontSynthesisSmallCaps, .widows, .orphans => true,
+        .WebkitTextStroke, .WebkitTextStrokeColor, .WebkitTextStrokeWidth, .color, .direction, .font, .fontFamily, .fontSize, .fontStyle, .fontWeight, .imageRendering, .letterSpacing, .lineHeight, .overflowWrap, .wordWrap, .tabSize, .textAlign, .textIndent, .textShadow, .textTransform, .textWrap, .textWrapMode, .textWrapStyle, .visibility, .whiteSpace, .whiteSpaceCollapse, .wordBreak, .wordSpacing, .borderCollapse, .borderSpacing, .captionSide, .emptyCells, .listStyle, .listStyleType, .listStylePosition, .listStyleImage, .writingMode, .textOrientation, .textCombineUpright, .textAlignLast, .hyphens, .WebkitHyphens, .lineBreak, .textDecorationSkipInk, .textUnderlineOffset, .textUnderlinePosition, .WebkitTextFillColor, .paintOrder, .fontStretch, .fontVariationSettings, .fontFeatureSettings, .fontVariant, .fontVariantLigatures, .fontVariantNumeric, .fontVariantCaps, .fontVariantPosition, .fontVariantEastAsian, .fontKerning, .fontOpticalSizing, .fontSynthesis, .fontSynthesisWeight, .fontSynthesisStyle, .fontSynthesisSmallCaps, .widows, .orphans => true,
         else => false,
     };
 }
@@ -2246,6 +2250,8 @@ fn kwEntryOf(comptime p: Prop) ?KwEntry {
         .isolation => ke(c.Isolation, fr("isolation")),
         .unicodeBidi => ke(c.UnicodeBidi, fr("unicode_bidi")),
         .writingMode => ke(c.WritingMode, fr("writing_mode")),
+        .textOrientation => ke(c.TextOrientation, fr("text_orientation")),
+        .textCombineUpright => ke(c.TextCombineUpright, fr("text_combine_upright")),
         .textDecorationSkipInk => ke(c.SkipInk, fr("text_decoration_skip_ink")),
         .textAlignLast => ke(c.TextAlignLast, fr("text_align_last")),
         .hyphens, .WebkitHyphens => ke(c.Hyphens, fr("hyphens")),
@@ -2340,6 +2346,68 @@ pub fn physicalProps(p: Prop, rtl: bool, buf: *[4]Prop) []const Prop {
     };
     buf[0] = p;
     return buf[0..1];
+}
+
+/// `physicalProps` for an element of style `s`: its `direction`, and its `writing-mode`, which in a
+/// vertical writing mode turns the inline axis vertical (inline-start = top, or bottom when `rtl`)
+/// and puts the block start on the right (`vertical-rl`, `sideways-rl`) or on the left.
+pub fn physicalPropsOf(p: Prop, s: *const S, buf: *[4]Prop) []const Prop {
+    const rtl = s.direction == .rtl;
+    if (s.writing_mode == .horizontal_tb) return physicalProps(p, rtl, buf);
+    var hb: [4]Prop = undefined;
+    // (the mapping of a horizontal left-to-right flow, turned: physical properties stay)
+    const h = physicalProps(p, false, &hb);
+    if (h.len == 1 and h[0] == p) {
+        buf[0] = p;
+        return buf[0..1];
+    }
+    const rl = s.writing_mode != .vertical_lr and s.writing_mode != .sideways_lr;
+    for (h, 0..) |q, i| buf[i] = turnProp(q, rtl, rl);
+    return buf[0..h.len];
+}
+
+/// A physical property of a horizontal left-to-right flow (left = inline-start, top = block-start)
+/// mapped to the one at the same logical place in a vertical flow.
+fn turnProp(q: Prop, rtl: bool, rl: bool) Prop {
+    const fams = [_][4]Prop{
+        .{ .marginTop, .marginRight, .marginBottom, .marginLeft },
+        .{ .paddingTop, .paddingRight, .paddingBottom, .paddingLeft },
+        .{ .top, .right, .bottom, .left },
+        .{ .borderTop, .borderRight, .borderBottom, .borderLeft },
+        .{ .borderTopWidth, .borderRightWidth, .borderBottomWidth, .borderLeftWidth },
+        .{ .borderTopStyle, .borderRightStyle, .borderBottomStyle, .borderLeftStyle },
+        .{ .borderTopColor, .borderRightColor, .borderBottomColor, .borderLeftColor },
+    };
+    // side index 0 top, 1 right, 2 bottom, 3 left -> its vertical-flow side
+    const is_side: usize = if (rtl) 2 else 0; // inline-start
+    const ie_side: usize = if (rtl) 0 else 2; // inline-end
+    const bs_side: usize = if (rl) 1 else 3; // block-start
+    const be_side: usize = if (rl) 3 else 1; // block-end
+    const turn = [4]usize{ bs_side, ie_side, be_side, is_side };
+    for (fams) |fam| {
+        for (fam, 0..) |x, k| if (x == q) return fam[turn[k]];
+    }
+    // corners: [block side][inline side] of the horizontal flow
+    const corners = [_]struct { Prop, usize, usize }{
+        .{ .borderTopLeftRadius, 0, 3 },    .{ .borderTopRightRadius, 0, 1 },
+        .{ .borderBottomLeftRadius, 2, 3 }, .{ .borderBottomRightRadius, 2, 1 },
+    };
+    for (corners) |cr| if (cr[0] == q) {
+        const v = turn[cr[1]]; // vertical flow: the block side is now left / right
+        const hz = turn[cr[2]]; // the inline side top / bottom
+        const top = hz == 0;
+        const right = v == 1;
+        return if (top) (if (right) .borderTopRightRadius else .borderTopLeftRadius) else (if (right) .borderBottomRightRadius else .borderBottomLeftRadius);
+    };
+    return switch (q) {
+        .width => .height,
+        .height => .width,
+        .minWidth => .minHeight,
+        .minHeight => .minWidth,
+        .maxWidth => .maxHeight,
+        .maxHeight => .maxWidth,
+        else => q,
+    };
 }
 
 /// True for the two-value logical shorthands `start [end]`.
@@ -3258,7 +3326,7 @@ pub fn apply(cx: *Cx, p: Prop, l: *Lexer) Error!void {
     const s = cx.s;
     const env = &cx.env;
     var pbuf: [4]Prop = undefined;
-    const phys = physicalProps(p, s.direction == .rtl, &pbuf);
+    const phys = physicalPropsOf(p, s, &pbuf);
     if (phys.len != 1 or phys[0] != p) return applyLogical(cx, p, l, phys);
     const ki = kw_index[@backingInt(p)];
     if (ki < kw_count) {

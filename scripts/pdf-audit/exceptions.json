@@ -273,6 +273,104 @@
       "match": "^definite height: what follows comes after the last table fragment \\(Chrome\\): word positions differ: page 4: bm \\[\"After\",7\\.5,52\\.9\\] vs takumi \\[\"After\",7\\.5,7\\.9\\]$",
       "status": "deliberate",
       "reason": "A table of a definite height with a repeated thead whose last row is cut in the free space of its cells: Chrome (Playwright Chromium printed to PDF, checked 2026-11-23) lays the last table fragment out below the repeated thead (the rest of the row, the spacing) and the block after the table follows it; takumi places that block at the top of the last page, over the repeated thead. bm-render follows Chrome. docs/PDF_AUDIT.md, Page model: table border spacing and rowspans at a break."
+    },
+    {
+      "probe": "text.decoration.vertical",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-rl-latin",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-lr-latin",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-rl-cjk",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-rl-cjk",
+      "kind": "text",
+      "match": "^extracted text: bm \".*\" vs takumi \".*\"$",
+      "status": "deliberate",
+      "reason": "bm-render lays the text out vertically (wrapped columns, upright glyphs advancing by their vertical advance), so pdftotext sees line breaks / gaps that takumi's single horizontal line does not have; the characters and their order are the same. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-mixed",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-mixed",
+      "kind": "text",
+      "match": "^extracted text: bm \".*\" vs takumi \".*\"$",
+      "status": "deliberate",
+      "reason": "bm-render lays the text out vertically (wrapped columns, upright glyphs advancing by their vertical advance), so pdftotext sees line breaks / gaps that takumi's single horizontal line does not have; the characters and their order are the same. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.upright",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.upright",
+      "kind": "text",
+      "match": "^extracted text: bm \".*\" vs takumi \".*\"$",
+      "status": "deliberate",
+      "reason": "bm-render lays the text out vertically (wrapped columns, upright glyphs advancing by their vertical advance), so pdftotext sees line breaks / gaps that takumi's single horizontal line does not have; the characters and their order are the same. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.sideways",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.sideways-rl",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.text-combine",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.text-combine",
+      "kind": "text",
+      "match": "^extracted text: bm \".*\" vs takumi \".*\"$",
+      "status": "deliberate",
+      "reason": "bm-render lays the text out vertically (wrapped columns, upright glyphs advancing by their vertical advance), so pdftotext sees line breaks / gaps that takumi's single horizontal line does not have; the characters and their order are the same. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
+    },
+    {
+      "probe": "text.vertical.vertical-wrapped",
+      "kind": "page-content",
+      "match": "^page 1 differs\\. Content stream at token \\d+ .*$",
+      "status": "deliberate",
+      "reason": "takumi has no vertical writing modes and lays the text out horizontally; bm-render lays it out vertically (CSS Writing Modes 4), so the text is drawn through a turned transform, upright glyphs as outlines under an invisible copy of the line. docs/PDF_AUDIT.md, Not ported: vertical writing modes."
     }
   ],
   "golden": [

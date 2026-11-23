@@ -264,6 +264,11 @@ const Node = struct {
     table_box: bool = false,
     /// index into Tree.table_geoms of this table's record (validated by `tableGeom`)
     table_geom: u32 = no_node,
+    /// An orthogonal flow root (CSS Writing Modes 4 §7): `style` places the box in its parent's space,
+    /// `ortho` is its style in its own writing mode, where its content is laid out (`setOrtho`).
+    ortho: ?*const Style = null,
+    /// the orthogonal flow root's own inline axis is vertical (picks `Tree.ortho_avail`)
+    ortho_v: bool = false,
 };
 
 const Entry = struct {
@@ -537,6 +542,10 @@ pub fn TreeWith(comptime cfg: Config) type {
         float_rects: std.ArrayList(fl.Rect) = .empty,
         /// paint geometry of the tables laid out by the last `compute` (see `tableGeom`)
         table_geoms: std.ArrayList(table.Geom) = .empty,
+        /// Available inline size of an orthogonal flow root whose containing block has no definite block size
+        /// (CSS Writing Modes 4 §7.3: the initial containing block's): [physical width, physical height] for
+        /// roots with a horizontal / vertical inline axis (NaN = unbounded).
+        ortho_avail: [2]f32 = .{ NONE, NONE },
         /// statistics of the last `compute`: number of MeasureFn invocations / node computations (cache misses)
         measure_calls: u32 = 0,
         node_computes: u32 = 0,
@@ -613,6 +622,19 @@ pub fn TreeWith(comptime cfg: Config) type {
         /// Measured nodes are always treated as leaves.
         pub fn setMeasured(self: *Self, node: NodeId, measured: bool) void {
             if (node < self.nodes.items.len) self.nodes.items[node].measured = measured;
+        }
+
+        /// Makes `node` an orthogonal flow root (CSS Writing Modes 4 §7): its own writing mode's axes are
+        /// the transpose of its parent's. `inner` is its style in its own writing mode (kept by the caller
+        /// for as long as the tree is laid out); the node's style stays the one its parent places it with.
+        /// The engine hands the node's own algorithm requests with the two axes swapped, its children are
+        /// laid out in its own (logical) space, and the caller maps their layouts to physical
+        /// coordinates. `vertical`: the node's own inline axis is the physical vertical one (picks the
+        /// fallback available inline size from `ortho_avail`).
+        pub fn setOrtho(self: *Self, node: NodeId, inner: *const Style, vertical: bool) void {
+            if (node >= self.nodes.items.len) return;
+            self.nodes.items[node].ortho = inner;
+            self.nodes.items[node].ortho_v = vertical;
         }
 
         /// Marks a measured replaced element such as an image.
@@ -736,7 +758,13 @@ pub fn TreeWith(comptime cfg: Config) type {
             self.rbox(&b, s, parent);
             var in: In = .{ .parent = parent, .avail = av, .layout = true };
             in.known = styledKnown(&in, &b);
-            if (!has(in.known[0]) and has(parent[0]) and !s.size[0].isKeyword()) {
+            if (self.nodes.items[root].ortho != null) {
+                // a root in a vertical writing mode: the initial containing block takes its writing mode,
+                // so the root's inline size (its height) fills the block size of the viewport, its block
+                // size (its width) is content-based
+                if (!has(in.known[1]) and has(parent[1]) and !s.size[1].isKeyword())
+                    in.known[1] = @max(clampO(parent[1] - b.marginSum(1), b.min[1], b.max[1]), b.pb[1]);
+            } else if (!has(in.known[0]) and has(parent[0]) and !s.size[0].isKeyword()) {
                 // block-level stretch fit (the root is blockified)
                 if (has(in.known[1])) in.known[0] = clampO(self.ratio(s, &b, 0, in.known[1]), b.min[0], b.max[0]);
                 if (!has(in.known[0])) in.known[0] = clampO(parent[0] - b.marginSum(0), b.min[0], b.max[0]);
@@ -1053,6 +1081,63 @@ pub fn TreeWith(comptime cfg: Config) type {
         /// `in` is normalised in place (callers must not rely on its flags / available space afterwards);
         /// the result is written to `out`.
         pub noinline fn computeNode(self: *Self, node: u32, in: *In, out: *Out) Error!void {
+            if (self.nodes.items[node].ortho != null) return self.computeOrtho(node, in, out);
+            return self.computeNodeIn(node, in, out);
+        }
+
+        /// An orthogonal flow root (`setOrtho`): the request in its parent's space is turned into one in its
+        /// own writing mode (axes swapped), answered there, and the result turned back. Its inline size is
+        /// fit-content against the available inline size (CSS Writing Modes 4 §7.3): the parent's definite
+        /// block size, else the initial containing block's (`ortho_avail`). It establishes an independent
+        /// formatting context: no margin collapsing through it, no baseline (one is synthesized).
+        noinline fn computeOrtho(self: *Self, node: u32, in: *In, out: *Out) Error!void {
+            const n = &self.nodes.items[node];
+            const outer = n.style;
+            const inner = n.ortho.?;
+            n.style = inner;
+            defer n.style = outer;
+            var li: In = .{
+                .known = .{ in.known[1], in.known[0] },
+                .parent = .{ in.parent[1], in.parent[0] },
+                .avail = .{ MAXC, MAXC },
+                .layout = in.layout,
+            };
+            if (!has(li.known[0])) {
+                var b: Box = undefined;
+                self.rbox(&b, inner, li.parent);
+                const space = if (has(li.parent[0])) li.parent[0] else self.ortho_avail[@intFromBool(n.ortho_v)];
+                var w = clampO(b.size[0], b.min[0], b.max[0]);
+                if (!has(w)) {
+                    // fit-content: min(max-content, max(min-content, available))
+                    var q: In = .{ .known = .{ NONE, li.known[1] }, .parent = li.parent, .avail = .{ MAXC, MAXC } };
+                    w = try self.measureChildIn(node, &q, 0);
+                    if (has(space) and w > space - b.marginSum(0)) {
+                        q = .{ .known = .{ NONE, li.known[1] }, .parent = li.parent, .avail = .{ MINC, MAXC } };
+                        const mn = try self.measureChildIn(node, &q, 0);
+                        w = @max(mn, space - b.marginSum(0));
+                    }
+                    w = clampO(w, b.min[0], b.max[0]);
+                }
+                li.known[0] = self.qt(@max(w, b.pb[0]));
+            }
+            var lo: Out = undefined;
+            try self.computeNodeIn(node, &li, &lo);
+            out.* = .{
+                .size = .{ lo.size[1], lo.size[0] },
+                .content = .{ lo.content[1], lo.content[0] },
+            };
+        }
+
+        /// `measureChild` without the orthogonal-flow wrapper (the node's own space).
+        fn measureChildIn(self: *Self, node: u32, in: *In, axis: usize) Error!f32 {
+            in.layout = false;
+            in.width_only = axis == 0;
+            var o: Out = undefined;
+            try self.computeNodeIn(node, in, &o);
+            return o.size[axis];
+        }
+
+        noinline fn computeNodeIn(self: *Self, node: u32, in: *In, out: *Out) Error!void {
             const n = &self.nodes.items[node];
             const c = &self.caches.items[node];
             if (n.plain) in.content_sizing = false;

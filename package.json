@@ -211,6 +211,7 @@
     "test:workers": "node scripts/worker-test.mjs",
     "test:limits": "node scripts/limits-test.mjs",
     "test:pdf": "node scripts/pdf-test.mjs",
+    "test:writing-mode": "node scripts/writing-mode-test.mjs",
     "test:pdf:chunks": "node scripts/pdf-chunks-check.mjs",
     "test:pdf:memory": "node scripts/pdf-memory.mjs",
     "test:pdf:takumi": "node scripts/pdf-compare.mjs",
