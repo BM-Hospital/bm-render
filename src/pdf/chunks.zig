@@ -26,7 +26,9 @@
 //! the flow a block; a part lays out the children of the flow from the one holding its first
 //! page's start, and the page it stops at is chosen as it is laid out. A child may hold a part's
 //! start (`Flow.cuttable`) unless a `#fragment` link in it or before it reaches it or a later
-//! child, or it holds a positioned or transformed box.
+//! child. The start may be inside a table (between its rows), a flex container or a grid (before
+//! a line, a row or an item of a single flow) as well as inside blocks: any start that is one point
+//! (paged.zig `resumeKid`); a row broken inside (parallel flows) is no start a part can take.
 const std = @import("std");
 const render = @import("../render.zig");
 const style = @import("../style/style.zig");
@@ -294,20 +296,10 @@ fn flowPlan(a: Allocator, f: *const Frame, flow: u32) Error!?Flow {
         const gop = try ids.getOrPut(a, e.id);
         if (!gop.found_existing or k > gop.value_ptr.*) gop.value_ptr.* = k;
     }
-    // a kid holding a positioned or transformed box: the boxes the walk lifts out of their page
-    // pass do not tag a page the same when the kid is laid out from one of its pages on (only
-    // the whole kid laid out gives the document's marked content)
-    for (kids.items, 0..) |kid, k| {
-        const end: usize = if (k + 1 < kids.items.len) kids.items[k + 1] else d.els.items.len;
-        for (d.els.items[kid..end], kid..) |*e, idx| {
-            if (bareText(f, @intCast(idx)) or e.cs.display == .none) continue;
-            const cs = e.cs;
-            if (cs.position != .static or cs.transform.len > 0 or cs.rotate != 0 or cs.scale[0] != 1 or cs.scale[1] != 1 or !zeroLp(cs.translate[0]) or !zeroLp(cs.translate[1])) {
-                cuttable[k] = false;
-                break;
-            }
-        }
-    }
+    // (a kid holding a positioned or transformed box may hold a start too: both parts lay the
+    // whole kid out, so its lifted boxes are painted and tagged in the same page passes; a box
+    // that paints onto a page of the part before or after is refused when the part is laid out,
+    // paged.zig `FlowIter.lay`)
     for (d.els.items, 0..) |*e, idx| {
         if (e.run) continue;
         const href = d.attr(@intCast(idx), "href") orelse continue;

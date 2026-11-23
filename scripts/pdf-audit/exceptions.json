@@ -181,7 +181,7 @@
       "kind": "text",
       "match": "^sidebar: text per page: bm ",
       "status": "open",
-      "reason": "Not what the Rust test asserts (that passes: the sidebar paints once). On the last page of a table that is a row-flex item and breaks over pages, takumi's rows are 14.3-14.4 px tall where both engines use 13.5 px on every earlier page; bm keeps 13.5 px, so pdftotext orders the words of page 3 differently (same words). Not yet checked against Chrome; docs/PDF_AUDIT.md, Page model."
+      "reason": "Not what the Rust test asserts (that passes: the sidebar paints once). On the last page of a table that is a row-flex item and breaks over pages, takumi's rows are 14.3-14.4 px tall where both engines use 13.5 px on every earlier page; bm keeps 13.5 px, so pdftotext orders the words of page 3 differently (same words). Chrome agrees with takumi: the table is stretched to the flex line (align-items: stretch) and the extra block size of that definite height goes to the rows of the last fragment (with align-items: start Chrome, takumi and bm all keep the row height). Open bm bug, not fixed; docs/PDF_AUDIT.md, Page model."
     },
     {
       "probe": "upstream.html_fixtures_paint_from_their_windows",
@@ -251,14 +251,14 @@
       "kind": "text",
       "match": "^report\\.html 300x120: text per page: bm ",
       "status": "open",
-      "reason": "Open: on 120 px / 90 px pages the report appendix paragraph lands one page later in bm (300x120) and bm needs 24 pages instead of 23 (250x90, margin 12). Found by the window_scenes / pagination.rs port; pagination at tiny page heights not investigated yet."
+      "reason": "Open: on 300x120 pages with no margin the report's appendix paragraph (one line, 16 px block margins) ends inside page 13 but its block-end margin does not: takumi and Chrome keep it on page 13 and add an empty page 14 for the margin; bm treats the column-flex item's margin box as not fitting and moves it to page 14. (The 250x90 page count, from the block-end margin of the item before a break carried onto the next page, is fixed: src/layout/fragment.zig, test `paged flex column: ...`.) docs/PDF_AUDIT.md, Page model."
     },
     {
       "probe": "upstream.html_fixtures_paint_from_their_windows",
       "kind": "page-content",
       "match": "^report\\.html 300x120: paint fills per page: bm ",
       "status": "open",
-      "reason": "Open: on 120 px / 90 px pages the report appendix paragraph lands one page later in bm (300x120) and bm needs 24 pages instead of 23 (250x90, margin 12). Found by the window_scenes / pagination.rs port; pagination at tiny page heights not investigated yet."
+      "reason": "Open: on 300x120 pages with no margin the report's appendix paragraph (one line, 16 px block margins) ends inside page 13 but its block-end margin does not: takumi and Chrome keep it on page 13 and add an empty page 14 for the margin; bm treats the column-flex item's margin box as not fitting and moves it to page 14. (The 250x90 page count, from the block-end margin of the item before a break carried onto the next page, is fixed: src/layout/fragment.zig, test `paged flex column: ...`.) docs/PDF_AUDIT.md, Page model."
     },
     {
       "probe": "upstream.page_summaries_add_up_to_the_summary_of_the_whole_scene",
@@ -273,20 +273,6 @@
       "match": "^certificate\\.html 250x90: link destinations per page: bm ",
       "status": "open",
       "reason": "Open: at 523x770 with no page margin the letter-spaced heading NORTHWIND INSTITUTE OF DESIGN reaches the page edge and its last glyph is extracted from takumi's file only; on the small window_scenes.rs page sizes (400x300 and smaller) the certificate splits over the pages differently. Found by the window_scenes port; not investigated yet."
-    },
-    {
-      "probe": "upstream.page_summaries_add_up_to_the_summary_of_the_whole_scene",
-      "kind": "page-count",
-      "match": "^report\\.html 250x90: page count: bm ",
-      "status": "open",
-      "reason": "Open: on 120 px / 90 px pages the report appendix paragraph lands one page later in bm (300x120) and bm needs 24 pages instead of 23 (250x90, margin 12). Found by the window_scenes / pagination.rs port; pagination at tiny page heights not investigated yet."
-    },
-    {
-      "probe": "upstream.page_summaries_add_up_to_the_summary_of_the_whole_scene",
-      "kind": "links",
-      "match": "^report\\.html 250x90: link destinations per page: bm ",
-      "status": "open",
-      "reason": "Open: on 120 px / 90 px pages the report appendix paragraph lands one page later in bm (300x120) and bm needs 24 pages instead of 23 (250x90, margin 12). Found by the window_scenes / pagination.rs port; pagination at tiny page heights not investigated yet."
     }
   ],
   "golden": [

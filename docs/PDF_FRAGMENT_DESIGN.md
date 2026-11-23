@@ -69,6 +69,10 @@ A frame cannot change its inline size during pagination. Pages of another width 
   `start_top`); counters (`counters.Seg`), links/anchors (`interactive.Collector.beginRun`), the
   structure tree and the emitter's neighbouring passes work across frames. A page whose start cannot
   be found again keeps the previous run's width.
+- A paragraph whose first line a float pushed onto the page (its box started on the page before)
+  resumes at line 0; the page starts at the earliest of its flows' points (`startY`: the float's
+  continuation above the line), and the line is not first moved to the page top
+  (`Frame.paginate`'s float re-flow is for lines resumed after a cut).
 
 Tokens refer to layout node ids of a frame that shares the element model; across independently
 built frames (section 5) they are re-keyed by DOM element (`paged.NodeKey`: nearest element plus
@@ -105,7 +109,10 @@ There are three lifetimes:
   break: a part lays out the flow's children from the one holding its first page's start up to at
   least `chunk_elements / 4` elements (`flowBudget`), keeps every page but its last, and hands a
   `Resume` (`NodeKey`, line + first glyph, page tops before/at/after, the child's top) to the next
-  part, which must reproduce the same break.
+  part, which must reproduce the same break. The start may be inside blocks, between the rows of a
+  table, before a line / row / item of a flex or grid container (`paged.resumeKid`: any start that
+  is one point), and inside a child holding positioned or transformed boxes (both parts lay that
+  child out whole; ink crossing the seam is refused).
 - `DocWriter`: `beginChunk` → `drawPages` (pages of that part, link annotations registered up front)
   → `endChunk` (structure tree built per part and copied compactly, `tags.Skip` / `tags.Carry` hand
   records over a seam, anchors/headings resolved to destinations: `handOn` / `takeOn`) → `finish`
@@ -122,12 +129,13 @@ held — i.e. the whole document waits — when:
 
 | Condition | Why the page cannot be settled | takumi behaviour (`streaming_tests.rs`) |
 |:--|:--|:--|
-| a child of the flow holds a positioned or transformed box (`Flow.cuttable` false) | it may paint into an earlier page or move the break | holds pages back to the reach of the transform / positioned box |
+| a box of the flow paints past the seam (a transform or a positioned box reaching an earlier or later part's page: `Extents.computeWith`) | it would be painted by the wrong part | holds pages back to the reach of the transform / positioned box |
 | `position: fixed`, floats among the flow's children, an absolute box whose containing block is outside its child | repeats on every page / exclusions cross the seam / its page is unknown | holds the containing block's pages until the box is found |
 | page counters or target counters in the content, page rules depending on the root, pages of different widths | page numbers or geometry settle only after the whole layout | numbers again (bounded passes) before drawing |
 | a `#fragment` link to a later part | its annotation is decided when its part is drawn: the parts between are joined | draws before layout ends and fixes the link later |
 | the seam check fails (the next frame breaks differently, or ink crosses the cut: `Extents.computeWith`) | the part would not equal the whole document | n/a |
-| table / flex / grid tokens with branches, cut inside such a container | no single-point resume token | resumes inside |
+| a start with parallel flows: a table row, flex line or grid row broken inside (`Start.branches`), a rowspan running on (`side_flows`) | no single-point resume token (that page is no cut; the part grows to the next one) | resumes inside |
+| one very long child of the flow (a single long table) | cut, but each part lays the whole child out again: no memory gain | lays out a page at a time |
 
 Fonts, destinations and structure objects are finalized after the page streams; streams only
 reference stable document object ids. No pointer into a part's arena survives `endChunk` (records
@@ -168,16 +176,23 @@ and are indicative only; live bytes and peaks are deterministic.
 
 What still grows with the page count (task 21): the shared element model and styles (about
 55 KiB per stress page), encoded page streams and the structure tree kept until `finish` (about
-11 KiB per stress page), and the object map built when the file is assembled.
+11 KiB per stress page), and the object map built when the file is assembled. The stress document
+is cut at its forced breaks; its peak is the element model, not its tables.
+
+Long tables without forced breaks (`--stress`, 60-row tables on the stress page, cut between table
+rows since 2026-11-23): 200 tables / 201 pages, peak 186.93 MiB laid out whole (before: no page
+boundary could be cut at) → 70.82 MiB in 198 parts, live after page 50 / 200 = 43.60 / 49.34 MiB;
+4.17 → 8.58 ms/page, as each part lays out again the table the next part starts in.
 
 ## 8. Open items
 
-- Cutting inside tables, flex and grid containers, and inside children holding positioned or
-  transformed boxes (they hold the whole document today, see the table in section 5).
+- Cutting where a page starts with parallel flows (a table row, flex line or grid row broken
+  inside, a running rowspan), and inside one very long child of the flow without laying it out
+  again per part (rows of an auto-layout table depend on every row's content).
 - Pages with forward links are joined instead of drawn early; page / target counters in the content
   and fixed boxes lay out the whole document.
 - Streaming adapters of `streaming_tests.rs` compare output equivalence and part emission
-  (`npm run test:pdf:chunks`, 55 cases); takumi's layout-pass counts and "laid at first page"
+  (`npm run test:pdf:chunks`, 75 cases); takumi's layout-pass counts and "laid at first page"
   instrumentation have no bm counterpart. The case-by-case status is in
   `scripts/pdf-coverage-map.json`.
 - `window_scenes.rs` fixtures at small page sizes paginate differently from takumi (open

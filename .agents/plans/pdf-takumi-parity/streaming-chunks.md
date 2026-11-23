@@ -75,3 +75,19 @@ Còn lại:
 2. DOM + style vẫn tuyến tính (stress ~55 KiB/trang); tích lũy khi emit ~11 KiB/trang ở stress (content stream, cây tag giữ đến cuối, heading), ~2–4 KiB/trang ở 700 section.
 3. Ráp file: map/rows theo số object và cây tag đóng gói vẫn nằm cùng lúc với file.
 4. Pass đếm + pass vẽ = layout hai lần khi band có totalPages (whole cũng vậy chỉ khi margin theo band).
+
+## Trạng thái 2026-11-23: cắt trong bảng / flex / grid và trong con có box positioned/transform
+
+Đã làm (cắt tại ranh giới trang bất kỳ, `.flowing`):
+- `paged.resumeKid`: chuỗi box từ node của token tới flow nay được đi qua row group / row của bảng, container flex / grid và item của chúng (item được blockify, display gì cũng được). Token một điểm không bao giờ trỏ vào ô (row bị cắt giữa là các nhánh song song, `Start.branches`), nên bảng chỉ được cắt giữa hai row; flex/grid cắt trước một line, một row hoặc một item của luồng đơn (flex column, grid một cột). Phần sau layout lại cả con của flow đó từ token, và các kiểm tra sẵn có (trang 1 bắt đầu đúng `top`, trang 2 bắt đầu đúng chỗ phần trước có, ink không vượt seam, cấu trúc/anchor chuyển qua seam) quyết định cắt hay fallback.
+- `chunks.flowPlan`: bỏ điều kiện "con chứa box positioned/transform thì không cắt được". Cả hai phần đều layout cả con đó nên box được lift vẽ và gắn tag trong cùng các pass trang; box vẽ sang trang của phần trước/sau vẫn bị kiểm tra ink từ chối (vd. `flow-rotated-long`, `flow-abs-far`: layout whole). Điều kiện lần trước ghi lại (translate + relative làm tag khác) không còn tái hiện được: 8 case mới đều tương đương, phần lớn trùng byte.
+- Token dòng 0 (đoạn mà dòng đầu bị float đẩy sang trang sau) nay tiếp tục được (`fragment.mainStartY` nhận dòng 0), cũng dùng cho phần sau của `.flowing`.
+
+Chưa làm: token có nhánh (row bảng bị cắt giữa, flex row line / grid row nhiều item bị cắt giữa) — trang đó không làm điểm cắt; row có rowspan đang chạy (side flow) cũng vậy (`flow-table-rowspan`: whole). Bảng một mình rất dài vẫn được layout lại toàn bộ ở mỗi phần (con của flow là đơn vị layout): đúng nhưng không giảm bộ nhớ; muốn giảm phải lọc row trong bảng, mà width cột auto phụ thuộc mọi row (chỉ an toàn với `table-layout: fixed`).
+
+Kiểm chứng: `npm run test:pdf:chunks` 75/75 tương đương trên native và wasm (+20 case: `flow-table-*`, `flow-one-long-table`, `flow-flex-*`, `flow-grid-*`, `flow-relative-*`, `flow-translated-long`, `flow-abs-*`, `flow-positioned-mix`, `flow-rotated-long`; 12 case `parts: true` mới fail ở HEAD vì bị vẽ whole: 6 bảng/flex/grid, 6 con có box positioned/transform). Ở HEAD `flow-table-rows` 2 phần, nay 10.
+
+Số đo (native, `node scripts/pdf-memory.mjs --stress`):
+- Stress doc (forced break) không đổi: 500 trang peak 52,96 MiB, 18 phần. Phần lớn là DOM + style dùng chung (checkpoint `frame: styled` ≈ 24,8 MiB trên 500 trang, ~50 KiB/trang); một phần chỉ ~5 MiB. Bảng không phải nguyên nhân: stress doc cắt tại forced break, không cần cắt trong bảng. Bản không forced break (`stressHtml(500)` bỏ `break-after`): peak 52,8 MiB cả trước và sau, phần 29 → 176.
+- Bảng dài không forced break (dòng mới `--stress`, 60 row mỗi bảng): 200 bảng / 201 trang peak 186,9 MiB (HEAD: layout whole, "no page boundary to cut at") → 70,8 MiB, 198 phần; live sau trang 50 / 200 = 43,6 / 49,3 MiB. Đổi lại thời gian: 4,2 → 8,6 ms/trang so với layout whole (mỗi bảng ~1 trang nên mỗi phần layout lại ~2 bảng của phần sau: điều kiện "còn ít nhất một trang và một con của flow sau điểm cắt").
+- 700 section (`memory_tests.rs`) không đổi: ×1,036 / ×1,064, peak 7,61 MiB.

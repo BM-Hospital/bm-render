@@ -119,6 +119,16 @@ same("lists.image", "list-style-image: image markers", [
   ["host-flex", `<ul style="${S};list-style-image:url(${PNG})"><li style="display:flex"><span>flex a</span><span>b</span></li></ul>`],
   ["host-grid", `<ul style="${S};list-style-image:url(${PNG})"><li style="display:grid"><span>grid</span></li></ul>`],
   ["host-img", `<ul style="${S};list-style-image:url(${SVG})"><li><img src="${PNG}" width="20" height="20"> after</li></ul>`],
+  // an item starting with a box of its own formatting context: the outside marker sits beside the item's first
+  // baseline (Blink PositionListMarkerBesideChild), or at its content top when nothing has one
+  ["host-flex-child", `<ul style="${S};list-style-image:url(${PNG})"><li><div style="display:flex">flex child</div></li></ul>`],
+  ["host-table", `<ul style="${S};list-style-image:url(${PNG})"><li><table><tr><td>cell</td></tr></table></li></ul>`],
+  ["host-img-block", `<ul style="${S};list-style-image:url(${SVG})"><li><img src="${PNG}" width="20" height="20" style="display:block">after</li></ul>`],
+  ["host-flex-child-decimal", `<ol style="${S}"><li><div style="display:flex">flex child</div></li></ol>`],
+  ["host-grid-child-decimal", `<ol style="${S}"><li><div style="display:grid;grid-template-columns:1fr 1fr;font-size:20px"><span style="grid-column:2">b</span><span>a</span></div></li></ol>`],
+  ["host-table-margin-decimal", `<ol style="${S}"><li><table style="margin-top:6px"><tr><td style="padding:5px">cell</td></tr></table></li><li><div style="display:flex;align-items:end;height:40px"><span>b1</span><span style="font-size:30px">b2</span></div></li></ol>`],
+  ["host-image-only-decimal", `<ol style="${S}"><li><img src="${PNG}" width="20" height="20" style="display:block"></li><li>next</li></ol>`],
+  ["host-rtl-flex-decimal", `<ol dir="rtl" style="${S};padding-right:30px"><li><div style="display:flex">flex child</div></li></ol>`],
 ]);
 
 const many = (n, style) => `<ul style="${S};${style}">${Array.from({ length: n }, (_, i) => `<li>item ${i + 1}</li>`).join("")}</ul>`;
@@ -130,6 +140,7 @@ same("lists.image.pages", "list-style-image: image markers on every page", [
 
 same("lists.image.tagged", "list-style-image: Lbl structure", [
   ["missing", `<ul style="${S};list-style-image:url(https://example.invalid/m.png)"><li>one</li></ul>`, { options: TAGGED }],
+  ["host-flex-decimal", `<ol style="${S}"><li><div style="display:flex">flex child</div></li><li><table><tr><td>cell</td></tr></table></li></ol>`, { options: TAGGED }],
 ]);
 
 /** The marked-content ids each `Lbl` of the structure tree holds. */
@@ -151,18 +162,6 @@ differs("lists.image.tagged", "list-style-image: Lbl structure", [
   check: (t, r) => { t.ok(!labels(r).length && (r.structure.tree.match(/^\s*P\b/gm) || []).length === 1, "no Lbl, one P"); },
 });
 
-differs("lists.image", "list-style-image: image markers", [
-  ["host-flex-child", `<ul style="${S};list-style-image:url(${PNG})"><li><div style="display:flex">flex child</div></li></ul>`],
-  ["host-table", `<ul style="${S};list-style-image:url(${PNG})"><li><table><tr><td>cell</td></tr></table></li></ul>`],
-  ["host-img-block", `<ul style="${S};list-style-image:url(${SVG})"><li><img src="${PNG}" width="20" height="20" style="display:block">after</li></ul>`],
-  ["host-flex-child-decimal", `<ol style="${S}"><li><div style="display:flex">flex child</div></li></ol>`, { text: false }],
-], "not ported: an outside marker of an item that starts with a box of its own formatting context (flex / grid / table child, block image) is dropped by bm-render; takumi hangs it beside that child's first baseline, or the next line's (Blink PositionListMarkerBesideChild)", {
-  draw: false,
-  check: (t, r) => {
-    t.ok(!/\b6 0 0 6 11\.25 /.test(content(r)), "no marker image");
-    t.ok(!squash(r.text).startsWith("1."), "no marker text");
-  },
-});
 
 // ------------------------------------------------------------------------------------------------ 12 content: url()
 

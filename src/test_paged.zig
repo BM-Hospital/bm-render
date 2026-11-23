@@ -481,6 +481,45 @@ test "paged floats: a clearing float after a split float shows on the page of an
     try T.expect(absTop(f, g.lid) >= d.windows[1].top);
 }
 
+test "paged flex column: the block-end margin of the item before a break is truncated at the page start" {
+    if (!enabled) return error.SkipZigTest;
+    // (66 px page areas: A ends at 50, its 30 px margin reaches 80, past the page end at 66; B's
+    // own 10 px margin stays: B starts at 66 + 10, not at 90 with the rest of A's margin above it.
+    // takumi window_scenes.rs report.html at 250x90, Chrome likewise)
+    const src = "<style>html,body{margin:0;padding:0}</style><main style=\"display:flex;flex-direction:column\"><div style=\"height:50px;margin-bottom:30px\">A</div><div id=\"b\" style=\"height:20px;margin-top:10px\">B</div></main>";
+    const d = try open(.html, src, 250, 90, 12);
+    defer d.deinit();
+    try T.expectEqual(@as(usize, 2), d.count());
+    const b = try nodeOfId(d, "b");
+    try T.expectApproxEqAbs(@as(f32, 76), absTop(&d.f, b.lid), 0.02);
+}
+
+test "paged floats: a first line pushed below a float onto a page of another width wraps at that width" {
+    if (!pdf_enabled) return error.SkipZigTest;
+    const r = rt.Renderer.create(T.allocator) orelse return error.OutOfMemory;
+    defer r.destroy();
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ls: std.ArrayList(u8) = .empty;
+    for (1..4) |i| try ls.appendSlice(a, try std.fmt.allocPrint(a, "<div class=\"l\">L{d}</div>", .{i}));
+    var fs: std.ArrayList(u8) = .empty;
+    for (1..11) |i| try fs.appendSlice(a, try std.fmt.allocPrint(a, "<div class=\"l\">F{d}</div>", .{i}));
+    // (the float, wider than its container, runs from 60 to 260 px; the paragraph's box starts
+    // beside it on page 1, its first line below it on the 360 px page 2: pinned takumi wraps the
+    // paragraph there at 340 px, three lines from 260 px, after the float's last line)
+    const src = try std.fmt.allocPrint(a, "<style>@page{{size:300px 200px;margin:10px}}@page:left{{size:360px 200px;margin:10px}}html,body{{margin:0;padding:0}} body{{font:12px/20px Inter}} .l{{height:20px}} p{{margin:0}}</style>{s}<div style=\"float:left;width:400px\">{s}</div><p id=\"p\">{s}</p>", .{ ls.items, fs.items, try wordList(a, "w", 15) });
+    const d = try pdfLayOut(r, src);
+    defer d.release(r);
+    try T.expectEqual(@as(usize, 2), d.pages.len);
+    try expectLinesFitPages(&d);
+    const f = d.pages[1].frame orelse d.frame;
+    const p = try nodeOfFrameId(f, "p");
+    const tl = p.tl orelse return error.MissingText;
+    const top = absTop(f, p.lid);
+    try T.expectApproxEqAbs(@as(f32, 260), top + tl.lines[0].top, 0.02);
+}
+
 fn nodeOfFrameId(f: *const rt.Frame, id: []const u8) !*const rt.Node {
     for (f.nodes.items) |*n| {
         if (n.el != rt.none and std.mem.eql(u8, f.dom.at(n.el).id, id)) return n;

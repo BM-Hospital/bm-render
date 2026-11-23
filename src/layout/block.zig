@@ -497,6 +497,11 @@ pub noinline fn compute(t: anytype, node: u32, in_: *const In, out: *Out) Error!
         c.area = .{ box.border[0], box.border[1], outer_w - box.border[0] - box.border[2], outer_h - box.border[1] - box.border[3] };
         for (abs[0..n_abs]) |a| {
             c.sp = .{ .rect = .{ inset[0], a.y, inner_w, 0 }, .al = .{ if (s.rtl) 2 else 0, 0 } };
+            // (an outside list marker beside the first baseline of the item's content)
+            if (t.nodes.items[a.node].style.list_marker and has(first_bl)) {
+                c.sp.rect[1] = first_bl;
+                c.sp.al[1] = 3;
+            }
             try t.placeAbsolute(node, a.node, &c.area, &c.sp);
             t.accumContent(&c.content, a.node);
         }

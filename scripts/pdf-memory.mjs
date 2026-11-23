@@ -8,7 +8,8 @@
 // wasm memory size. Each render runs in a child process of its own (a fresh heap).
 //
 //   node scripts/pdf-memory.mjs              the invariant, and peak / live figures
-//   node scripts/pdf-memory.mjs --stress     also the stress document at 1, 10, 100 and 500 pages (peak, live, time, size)
+//   node scripts/pdf-memory.mjs --stress     also the stress document at 1, 10, 100 and 500 pages (peak, live, time, size),
+//                                            and long tables without forced breaks (50 and 200 tables)
 //   node scripts/pdf-memory.mjs --stress --sizes=100,500     other page counts of the stress document
 //   BM_PDF_CHUNKS=off node scripts/pdf-memory.mjs   the document laid out whole (for comparison; fails)
 //
@@ -35,6 +36,10 @@ function addonFile() {
 const sections = (count) =>
   `<div style="font-size: 12px">${Array.from({ length: count }, (_, i) => `<section><h2>Section ${i}</h2><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p></section>`).join("")}</div>`;
 
+/** Long tables and no forced break: most page boundaries fall between the rows of a table (60 rows each). */
+const tables = (count) =>
+  `<div style="font-family:Inter;font-size:11px">${Array.from({ length: count }, (_, t) => `<table style="width:100%;border-collapse:collapse;margin:8px 0"><thead><tr><th>Item</th><th>Qty</th><th>Amount</th></tr></thead><tbody>${Array.from({ length: 60 }, (_, r) => { const i = t * 60 + r; return `<tr><td style="border-bottom:1px solid #e2e8f0">Line ${i}</td><td style="text-align:right">${i % 23}</td><td style="text-align:right">${(i * 37) % 997}.50</td></tr>`; }).join("")}</tbody></table>`).join("")}</div>`;
+
 const child = args.find((a) => a.startsWith("--child="))?.slice(8);
 if (child) {
   process.env.BM_RENDER_BACKEND = "native";
@@ -48,6 +53,9 @@ if (child) {
   if (child.startsWith("sections")) {
     source = sections(Number(child.split(":")[1] ?? 700));
     options = { size: { width: 320, height: 240 }, margin: 24, header: `<div style="font-family:Inter">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>`, ...chunks };
+  } else if (child.startsWith("tables")) {
+    source = tables(Number(child.split(":")[1]));
+    options = { ...stressCorpus([1])[0].options(), ...chunks };
   } else {
     source = stressHtml(Number(child));
     options = { ...stressCorpus([1])[0].options(), ...chunks };
@@ -107,6 +115,16 @@ if (args.includes("--stress")) {
     const d = t.passes.find((p) => p.label === "emit: page done");
     const cell = (v) => (v == null ? "-" : MiB(v));
     console.log(`| ${n} | ${(t.ms / n).toFixed(2)} | ${MiB(t.peak)} | ${cell(d?.first)} | ${cell(d?.early)} | ${cell(d?.late)} | ${cell(d?.last)} | ${t.parts}${t.whole.length ? " (whole: " + t.whole.join("; ") + ")" : ""} | ${(t.bytes / n / 1024).toFixed(1)} |`);
+  }
+  // (cut between table rows: paged.zig `resumeKid`)
+  console.log("long tables, no forced break (60-row tables, the stress page; cut at page boundaries inside the tables):");
+  console.log("| tables | pages | ms/page | peak | live after page 50 | live after page 200 | parts |");
+  console.log("|--:|--:|--:|--:|--:|--:|--:|");
+  for (const n of [50, 200]) {
+    const t = run(`tables:${n}`);
+    const d = t.passes.find((p) => p.label === "emit: page done");
+    const cell = (v) => (v == null ? "-" : MiB(v));
+    console.log(`| ${n} | ${d?.pages ?? "?"} | ${(t.ms / (d?.pages || 1)).toFixed(2)} | ${MiB(t.peak)} | ${cell(d?.early)} | ${cell(d?.late)} | ${t.parts}${t.whole.length ? " (whole: " + t.whole.join("; ") + ")" : ""} |`);
   }
 }
 process.exitCode = failed ? 1 : 0;

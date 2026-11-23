@@ -332,8 +332,11 @@ probe("pagination.float.source-fit-split", "pinned upstream float fit/split asse
       ...['left', 'right', 'both'].map((c) => [`clear:${c} after a split float`, doc(lines(1, 5) + side('left', '', F(1, 8, 'F')) + side('right', '', F(1, 3, 'R')) + `<p>${W(30)}</p><div class="l" style="clear:${c}">CLR</div>` + lines(6, 8), css)]),
       ['a clearing float after a split float', doc(lines(1, 5) + side('left', '', F(1, 8, 'F')) + side('left', 'clear:left', F(1, 2, 'G')) + `<p>${W(30)}</p>` + lines(6, 8), css)],
     ],
-    oversized: (css, wide) => [
-      ...(wide ? [] : [['a float wider than its container and taller than the page', doc(lines(1, 3) + `<div style="float:left;width:400px">${F(1, 10, 'F')}</div><p>${W(30)}</p>`, css)]]),
+    oversized: (css) => [
+      ['a float wider than its container and taller than the page', doc(lines(1, 3) + `<div style="float:left;width:400px">${F(1, 10, 'F')}</div><p>${W(30)}</p>`, css)],
+      // (the paragraph's first line, pushed below the float onto a page of another width, wraps at that width: task 16/18)
+      ['a float wider than its container pushes the first line to a later page', doc(lines(1, 7) + `<div style="float:left;width:400px">${F(1, 4, 'F')}</div><p>${W(40)}</p>`, css)],
+      ['a wide float over two pages before a paragraph', doc(lines(1, 3) + `<div style="float:left;width:400px">${F(1, 18, 'F')}</div><p>${W(60)}</p>`, css)],
       ['a monolithic float taller than the page', doc(lines(1, 3) + `<div style="float:left;width:80px;height:400px;overflow:hidden">M</div><p>${W(60)}</p>`, css)],
       ['a float of text taller than the page', doc(lines(1, 3) + side('left', '', F(1, 25, 'F')) + `<p>${W(80)}</p>`, css)],
     ],

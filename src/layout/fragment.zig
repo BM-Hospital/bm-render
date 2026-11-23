@@ -844,13 +844,15 @@ fn Engine(comptime T: type) type {
             for (s.branches) |p| if (!p.finished and p.node == c) return p.forced;
             return s.forced;
         }
-        /// The block offset `Options.start` names (null: no point to break at).
+        /// The block offset `Options.start` names (null: no point to break at): the earliest of its
+        /// flows' points, where the page starts (a float continued above a paragraph line it pushed
+        /// onto the page: the page starts at the float, the line stays below it).
         fn startY(e: *Self, s: Start) ?f32 {
             var y = e.mainStartY(s);
             for (s.side_flows) |p| {
                 if (p.finished) continue;
                 const side = e.mainStartY(.{ .node = p.node, .line = p.line, .forced = p.forced }) orelse return null;
-                y = if (y) |main| @max(main, side) else side;
+                y = if (y) |main| @min(main, side) else side;
             }
             return y;
         }
@@ -869,7 +871,7 @@ fn Engine(comptime T: type) type {
             const top = e.absTopOf(s.node);
             if (s.line != no_node) {
                 const lines = e.linesOf(s.node);
-                if (s.line == 0 or s.line >= lines.len) return null;
+                if (s.line >= lines.len) return null;
                 return top + lines[s.line].top;
             }
             return top - (if (s.forced) @max(e.lay(s.node).margin.top, 0) else 0);
@@ -1754,7 +1756,16 @@ fn Engine(comptime T: type) type {
                 // item down to the page start only when it began before it, so an item that the gap
                 // carried past the page end keeps its distance; takumi golden paged-header-footer)
                 const ns = e.style(n);
-                if (k == .bands and ns.display == .flex and (ns.flex_direction == .column or ns.flex_direction == .column_reverse)) gap = 0;
+                if (k == .bands and ns.display == .flex and (ns.flex_direction == .column or ns.flex_direction == .column_reverse)) {
+                    // (but the block-end margin of the item before, where it reaches past the page
+                    // start, is truncated there: the item's own margin and the gap stay; takumi
+                    // window_scenes.rs report.html on 90 px pages, Chrome likewise)
+                    gap = 0;
+                    if (p > 0 and reach < next) {
+                        const mb = @max(e.lay(sq.items[p - 1].node).margin.bottom, 0);
+                        gap = std.math.clamp(reach + mb - next, 0, mb);
+                    }
+                }
                 var target = @max(@max(next, reach), band_top - gap);
                 // (content that overflows the page and is left behind: what follows starts the next page)
                 const stays = k == .block and e.overflowStays(sq, i, top, pg_in.end);

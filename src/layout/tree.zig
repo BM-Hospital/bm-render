@@ -474,7 +474,8 @@ fn algoOf(d: st.Display) Algo {
 pub const StaticPos = struct {
     /// static-position rectangle relative to the container's border-box origin: x, y, w, h
     rect: [4]f32,
-    /// alignment inside the rectangle per axis: 0 = start, 1 = center, 2 = end
+    /// alignment inside the rectangle per axis: 0 = start, 1 = center, 2 = end, 3 = the box's first
+    /// baseline at the rectangle's start (block axis; `Style.list_marker`)
     al: [2]u8 = .{ 0, 0 },
     /// stretch to the rectangle when size is auto and insets are auto (grid areas)
     stretch: [2]bool = .{ false, false },
@@ -1360,6 +1361,8 @@ pub fn TreeWith(comptime cfg: Config) type {
                     pos[a] = switch (sp.al[a]) {
                         0 => r0 + b.margin[a],
                         1 => r0 + self.div(rs - size[a] + b.margin[a] - b.margin[e], 2),
+                        // (no baseline: its block-end margin edge, as an atomic inline's)
+                        3 => r0 - orElse(c.out.baseline, size[a] + b.margin[e]),
                         else => r0 + rs - size[a] - b.margin[e],
                     };
                 }

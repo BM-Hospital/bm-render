@@ -331,7 +331,9 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
             // A rowspan may be the only flow left on this page boundary: the main-flow token has
             // no node, while the spanning cell's paragraphs continue independently in side_flows.
             if (tok.node == no_node.node and tok.side_flows.len == 0) continue;
-            if (tok.line != no_node.line and lineGlyph(f, tok.node, tok.line) == null) continue;
+            // (line 0: a paragraph whose first line a float pushed onto this page resumes whole,
+            // no glyph cut needed)
+            if (tok.line != no_node.line and tok.line != 0 and lineGlyph(f, tok.node, tok.line) == null) continue;
             stop = i;
             break;
         }
@@ -422,7 +424,7 @@ fn laySegments(cx: *const Ctx, a: Allocator, g: *Geo, subst: *counters.Subst, se
                 const glyph = lineGlyph(f, p.node, p.line) orelse return extendLast(segs);
                 try next_cuts.append(a, .{ .node = f.lid_node.items[p.node], .glyph = glyph });
             }
-        } else if (tok.line != no_node.line) try next_cuts.append(a, .{ .node = f.lid_node.items[tok.node], .glyph = lineGlyph(f, tok.node, tok.line).? });
+        } else if (tok.line != no_node.line and tok.line != 0) try next_cuts.append(a, .{ .node = f.lid_node.items[tok.node], .glyph = lineGlyph(f, tok.node, tok.line).? });
         for (tok.side_flows) |point| {
             const id = f.lid_node.items[point.node];
             if (point.finished) {
@@ -1391,8 +1393,12 @@ fn paragraphLines(f: *Frame, id: u32) ?*const @import("../font/font.zig").TextLa
 }
 
 /// The child of the flow (index in `fl.kids`) holding render node `id` of frame `f`, when the
-/// boxes from it up to the flow are plain blocks a page break can resume in (null: a table, a
-/// flex or grid container, an inline box ...).
+/// boxes from it up to the flow are boxes a page break can resume in: blocks, the row groups and
+/// rows of a table, flex and grid containers and their items (null: an inline box, a cell, an
+/// absolutely positioned box ...). A token that is one point never names a cell (a row broken
+/// inside resumes its cells in parallel: `Start.branches`, which a part does not take), so a
+/// table resumes between its rows; the part laying the table out from that row checks that its
+/// pages start and end where the part before had them (`FlowIter.lay`).
 fn resumeKid(f: *const Frame, fl: chunks.Flow, flow: u32, id: u32) ?usize {
     var cur = id;
     var guard: u32 = 0;
@@ -1400,10 +1406,21 @@ fn resumeKid(f: *const Frame, fl: chunks.Flow, flow: u32, id: u32) ?usize {
         const n = &f.nodes.items[cur];
         const parent = n.parent;
         if (parent == rt.none) return null;
-        if (cur != id or n.kind == .container) switch (n.cs.display) {
-            .block, .flow_root, .list_item => {},
-            else => return null,
-        };
+        if (cur != id or n.kind == .container) {
+            const pd = f.nodes.items[parent].cs.display;
+            // (an item of a flex / grid container is blockified whatever its display)
+            const item = parent != flow and switch (pd) {
+                .flex, .grid => true,
+                else => false,
+            };
+            if (!item) switch (n.cs.display) {
+                .block, .flow_root, .list_item, .flex, .grid => {},
+                // (a row group or a row of a table broken between its rows: the token is one
+                // point, the row; a row broken inside is parallel flows, never one point)
+                .table, .table_row_group, .table_header_group, .table_footer_group, .table_row => {},
+                else => return null,
+            };
+        }
         if (n.cs.position != .static and n.cs.position != .relative) return null;
         if (parent == flow) {
             if (n.el == rt.none) return null;

@@ -69,6 +69,9 @@ const Item = struct {
 /// Per-container state kept in the tree's scratch arena (see `Tree.computeNode` on stack discipline).
 const G = struct {
     items: []Item,
+    /// the first baseline (from the border-box top): the first item in grid order of the first row
+    /// (CSS Align 3 §9.3; NaN: that item has none)
+    first_bl: f32 = NONE,
     tracks: [2][]Track,
     gap: [2]f32,
     in: In,
@@ -707,6 +710,7 @@ pub noinline fn compute(t: anytype, node: u32, in_: *const In, out: *Out) Error!
     placeTracks(t, g, 1, @max(g.size[1] - pb[1], 0), g.inset[1], ac, s.safe.align_content);
     try layoutItems(t, g, node, s);
     out.content = g.content;
+    out.baseline = g.first_bl;
 }
 
 /// Explicit grid (with auto-repeat expansion), item placement, track allocation.
@@ -866,6 +870,16 @@ noinline fn itemWidths(t: anytype, g: *G, s: *const st.Style) Error!void {
 noinline fn layoutItems(t: anytype, g: *G, node: u32, s: *const st.Style) Error!void {
     const box = &g.box;
     g.content = .{ 0, 0 };
+    g.first_bl = NONE;
+    // (the first item in grid order of the first row: the lowest row start, then column start)
+    var first: ?*const Item = null;
+    for (g.items) |*it| {
+        if (t.nodes.items[it.node].style.position.isOut()) continue;
+        if (first) |f| {
+            if (it.p[1].start > f.p[1].start or (it.p[1].start == f.p[1].start and it.p[0].start >= f.p[0].start)) continue;
+        }
+        first = it;
+    }
     for (g.items) |*it| {
         const cs = t.nodes.items[it.node].style;
         const ax = areaOf(g.tracks[0], g.gap[0], it.p[0].start, it.end(0));
@@ -912,6 +926,7 @@ noinline fn layoutItems(t: anytype, g: *G, node: u32, s: *const st.Style) Error!
             pos[1] += orElse(t.dim(cs.inset.top, area[1]), -orElse(t.dim(cs.inset.bottom, area[1]), 0));
         }
         t.setLayout(it.node, pos.*, o, b);
+        if (first == it and has(o.baseline)) g.first_bl = pos[1] + o.baseline;
         if (comptime st.frag_enabled) {
             t.layouts.items[it.node].grid_block_start = ay[0];
             t.layouts.items[it.node].grid_row_span = @intCast(std.math.clamp(it.p[1].span, 0, std.math.maxInt(u16)));

@@ -3428,6 +3428,12 @@ pub const Frame = struct {
                 st.breaks.page = @import("pdf/page_names.zig").idOf(f, n.el);
             };
         }
+        if (comptime config.enable_pdf) {
+            if (@import("pdf/markers.zig").besideBaseline(f, id)) {
+                st.position = .absolute;
+                st.list_marker = true;
+            }
+        }
         if (n.el != none) {
             if (comptime config.enable_tables) tableSpans(&f.dom, n.el, &st);
             if (n.parent != none and (st.grid_column.start == .auto or st.grid_column.end == .auto or st.grid_row.start == .auto or st.grid_row.end == .auto)) {
@@ -3760,7 +3766,8 @@ pub const Frame = struct {
             f.tree.paged.height_fn = o.page_height_fn;
             f.tree.paged.height_ctx = o.ctx;
             if (f.tree.has_floats) if (o.start) |start| if (o.start_top) |page_top| {
-                if (start.branches.len == 0 and start.node < f.lid_node.items.len) {
+                // (not a first line a float continuing above it pushed onto the page: it stays below the float)
+                if (start.branches.len == 0 and !(start.line == 0 and start.side_flows.len > 0) and start.node < f.lid_node.items.len) {
                     const id = f.lid_node.items[start.node];
                     if (id != none) {
                         const n = &f.nodes.items[id];
