@@ -121,6 +121,21 @@ pub const RowMinimum = struct { node: u32, height: f32, top: ?f32 = null };
 /// border-box width `w` of its first fragment (takumi: the container's box takes the page's width,
 /// its items keep the sizes and offsets the flex / grid algorithm gave them).
 pub const FrozenWidth = struct { node: u32, w: f32 };
+/// A table stretched to its row flex line (`align-self: stretch`) whose fragments grew past the
+/// line's end. Blink's flex fragmentation grows the line by what the item reaches past it, in the
+/// fragment where the line ends (`row_cross_size_updates`: to the item's end when the item ends
+/// there, else to the fragmentainer's end), and lays the stretched items out again at the grown
+/// size; the table shares that larger block size among its rows (`DistributeTableBlockSizeToSections`,
+/// proportionally to their minimum block sizes), and only the rows of that fragment and later ones
+/// show it: the earlier fragments are done. Rows from table row `segs[i].row` (table.zig row order)
+/// take the block sizes they get when the table box is `segs[i].size` tall; `segs[0]` is the size
+/// the table was first laid out at. `line`: where the line ends, from the table's border-box
+/// block start; `next_page`: the first page not looked at yet; `h0`: the table's border-box block
+/// size in that first layout, which the other items of the line stretch to as before (the line
+/// grows in the fragment where it ends, after they were laid out: their content stays, their boxes
+/// reach its grown end; flex.zig, `applyBand`).
+pub const TableStretch = struct { node: u32, line: f32, next_page: u32, h0: f32, segs: []StretchSeg };
+pub const StretchSeg = struct { row: u32, size: f32 };
 
 pub const Page = struct { top: f32, height: f32 };
 /// Lines `first_line..` of `node` (up to the next entry of the same node) are painted `dy` lower.
@@ -262,6 +277,9 @@ pub const PagedState = struct {
     cut_glyph: u32 = 0,
     cuts: []const ParagraphCut = &.{},
     row_minimums: []const RowMinimum = &.{},
+    /// Tables stretched in a row flex line that pagination made reach past the line's end (filled
+    /// by src/render.zig `Frame.stretchRowFlexTables`, read by table.zig).
+    table_stretches: []TableStretch = &.{},
     /// Flex / grid containers whose items lay out at another width than the container's own
     /// (src/pdf/paged.zig, tree.zig).
     frozen_widths: []const FrozenWidth = &.{},
@@ -457,6 +475,9 @@ fn Engine(comptime T: type) type {
         any_names: bool = false,
         shifts: std.ArrayList(LineShift) = .empty,
         reps: std.ArrayList(RepeatRaw) = .empty,
+        /// per `PagedState.table_stretches` entry: how much taller than in its first layout the
+        /// table is before the breaks (`stretchExcess`)
+        stretch_excess: []f32 = &.{},
         fixed: std.ArrayList(u32) = .empty,
         pushes: std.ArrayList(u32) = .empty,
         stamp: u32 = 0,
@@ -488,6 +509,7 @@ fn Engine(comptime T: type) type {
             e.pushes.deinit(e.a);
             e.a.free(e.st);
             e.a.free(e.slot);
+            e.a.free(e.stretch_excess);
         }
 
         inline fn lay(e: *Self, n: u32) *tr.Layout {
@@ -1821,13 +1843,19 @@ fn Engine(comptime T: type) type {
 
         noinline fn applyBand(e: *Self, sq_i: u32, i: u32, j: u32, top: f32, pg: Pg) Error!f32 {
             var old_bottom: f32 = ninf;
+            // (the end of the line the stretched items reach: without what the rows a page break
+            // grew in a stretched table add, `TableStretch`)
+            var old_line: f32 = ninf;
             var k = i;
             while (k < j) : (k += 1) {
                 const sq = &e.seqs.items[sq_i];
                 if (!sq.items[k].flow) continue;
-                old_bottom = @max(old_bottom, e.itemTop(sq, k, top) + e.lay(sq.items[k].node).h);
+                const c = sq.items[k].node;
+                old_bottom = @max(old_bottom, e.itemTop(sq, k, top) + e.lay(c).h);
+                old_line = @max(old_line, e.itemTop(sq, k, top) + e.lay(c).h - e.stretchExcess(c));
             }
             var new_bottom: f32 = ninf;
+            var new_line: f32 = ninf;
             k = i;
             while (k < j) : (k += 1) {
                 var sq = &e.seqs.items[sq_i];
@@ -1839,7 +1867,8 @@ fn Engine(comptime T: type) type {
                     e.shiftKids(c, cst.realign);
                     cst.realign = 0;
                 }
-                cst.full = ct + e.lay(c).h >= old_bottom - eps;
+                const excess = e.stretchExcess(c);
+                cst.full = ct + e.lay(c).h - excess >= old_line - eps;
                 if (!cst.done) {
                     const cs = e.slot[c];
                     if (cs.stamp == e.stamp and cs.brk and !cs.par) {
@@ -1857,6 +1886,7 @@ fn Engine(comptime T: type) type {
                 }
                 sq = &e.seqs.items[sq_i];
                 new_bottom = @max(new_bottom, e.itemTop(sq, k, top) + e.lay(c).h);
+                new_line = @max(new_line, e.itemTop(sq, k, top) + e.lay(c).h - excess);
             }
             // (the band shrinks too: an item whose block-start margin a break truncated ends higher, and
             // when no other item reaches the old end the band ends with it; takumi / Blink flex rows
@@ -1874,10 +1904,17 @@ fn Engine(comptime T: type) type {
                     // (a grid item spanning more than one row keeps the block size the grid gave
                     // it: takumi / Blink grow only the rows a break moves content down in)
                     if (comptime @TypeOf(cl.grid_row_span) != void) if (cl.grid_row_span > 1) continue;
-                    cl.h = @max(cl.h, new_bottom - e.itemTop(sq, k, top));
+                    cl.h = @max(cl.h, new_line - e.itemTop(sq, k, top));
                 }
             }
             return g;
+        }
+
+        /// How much taller than in its first layout a table stretched in a row flex line is, the
+        /// rows a page break grew on a later page (`TableStretch`); 0 for any other box.
+        fn stretchExcess(e: *Self, n: u32) f32 {
+            for (e.t.paged.table_stretches, e.stretch_excess) |ts, x| if (ts.node == n and ts.segs.len > 1) return x;
+            return 0;
         }
 
         fn grow(e: *Self, n: u32, sq_i: u32, d: f32) f32 {
@@ -2011,6 +2048,9 @@ fn Engine(comptime T: type) type {
             @memset(e.st, .{});
             e.slot = try e.a.alloc(Slot, ns.len);
             @memset(e.slot, .{});
+            const stretches = e.t.paged.table_stretches;
+            e.stretch_excess = try e.a.alloc(f32, stretches.len);
+            for (stretches, e.stretch_excess) |ts, *x| x.* = if (ts.node < ns.len) @max(e.lay(ts.node).h - ts.h0, 0) else 0;
             for (ns) |*nd| {
                 if (nd.style.breaks.page != 0) e.any_names = true;
             }

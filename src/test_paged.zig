@@ -804,6 +804,109 @@ test "paged: a long table repeats its header group on every continuation page" {
     try T.expect(pm.data[at * 4 + 3] == 0);
 }
 
+/// A table of `rows` body rows (ids `r1`..; rows `tall` hold two lines) beside a short item (`b`) in a
+/// flex row container (`c`) styled `flex_style`, a block (`after`) below.
+fn stretchSrc(a: std.mem.Allocator, flex_style: []const u8, rows: u32, tall: []const u32) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(a, "<html><body style=\"margin: 0\"><div id=\"c\" style=\"display: flex; font-size: 12px; {s}\"><table id=\"t\" style=\"width: 280px\"><thead><tr><th>Name</th><th>Qty</th></tr></thead><tbody>", .{flex_style});
+    for (1..rows + 1) |i| {
+        const two = std.mem.indexOfScalar(u32, tall, @intCast(i)) != null;
+        try buf.print(a, "<tr id=\"r{d}\"><td>Item {d}{s}</td><td>{d}</td></tr>", .{ i, i, if (two) "<br>x" else "", i * 3 });
+    }
+    try buf.appendSlice(a, "</tbody></table><div id=\"b\">Beside</div></div><div id=\"after\">After</div></body></html>");
+    return buf.items;
+}
+
+/// Laid out once at `width` px for the raster / SVG output: not paged.
+fn openFlat(src: []const u8, width: u32) !*Doc {
+    const r = try newRenderer();
+    errdefer r.destroy();
+    r.beginCall();
+    const a = r.arena.allocator();
+    const d = try a.create(Doc);
+    d.r = r;
+    d.f = .{ .r = r, .a = a, .opts = .{ .width = width }, .tree = rt.LTree.init(a), .ctx = undefined };
+    try d.f.prepare(.html, src);
+    d.pages = undefined;
+    return d;
+}
+
+fn rowH(d: *Doc, i: u32) !f32 {
+    var buf: [8]u8 = undefined;
+    return d.f.tree.layout((try nodeOfId(d, try std.fmt.bufPrint(&buf, "r{d}", .{i}))).lid).h;
+}
+
+test "paged: a table stretched in a flex row gives its last fragment's rows the line's growth (Blink / Chrome / takumi)" {
+    if (!enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows: u32 = 30;
+    const tall = [_]u32{ 27, 29 };
+    // 400 x 300 pages, 24px margins (upstream.content_beside_a_table_does_not_replay_with_its_header):
+    // the table breaks over three pages; its pushed rows and repeated headers make it end past the
+    // line it was stretched to. The flex line grows there by that much, the table stretched to it
+    // shares the larger block size among its body rows in proportion to their minimum block sizes
+    // (Blink's DistributeTableBlockSizeToSections), and the rows of its last fragment show it.
+    const st = try open(.html, try stretchSrc(a, "", rows, &tall), 400, 300, 24);
+    defer st.deinit();
+    const start = try open(.html, try stretchSrc(a, "align-items: start", rows, &tall), 400, 300, 24);
+    defer start.deinit();
+    const flat = try openFlat(try stretchSrc(a, "", rows, &tall), 352);
+    defer flat.deinit();
+    try T.expectEqual(@as(usize, 3), st.count());
+    try T.expectEqual(@as(usize, 3), start.count());
+    const last_page: u32 = 2;
+    const t_st = (try nodeOfId(st, "t")).lid;
+    const t_top = absTop(&st.f, t_st);
+    // unpaged, the rows keep their minimum block sizes: the table is as tall as the line
+    const b0 = flat.f.tree.layout((try nodeOfId(flat, "t")).lid).h;
+    var min_sum: f32 = 0;
+    var growth: f32 = 0;
+    var last_min: f32 = 0;
+    var i: u32 = 1;
+    while (i <= rows) : (i += 1) {
+        const h0 = try rowH(flat, i);
+        try T.expectApproxEqAbs(h0, try rowH(start, i), 0.001);
+        min_sum += h0;
+        const lid = (try nodeOfId(st, try std.fmt.allocPrint(a, "r{d}", .{i}))).lid;
+        const on_last = st.pages.pageAt(absTop(&st.f, lid) + 0.01) == last_page;
+        const h = try rowH(st, i);
+        if (!on_last) {
+            // the rows of the earlier fragments keep their block sizes
+            try T.expectApproxEqAbs(h0, h, 0.001);
+        } else {
+            try T.expect(h > h0 + 0.5);
+            growth += h - h0;
+            last_min += h0;
+        }
+    }
+    try T.expectApproxEqAbs(b0, flat.f.tree.layout((try nodeOfId(flat, "c")).lid).h, 0.001);
+    // in proportion: the two-line rows grow by twice as much (and a bit) as the one-line rows
+    // (row 30, the last, also takes what the 1/64 px rounding of the shares leaves)
+    const g_one = try rowH(st, 28) - try rowH(flat, 28);
+    const g_two = try rowH(st, 29) - try rowH(flat, 29);
+    try T.expectApproxEqAbs((try rowH(flat, 29)) / (try rowH(flat, 28)), g_two / g_one, 0.02);
+    // the line grew by what the table reached past it, X = its end before the rows grew less the
+    // line's end; every body row took its share of X
+    const t_end = t_top + st.f.tree.layout(t_st).h;
+    const x = (t_end - growth) - (t_top + b0);
+    try T.expect(x > 1);
+    try T.expectApproxEqAbs(x * last_min / min_sum, growth, @as(f32, @floatFromInt(rows)) / 64);
+    // the other item reaches the grown line's end, the container and what follows the table's
+    const b = (try nodeOfId(st, "b")).lid;
+    try T.expectApproxEqAbs(t_end - growth, absTop(&st.f, b) + st.f.tree.layout(b).h, 0.02);
+    const c = (try nodeOfId(st, "c")).lid;
+    try T.expectApproxEqAbs(t_end, absTop(&st.f, c) + st.f.tree.layout(c).h, 0.02);
+    try T.expectApproxEqAbs(t_end, absTop(&st.f, (try nodeOfId(st, "after")).lid), 0.02);
+
+    // a column flex container does not stretch the table in the block axis: nothing grows
+    const col = try open(.html, try stretchSrc(a, "flex-direction: column", rows, &tall), 400, 300, 24);
+    defer col.deinit();
+    i = 1;
+    while (i <= rows) : (i += 1) try T.expectApproxEqAbs(try rowH(flat, i), try rowH(col, i), 0.001);
+}
+
 test "paged: a flex row shrinks with an item whose truncated margin moved it up (align-items: flex-start)" {
     if (!enabled) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(T.allocator);

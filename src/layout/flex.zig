@@ -54,7 +54,18 @@ const Line = struct {
     end: u32,
     cross: f32 = 0,
     off: f32 = 0,
+    /// how much of `cross` only the rows a page break grew in a stretched table make up: the other
+    /// items stretch to `cross - excess` (fragment.zig `TableStretch`)
+    excess: f32 = 0,
 };
+
+/// The block size a table stretched in a row flex line had before pagination grew its rows on later
+/// pages (fragment.zig `TableStretch`); NONE: no such table.
+fn stretchBase(t: anytype, node: u32) f32 {
+    if (comptime !@import("style.zig").frag_enabled) return NONE;
+    for (t.paged.table_stretches) |ts| if (ts.node == node and ts.segs.len > 1) return ts.h0;
+    return NONE;
+}
 
 /// Blink's LayoutUnitDiffuser: `size` split into `n` buckets that differ by at most one layout unit
 /// (exact division when not laying out on the 1/64 px grid).
@@ -605,12 +616,19 @@ noinline fn lineCross(t: anytype, c: *S) void {
             var max_bl: f32 = 0;
             for (li) |*it| max_bl = @max(max_bl, it.baseline);
             var v: f32 = 0;
+            // (the line as it was before a page break grew the rows of a stretched table in it:
+            // what the other items stretch to, Blink's line before `row_cross_size_updates`)
+            var v_base: f32 = 0;
             for (li) |*it| {
                 const outer = it.hyp[x] + it.box.marginSum(x);
                 const is_bl = it.al == .baseline and !it.box.margin_auto[x] and !it.box.margin_auto[x + 2];
                 v = @max(v, if (is_bl) max_bl - it.baseline + outer else outer);
+                const base = if (x == 1) stretchBase(t, it.node) else NONE;
+                const outer_base = if (has(base)) @min(outer, base + it.box.marginSum(x)) else outer;
+                v_base = @max(v_base, if (is_bl) max_bl - it.baseline + outer_base else outer_base);
             }
             ln.cross = v;
+            ln.excess = v - v_base;
         }
         if (!c.wrap) lines[0].cross = @max(clampO(lines[0].cross, c.min_inner[x], c.max_inner[x]), 0);
         if (c.cross_floor) {
@@ -641,7 +659,7 @@ noinline fn usedCross(t: anytype, c: *S) Error!void {
         for (c.items[ln.start..ln.end]) |*it| {
             const b = &it.box;
             if (it.al == .stretch and !b.margin_auto[x] and !b.margin_auto[x + 2] and it.cross_auto) {
-                it.target[x] = @max(clampO(ln.cross - b.marginSum(x), b.min[x], b.max[x]), b.pb[x]);
+                it.target[x] = @max(clampO(ln.cross - ln.excess - b.marginSum(x), b.min[x], b.max[x]), b.pb[x]);
                 if (m == 0) it.indef = false;
             } else {
                 it.target[x] = it.hyp[x];

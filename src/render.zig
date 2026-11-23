@@ -3812,6 +3812,8 @@ pub const Frame = struct {
                         previous_h[lid] = before.h;
                     }
                 };
+                // (the tables a row flex line stretches, as laid out before the breaks grow them)
+                const stretched = if (o.start == null) try f.stretchedTables() else &.{};
                 var pages = layout.fragment.paginate(&f.tree, f.a, f.lroot, .{
                     .page_height = o.page_height,
                     .page_height_fn = if (o.page_height_fn != null) pageHeightCb else null,
@@ -3872,6 +3874,7 @@ pub const Frame = struct {
                     f.tree.paged.inline_resume = resumed;
                     changed = true;
                 };
+                if (!changed) changed = try f.stretchRowFlexTables(&pages, stretched);
                 if (changed) {
                     pages.deinit(f.a);
                     attempts += 1;
@@ -3945,6 +3948,102 @@ pub const Frame = struct {
             }
         };
         return null;
+    }
+
+    const StretchedTable = struct { node: u32, h: f32, grid: f32 };
+
+    /// The tables laid out as items of a row flex line that stretches them (`align-self: stretch`,
+    /// `height: auto`), with their border-box and table-box block sizes, before pagination grows them.
+    /// Blink lays such a line out again where the breaks make an item reach past its end, which a
+    /// line of a single-line container with a definite block size never does.
+    fn stretchedTables(f: *Frame) Error![]const StretchedTable {
+        if (comptime !layout.fragment.enabled) return &.{};
+        const t = &f.tree;
+        var out: std.ArrayList(StretchedTable) = .empty;
+        for (t.table_geoms.items) |g| {
+            if (!g.is_table or g.node >= t.nodes.items.len or t.nodes.items[g.node].table_geom >= t.table_geoms.items.len) continue;
+            if (t.table_geoms.items[t.nodes.items[g.node].table_geom].node != g.node) continue;
+            const nd = t.nodes.items[g.node];
+            const s = nd.style;
+            if (s.display != .table and s.display != .inline_table) continue;
+            if (s.position.isOut() or s.size[1] != .auto or s.margin.top == .auto or s.margin.bottom == .auto) continue;
+            if (nd.parent >= t.nodes.items.len) continue;
+            const ps = t.nodes.items[nd.parent].style;
+            if (ps.display != .flex or (ps.flex_direction != .row and ps.flex_direction != .row_reverse)) continue;
+            if ((s.align_self orelse ps.align_items orelse .stretch) != .stretch) continue;
+            if (ps.flex_wrap == .nowrap and ps.size[1] != .auto) continue;
+            try out.append(f.a, .{ .node = g.node, .h = t.layout(g.node).h, .grid = g.grid_h });
+        }
+        return out.items;
+    }
+
+    /// Blink's flex fragmentation (`row_cross_size_updates`) for the tables of `stretchedTables`
+    /// that `pages` broke: on the page where the flex line ends, a table that ends there and reaches
+    /// past the line's end grows the line by that much, one that goes on grows it to the page end,
+    /// and the table, stretched to the grown line, shares the larger block size among its rows: the
+    /// rows from that page on take it (`layout.fragment.TableStretch`). One page per table and pass;
+    /// true when the layout must be computed again.
+    fn stretchRowFlexTables(f: *Frame, pages: *const layout.fragment.Pages, stretched: []const StretchedTable) Error!bool {
+        if (comptime !layout.fragment.enabled) return false;
+        const eps = 1.0 / 64.0;
+        const t = &f.tree;
+        var changed = false;
+        for (stretched) |stretched_table| {
+            const box = t.layout(stretched_table.node);
+            var top: f32 = 0;
+            var cur = stretched_table.node;
+            while (cur < t.nodes.items.len) : (cur = t.nodes.items[cur].parent) top += t.layout(cur).y;
+            const bottom = top + box.h;
+            const margin_end = box.margin.bottom;
+            var entry: ?*layout.fragment.TableStretch = null;
+            for (t.paged.table_stretches) |*ts| if (ts.node == stretched_table.node) {
+                entry = ts;
+            };
+            const line = if (entry) |e| e.line else stretched_table.h + margin_end;
+            const first = pages.pageAt(top);
+            const last = pages.pageAt(@max(bottom - eps, top));
+            var k = @max(if (entry) |e| e.next_page else 0, first);
+            while (k <= last and k < pages.pages.len) : (k += 1) {
+                const pg = pages.pages[k];
+                const line_end = top + line;
+                if (line_end < pg.top - eps or line_end > pg.top + pg.height + eps) continue;
+                const grow = if (k == last) bottom + margin_end - line_end else pg.top + pg.height - line_end;
+                if (!(grow > eps)) continue;
+                // (the rows of the table's fragment on this page: from the first that ends below its top)
+                const g = &t.table_geoms.items[t.nodes.items[stretched_table.node].table_geom];
+                var from: ?u32 = null;
+                for (g.rows, 0..) |row, ri| {
+                    if (row.node >= t.nodes.items.len) break;
+                    var row_top: f32 = 0;
+                    var n = row.node;
+                    while (n < t.nodes.items.len) : (n = t.nodes.items[n].parent) row_top += t.layout(n).y;
+                    if (row_top + t.layout(row.node).h > pg.top + eps) {
+                        from = @intCast(ri);
+                        break;
+                    }
+                }
+                const row = from orelse break;
+                if (entry == null) {
+                    const list = try f.a.alloc(layout.fragment.TableStretch, t.paged.table_stretches.len + 1);
+                    @memcpy(list[0..t.paged.table_stretches.len], t.paged.table_stretches);
+                    const segs = try f.a.alloc(layout.fragment.StretchSeg, 1);
+                    segs[0] = .{ .row = 0, .size = stretched_table.grid };
+                    list[list.len - 1] = .{ .node = stretched_table.node, .line = line, .next_page = 0, .h0 = stretched_table.h, .segs = segs };
+                    t.paged.table_stretches = list;
+                    entry = &list[list.len - 1];
+                }
+                const e = entry.?;
+                const segs = try f.a.alloc(layout.fragment.StretchSeg, e.segs.len + 1);
+                @memcpy(segs[0..e.segs.len], e.segs);
+                segs[e.segs.len] = .{ .row = row, .size = e.segs[e.segs.len - 1].size + grow };
+                e.segs = segs;
+                e.line = line + grow;
+                e.next_page = k + 1;
+                changed = true;
+                break;
+            }
+        }
+        return changed;
     }
 
     /// Block offset of the content box of layout node `lid` in the frame.

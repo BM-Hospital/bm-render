@@ -210,6 +210,37 @@ probe("pagination.flex.row", "flex row containers: items are parallel flows", as
   ], G);
 });
 
+// A table stretched to its row flex line (align-items: stretch) and broken over pages: on the page where the
+// line ends, Blink's flex fragmentation grows the line by what the table reaches past it (to the table's end
+// there, or to the page end when the table goes on), lays it out again at the grown size and the table shares
+// it among its body rows in proportion to their minimum block sizes; only the rows of that page and later
+// ones take it (Chrome agrees, Playwright Chromium printed to PDF). The other items keep their content and
+// reach the grown line's end; the container ends with the table.
+const ST_CSS = `table{width:200px;font:12px/16px Inter} td,th{padding:1px 2px;text-align:left;font-weight:400}`;
+const stRows = (n, f = () => "") => Array.from({ length: n }, (_, i) => `<tr><td>Item ${pad(i + 1)}${f(i)}</td><td>${(i + 1) * 3}</td></tr>`).join("");
+const stHead = "<thead><tr><th>Name</th><th>Qty</th></tr></thead>";
+const stTable = (body, head = stHead, attrs = "") => `<table ${attrs}>${head}<tbody>${body}</tbody></table>`;
+const stFlex = (style, inner, beside = "<div>Beside</div>") => doc(fx(style, inner + beside) + `<div class="l">After</div>`, ST_CSS);
+const ST_PAGE = { size: { width: 300, height: 220 }, margin: 10, tagged: false };
+const stSpan = (at, n) => Array.from({ length: n }, (_, i) => i === at ? `<tr><td rowspan="3">Item ${pad(i + 1)}<br>span</td><td>${(i + 1) * 3}</td></tr>`
+  : (i === at + 1 || i === at + 2) ? `<tr><td>${(i + 1) * 3}</td></tr>` : `<tr><td>Item ${pad(i + 1)}</td><td>${(i + 1) * 3}</td></tr>`).join("");
+probe("pagination.flex.stretched-table", "flex rows: a stretched table broken over pages takes the grown line in its last fragment", async (t) => {
+  const bg = `<div style="background:#f99;width:40px">Beside</div>`;
+  await cmpAll(t, [
+    ["stretch, three pages", stFlex("", stTable(stRows(30))), ST_PAGE],
+    ["align-items:start keeps the row height", stFlex("align-items:start", stTable(stRows(30))), ST_PAGE],
+    ["stretch, two pages", stFlex("", stTable(stRows(16))), ST_PAGE],
+    ["stretch, rows of two heights share in proportion", stFlex("", stTable(stRows(30, (i) => (i === 26 || i === 28 ? "<br>x" : "")))), ST_PAGE],
+    ["stretch beyond the content (a taller item)", stFlex("", stTable(stRows(30)), `<div style="height:760px">Beside</div>`), ST_PAGE],
+    ["stretch, a rowspan in the last fragment", stFlex("", stTable(stSpan(27, 30))), ST_PAGE],
+    ["stretch, a tall repeated header: the line ends a page before the table", stFlex("", stTable(stRows(18), "<thead><tr><th>Name<br>a<br>b<br>c</th><th>Qty</th></tr></thead>")), ST_PAGE],
+    ["stretch, a repeated footer", stFlex("", stTable(stRows(30), stHead + "<tfoot><tr><td>Total</td><td>0</td></tr></tfoot>")), ST_PAGE],
+    ["stretch, backgrounds: the sibling reaches the line, the container the table", stFlex("background:#99f", stTable(stRows(30), stHead, `style="background:#9f9"`), bg), ST_PAGE, { paint: true }],
+    ["column flex is not stretched in the block axis", stFlex("flex-direction:column", stTable(stRows(30))), ST_PAGE],
+    ["a definite container height", stFlex("height:900px", stTable(stRows(30))), ST_PAGE],
+  ], G);
+});
+
 // ------------------------------------------------------------------------------------------------ grid
 
 const grid = (style, inner) => `<div style="display:grid;${style}">${inner}</div>`;

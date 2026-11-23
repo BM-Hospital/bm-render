@@ -177,13 +177,6 @@
       "reason": "The parent tree follows the same single P of the inline generated image (see the structure-tree exception of this probe). docs/PDF_AUDIT.md, Painting: content url()."
     },
     {
-      "probe": "upstream.content_beside_a_table_does_not_replay_with_its_header",
-      "kind": "text",
-      "match": "^sidebar: text per page: bm ",
-      "status": "open",
-      "reason": "Not what the Rust test asserts (that passes: the sidebar paints once). On the last page of a table that is a row-flex item and breaks over pages, takumi's rows are 14.3-14.4 px tall where both engines use 13.5 px on every earlier page; bm keeps 13.5 px, so pdftotext orders the words of page 3 differently (same words). Chrome agrees with takumi: the table is stretched to the flex line (align-items: stretch) and the extra block size of that definite height goes to the rows of the last fragment (with align-items: start Chrome, takumi and bm all keep the row height). Open bm bug, not fixed; docs/PDF_AUDIT.md, Page model."
-    },
-    {
       "probe": "upstream.html_fixtures_paint_from_their_windows",
       "kind": "text",
       "match": "^certificate\\.html 523x770: text per page: bm ",

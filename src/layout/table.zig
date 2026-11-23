@@ -335,6 +335,13 @@ noinline fn scratchBytes(t: anytype, bytes: usize) Error![*]align(16) u8 {
     const s = try t.scratch.alloc(t.alloc, u128, bytes / 16 + 1);
     return @ptrCast(s.ptr);
 }
+/// The block sizes a stretched table broken over pages shared among its rows (fragment.zig
+/// `TableStretch`); null: none beyond the one it is laid out at.
+fn stretchOf(t: anytype, node: u32) ?[]const @import("fragment.zig").StretchSeg {
+    if (comptime !@import("style.zig").frag_enabled) return null;
+    for (t.paged.table_stretches) |ts| if (ts.node == node and ts.segs.len > 1) return ts.segs;
+    return null;
+}
 inline fn styleOf(t: anytype, n: u32) *const st.Style {
     return t.nodes.items[n].style;
 }
@@ -2410,6 +2417,17 @@ pub noinline fn compute(t: anytype, node: u32, in_: *const In, out: *Out) Error!
         c.bot_h = try captions(t, c, true, false, 0);
     }
     const total_min = try computeRows(t, c);
+    // (a table stretched in a row flex line that pagination grew past the line's end: its rows'
+    // minimum block sizes, which every block size it had shares out again, fragment.zig `TableStretch`)
+    const stretch_segs = stretchOf(t, node);
+    var min_rows: []f32 = &.{};
+    var min_secs: []f32 = &.{};
+    if (stretch_segs != null) {
+        min_rows = try arr(t, f32, c.rows.len);
+        for (min_rows, c.rows) |*h, *row| h.* = row.h;
+        min_secs = try arr(t, f32, c.secs.len);
+        for (min_secs, c.secs) |*h, *sec| h.* = sec.h;
+    }
     // the table's block size to share among its sections (Blink's css_table_block_size)
     var tbs: f32 = NONE;
     if (has(known[1])) {
@@ -2427,6 +2445,24 @@ pub noinline fn compute(t: anytype, node: u32, in_: *const In, out: *Out) Error!
         c.min_grid_h = tbs;
         const distributable = @max(tbs - pb[1], 0);
         if (distributable > total_min) distributeToSections(c, distributable);
+    }
+    if (stretch_segs) |segs| {
+        // each row takes the block size the table shared out when the fragment it is in was laid
+        // out (each time over the rows as the size before left them: takumi / Blink keep the rows
+        // in the break token); the grid is its rows (the line it stretches to has grown with them)
+        const heights = try arr(t, f32, c.rows.len);
+        for (c.rows, min_rows) |*row, h| row.h = h;
+        for (c.secs, min_secs) |*sec, h| sec.h = h;
+        for (segs, 0..) |seg, si| {
+            for (c.secs) |*sec| sec.redist = false;
+            const distributable = @max(seg.size - pb[1], 0);
+            if (distributable > total_min) distributeToSections(c, distributable);
+            const end = @min(if (si + 1 < segs.len) segs[si + 1].row else c.rows.len, c.rows.len);
+            var r: usize = @min(seg.row, end);
+            while (r < end) : (r += 1) heights[r] = c.rows[r].h;
+        }
+        for (c.rows, heights) |*row, h| row.h = h;
+        c.min_grid_h = 0;
     }
     for (c.rows) |*row| {
         if (!row.collapsed) continue;
@@ -2476,7 +2512,7 @@ pub noinline fn compute(t: anytype, node: u32, in_: *const In, out: *Out) Error!
         y = start + @max(end - start, c.min_grid_h);
         c.bottom_y = y;
         y += c.bot_h;
-        c.block_size = if (fixed_h) known[1] else @max(y, 0);
+        c.block_size = if (fixed_h and stretch_segs == null) known[1] else if (fixed_h) @max(known[1], y) else @max(y, 0);
     }
     if (!in.layout) {
         if (c.did_layout) invalidateFinals(t, node);
