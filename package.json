@@ -1,6 +1,6 @@
 {
   "name": "bm-render",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Render JSX-like node trees / HTML + CSS to PNG, JPEG, WebP, SVG, animations and PDF with a dependency-free Zig engine: WebAssembly in Node.js, browsers, Bun, Deno and edge runtimes such as Cloudflare Workers, and a native Node-API addon on Node.js through optional per-platform packages (automatic wasm fallback).",
   "keywords": [
     "og-image",
@@ -248,14 +248,14 @@
     "vitepress": "^1.6.4"
   },
   "optionalDependencies": {
-    "@hunghg255/bm-render-win32-x64-msvc": "0.1.3",
-    "@hunghg255/bm-render-win32-arm64-msvc": "0.1.3",
-    "@hunghg255/bm-render-linux-x64-gnu": "0.1.3",
-    "@hunghg255/bm-render-linux-x64-musl": "0.1.3",
-    "@hunghg255/bm-render-linux-arm64-gnu": "0.1.3",
-    "@hunghg255/bm-render-linux-arm64-musl": "0.1.3",
-    "@hunghg255/bm-render-darwin-x64": "0.1.3",
-    "@hunghg255/bm-render-darwin-arm64": "0.1.3"
+    "@hunghg255/bm-render-win32-x64-msvc": "0.1.4",
+    "@hunghg255/bm-render-win32-arm64-msvc": "0.1.4",
+    "@hunghg255/bm-render-linux-x64-gnu": "0.1.4",
+    "@hunghg255/bm-render-linux-x64-musl": "0.1.4",
+    "@hunghg255/bm-render-linux-arm64-gnu": "0.1.4",
+    "@hunghg255/bm-render-linux-arm64-musl": "0.1.4",
+    "@hunghg255/bm-render-darwin-x64": "0.1.4",
+    "@hunghg255/bm-render-darwin-arm64": "0.1.4"
   },
   "overrides": {
     "vite": "^7.3.8",

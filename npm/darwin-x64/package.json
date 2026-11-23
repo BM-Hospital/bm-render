@@ -1,6 +1,6 @@
 {
   "name": "@hunghg255/bm-render-darwin-x64",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "bm-render native Node-API addon for macOS x64 (10.15+). Installed automatically by bm-render as an optional dependency; do not depend on it directly.",
   "keywords": [
     "bm-render",

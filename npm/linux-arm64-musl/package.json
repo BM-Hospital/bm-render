@@ -1,6 +1,6 @@
 {
   "name": "@hunghg255/bm-render-linux-arm64-musl",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "bm-render native Node-API addon for Linux arm64, musl (Alpine). Installed automatically by bm-render as an optional dependency; do not depend on it directly.",
   "keywords": [
     "bm-render",
