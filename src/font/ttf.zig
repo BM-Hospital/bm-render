@@ -202,6 +202,10 @@ pub const Font = struct {
     kern: []const u8 = &.{},
     gpos: []const u8 = &.{},
     gsub: []const u8 = &.{},
+    /// Vertical metrics (empty when absent): `vhea`, `vmtx`, `VORG`.
+    vhea: []const u8 = &.{},
+    vmtx: []const u8 = &.{},
+    vorg: []const u8 = &.{},
     units_per_em: u16 = 1000,
     num_glyphs: u16 = 0,
     num_hmetrics: u16 = 0,
@@ -291,6 +295,9 @@ pub const Font = struct {
                 tag("kern") => f.kern = t,
                 tag("GPOS") => f.gpos = t,
                 tag("GSUB") => f.gsub = t,
+                tag("vhea") => f.vhea = t,
+                tag("vmtx") => f.vmtx = t,
+                tag("VORG") => f.vorg = t,
                 tag("CFF ") => cff1 = t,
                 tag("CFF2") => cff2 = t,
                 tag("fvar") => f.fvar = t,
@@ -551,6 +558,58 @@ pub const Font = struct {
         if (gid >= f.num_glyphs) return base;
         const v = @as(i32, base) +| variations.advanceDelta(f, gid);
         return @intCast(std.math.clamp(v, 0, 0xffff));
+    }
+
+    /// Whether the face has vertical metrics (`vhea` + `vmtx`).
+    pub fn hasVerticalMetrics(f: *const Font) bool {
+        return f.vhea.len >= 36 and rd16(f.vhea, 34) != 0 and f.vmtx.len >= 4;
+    }
+
+    /// Vertical advance in font units (Blink `OpenTypeVerticalData::AdvanceHeight`): the `vmtx`
+    /// advance height, else the font height (ascent + descent of `lineMetrics`).
+    pub fn advanceHeight(f: *const Font, gid: u16) u16 {
+        if (f.hasVerticalMetrics()) {
+            const n = rd16(f.vhea, 34);
+            const i: u32 = @min(gid, n - 1);
+            if (i * 4 + 2 <= f.vmtx.len) return rd16(f.vmtx, i * 4);
+        }
+        const m = f.lineMetrics();
+        return @intCast(std.math.clamp(m.ascent + m.descent, 0, 0xffff));
+    }
+
+    /// Y of the vertical origin above the horizontal baseline, font units (y-up), as Blink's
+    /// `OpenTypeVerticalData::GetVerticalTranslationsForGlyphs`: `VORG` when present, else the
+    /// top side bearing from `vmtx` plus the glyph's yMax, else the font ascent. An upright
+    /// glyph in vertical text hangs its horizontal baseline this far below the pen position.
+    pub fn verticalOriginY(f: *const Font, gid: u16) i32 {
+        if (f.vorg.len >= 8) {
+            // VORG: version, defaultVertOriginY, numVertOriginYMetrics, {glyphIndex, vertOriginY}[]
+            const n: u32 = rd16(f.vorg, 6);
+            var lo: u32 = 0;
+            var hi: u32 = @min(n, (@as(u32, @intCast(f.vorg.len)) - 8) / 4);
+            while (lo < hi) {
+                const mid = (lo + hi) / 2;
+                const g = rd16(f.vorg, 8 + mid * 4);
+                if (g == gid) return rdi16(f.vorg, 8 + mid * 4 + 2);
+                if (g < gid) lo = mid + 1 else hi = mid;
+            }
+            return rdi16(f.vorg, 4);
+        }
+        if (f.hasVerticalMetrics()) {
+            const n: u32 = rd16(f.vhea, 34);
+            const off: u32 = if (gid < n) @as(u32, gid) * 4 + 2 else n * 4 + (@as(u32, gid) - n) * 2;
+            if (off + 2 <= f.vmtx.len) {
+                const tsb: i32 = rdi16(f.vmtx, off);
+                return tsb + f.headerBoundsOf(gid).y_max;
+            }
+        }
+        return f.lineMetrics().ascent;
+    }
+
+    /// Bounding box stored for `gid` (glyf header), else the outline bounds (CFF).
+    fn headerBoundsOf(f: *const Font, gid: u16) Bounds {
+        if (f.cff.len != 0) return f.outlineBounds(gid);
+        return f.headerBounds(gid);
     }
 
     /// Left side bearing from hmtx (default instance), font units.

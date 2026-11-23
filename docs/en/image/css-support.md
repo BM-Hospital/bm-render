@@ -50,7 +50,7 @@ This page lists bm-render features and the smallest profile that includes them. 
 | Floats (`float`, `clear`) | standard (`floats` flag; also `full`) | supported; 138/138 layout oracle cases; text flows around floats  |
 | `display: contents` | core | supported |
 | `display: list-item` | core | laid out as a block; no list marker in raster / SVG output (the [`pdf` profile](../pdf/index.md) paints markers in PDF output) |
-| Writing modes (`writing-mode`) | — | no: parsed, horizontal layout only |
+| Writing modes (`writing-mode: vertical-rl / vertical-lr / sideways-rl`, `text-orientation`, orthogonal flows, logical properties through the writing mode) | core | supported for block, flex and grid content with text, spans and images (compared with Chrome by `npm run test:writing-mode`); tables, absolutely / fixed positioned boxes, and `sideways-lr` are not (`text-combine-upright: all` is): see [Typography](./typography.md#vertical-text) |
 
 On `core`, `display: table*` lays out like `block` and `float` is ignored (no error).
 
@@ -288,7 +288,11 @@ As of 0.1.0 (see [docs/BENCHMARK.md](../../BENCHMARK.md) for the final status):
   `first:`, `last:` and `odd:`. Give the node a `tagName` or wrap the text in a container.
 - **`text-transform`** — no `lang`-tailored casing (Turkish, Azeri, Greek, Lithuanian), no `full-width` /
   `full-size-kana`.
-- Not supported: list markers and counters, `writing-mode`, 3D transforms, `filter: url()` /
+- **Vertical writing modes** — a vertical flow holding a table, an absolutely / fixed positioned box,
+  `sideways-lr` or both `vertical-rl` and `vertical-lr` is laid out horizontally;
+  no `text-combine-upright: digits`; no `text-spacing-trim`; a vertical flow is not split across PDF
+  pages. Details: [Typography](./typography.md#vertical-text).
+- Not supported: list markers and counters, 3D transforms, `filter: url()` /
   `clip-path: url()`, relative colour syntax, `outline-offset` in %, `@apply`, animations on
   pseudo-elements. (PDF output exists only in the separate [`pdf` profile](../pdf/index.md); it paints list markers in PDF output.)
 - Remaining one-level differences: gradient interior, dashed borders on rounded corners, rotated text,
@@ -354,7 +358,7 @@ mean implemented: see the notes at the end.
 
 **Images:** `objectFit`, `objectPosition`, `imageRendering`.
 
-**Text:** `color`, `direction`, `unicodeBidi`, `writingMode`, `textAlign`, `textAlignLast`,
+**Text:** `color`, `direction`, `unicodeBidi`, `writingMode`, `textOrientation`, `textCombineUpright`, `textAlign`, `textAlignLast`,
 `textIndent`, `textTransform`, `textShadow`, `textOverflow`, `textWrap`, `textWrapMode`,
 `textWrapStyle`, `whiteSpace`, `whiteSpaceCollapse`, `wordBreak`, `wordSpacing`, `wordWrap`,
 `overflowWrap`, `letterSpacing`, `lineHeight`, `lineBreak`, `lineClamp`, `WebkitLineClamp`,
@@ -387,7 +391,7 @@ Notes:
   `pointerEvents`, `cursor`, `userSelect`, `WebkitUserSelect`, `transitionBehavior`, `maskComposite`,
   `WebkitMaskComposite`.
 - **Parsed, no visible effect in 0.1.0** (found by inspecting which computed values the renderer
-  reads): `writingMode`, `hyphens` / `WebkitHyphens`, `lineBreak`, `textAlignLast`, `unicodeBidi`,
+  reads): `hyphens` / `WebkitHyphens`, `lineBreak`, `textAlignLast`, `unicodeBidi`,
   `fontSynthesisWeight` / `fontSynthesisStyle` and the weight / style parts of `fontSynthesis` (bold /
   italic synthesis is always on; small-caps synthesis does follow `fontSynthesis` /
   `fontSynthesisSmallCaps`), `counterReset` / `counterIncrement` / `counterSet`, `listStyle*` (no

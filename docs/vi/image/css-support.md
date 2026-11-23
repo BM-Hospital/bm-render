@@ -52,7 +52,7 @@ Trang này liệt kê tính năng của bm-render và profile tối thiểu cầ
 | Float (`float`, `clear`) | standard (cờ `floats`; cả `full`) | hỗ trợ; 138/138 ca oracle layout; chữ chảy quanh float  |
 | `display: contents` | core | hỗ trợ |
 | `display: list-item` | core | layout như block; không có ký hiệu đầu dòng (list marker) trong đầu ra raster / SVG ([profile `pdf`](../pdf/index.md) vẽ ký hiệu trong đầu ra PDF) |
-| Chế độ viết (`writing-mode`) | — | không: parse được, chỉ layout theo chiều ngang |
+| Chế độ viết (`writing-mode: vertical-rl / vertical-lr / sideways-rl`, `text-orientation`, luồng trực giao, thuộc tính logic theo chế độ viết) | core | hỗ trợ cho nội dung block, flex và grid có chữ, span và ảnh (so với Chrome bằng `npm run test:writing-mode`); chưa hỗ trợ bảng, hộp định vị absolute / fixed và `sideways-lr` (có hỗ trợ `text-combine-upright: all`): xem [Typography](./typography.md#chữ-dọc) |
 
 Trên `core`, `display: table*` được layout như `block` và `float` bị bỏ qua (không báo lỗi).
 
@@ -290,7 +290,11 @@ Tình trạng ở 0.1.0 (xem [docs/BENCHMARK.md](../../BENCHMARK.md) để biế
   khớp `first:`, `last:` và `odd:`. Hãy đặt `tagName` cho node hoặc bọc chữ trong container.
 - **`text-transform`** — chưa đổi hoa / thường theo `lang` (Thổ Nhĩ Kỳ, Azeri, Hy Lạp, Litva), chưa có
   `full-width` / `full-size-kana`.
-- Chưa hỗ trợ: ký hiệu đầu dòng và counter, `writing-mode`, transform 3D, `filter: url()` /
+- **Chế độ viết dọc** — một luồng dọc chứa bảng, hộp định vị absolute / fixed, `sideways-lr` hoặc cả
+  `vertical-rl` lẫn `vertical-lr` sẽ được bố trí theo chiều ngang; chưa có `text-combine-upright: digits`;
+  chưa có `text-spacing-trim`; luồng dọc không được chia qua nhiều trang PDF. Chi tiết:
+  [Typography](./typography.md#chữ-dọc).
+- Chưa hỗ trợ: ký hiệu đầu dòng và counter, transform 3D, `filter: url()` /
   `clip-path: url()`, cú pháp màu tương đối, `outline-offset` theo %, `@apply`, animation trên
   pseudo-element. (Đầu ra PDF chỉ có ở [profile `pdf`](../pdf/index.md) riêng; nó vẽ ký hiệu danh sách trong đầu ra PDF.)
 - Các sai khác 1 mức còn lại: phần trong của gradient, viền nét đứt trên góc bo, chữ bị xoay,
@@ -356,7 +360,7 @@ lúc nào cũng đã được cài đặt: xem phần ghi chú ở cuối.
 
 **Ảnh:** `objectFit`, `objectPosition`, `imageRendering`.
 
-**Văn bản:** `color`, `direction`, `unicodeBidi`, `writingMode`, `textAlign`, `textAlignLast`,
+**Văn bản:** `color`, `direction`, `unicodeBidi`, `writingMode`, `textOrientation`, `textCombineUpright`, `textAlign`, `textAlignLast`,
 `textIndent`, `textTransform`, `textShadow`, `textOverflow`, `textWrap`, `textWrapMode`,
 `textWrapStyle`, `whiteSpace`, `whiteSpaceCollapse`, `wordBreak`, `wordSpacing`, `wordWrap`,
 `overflowWrap`, `letterSpacing`, `lineHeight`, `lineBreak`, `lineClamp`, `WebkitLineClamp`,
@@ -389,7 +393,7 @@ Ghi chú:
   `pointerEvents`, `cursor`, `userSelect`, `WebkitUserSelect`, `transitionBehavior`, `maskComposite`,
   `WebkitMaskComposite`.
 - **Parse được nhưng chưa có tác dụng thấy được trong 0.1.0** (xác định bằng cách kiểm tra renderer đọc
-  những giá trị computed nào): `writingMode`, `hyphens` / `WebkitHyphens`, `lineBreak`, `textAlignLast`,
+  những giá trị computed nào): `hyphens` / `WebkitHyphens`, `lineBreak`, `textAlignLast`,
   `unicodeBidi`, `fontSynthesisWeight` / `fontSynthesisStyle` và phần weight / style của `fontSynthesis`
   (luôn tự tạo đậm / nghiêng; việc tự tạo small caps thì theo `fontSynthesis` / `fontSynthesisSmallCaps`), `counterReset` / `counterIncrement` / `counterSet`,
   `listStyle*` (không có ký hiệu đầu dòng), `transition*`, `paintOrder` trên chữ (bị bỏ qua).

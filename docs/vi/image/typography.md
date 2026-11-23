@@ -4,7 +4,8 @@
 
 bm-render dàn trang và vẽ chữ như thế nào: xuống dòng và `white-space`, ngắt từ dài, chiều cao dòng và
 khoảng cách, căn lề, cắt bớt bằng dấu ba chấm và `line-clamp`, tiêu đề cân dòng, trang trí chữ, đổ bóng
-và viền chữ, đổi hoa thường, trộn span, inline-block và ảnh trong cùng một dòng, các feature OpenType, và
+và viền chữ, đổi hoa thường, trộn span, inline-block và ảnh trong cùng một dòng, các feature OpenType, chữ
+dọc (`writing-mode`), và
 [profile](../profiles-and-size.md) nào cần cho chữ hai chiều và hệ chữ phức tạp. Chữ cần một font đã đăng
 ký: hãy đọc [Font](./fonts.md) trước. Mọi ví dụ đều được chạy bởi `docs/examples/typography.mjs` và ảnh
 minh hoạ là kết quả của nó.
@@ -444,6 +445,91 @@ Roboto, Be Vietnam Pro, ...). Văn bản ở dạng tổ hợp (NFD, hay gặp k
 định vị dấu của font và chỉ được tự chuẩn hoá trên `full`; hãy gọi `normalize("NFC")` với dữ liệu người
 dùng cho chắc. Dòng được ngắt ở dấu cách, đúng với những gì tiếng Việt cần.
 
+## Chữ dọc
+
+`writingMode: "vertical-rl"` (sách tiếng Nhật, tiếng Trung, tiếng Hàn) và `"vertical-lr"` (tiếng Mông Cổ,
+một số tiêu đề) xoay một khối sang dọc: các dòng chạy từ trên xuống dưới và xếp từ phải sang trái
+(`vertical-rl`) hoặc từ trái sang phải (`vertical-lr`). `"sideways-rl"` là `vertical-rl` với mọi ký tự
+đều được xoay. Tính năng có trên mọi profile, ở đầu ra PNG / JPEG / WebP, `renderSvg` và PDF.
+
+```js
+// Noto Sans TC (hoặc font CJK bất kỳ có metric dọc) đã đăng ký với tên "Noto Sans TC"
+const vertical = renderer.renderSync(
+  `<!doctype html><html><body style="margin:0;font-family:'Noto Sans TC';font-size:20px">
+    <div style="writing-mode:vertical-rl;height:200px;padding:10px;line-height:1.5;background:#eef">
+      日本語の書き方。CSS 2024年、ABC と 123 を含む。<span style="color:#c00">赤い文字</span>
+    </div>
+  </body></html>`,
+  { width: 300, height: 240 },
+);
+```
+
+Những gì được hỗ trợ:
+
+- **Hướng ký tự** (`textOrientation`). `mixed` (mặc định) đặt đứng các chữ Hán, kana, Hangul, ký tự
+  toàn độ rộng và các ký tự khác mà Unicode cho hướng dọc đứng (UAX #50, xấp xỉ theo các khoảng mã), còn
+  chữ Latin, chữ số và phần còn lại được xoay 90 độ theo chiều kim đồng hồ. `upright` đặt đứng mọi ký tự,
+  `sideways` xoay mọi ký tự. Ký tự đứng được shape với feature `vert` của font (dấu câu dọc như `、` `。`
+  `「」` `（）`), tiến theo độ tiến dọc (`vhea` / `vmtx`) và treo từ gốc dọc (`VORG`, nếu không có thì
+  `vmtx` + hộp glyph); font không có metric dọc thì dùng chiều cao font và hộp em căn giữa dòng, như Chrome.
+- **Tate-chu-yoko** (`textCombineUpright: "all"` trên một span): chữ của span (`"12"`, `"2024"`, `"!?"`)
+  được đặt ngang trong một ô em đứng, bị nén theo chiều ngang khi rộng hơn, và căn giữa dòng.
+- **Nội dung inline**: cỡ chữ, màu, span có nền, viền và padding, trang trí chữ (`underline` vẽ ở bên
+  trái, phía dưới dòng), `text-align` dọc theo dòng (`start` = trên, `end` = dưới, `center`),
+  `text-indent`, `line-height`, xuống dòng và mọi giá trị `white-space` / `word-break`, inline-block và
+  ảnh trong dòng.
+- **Hộp**: padding, viền, nền và margin của hộp dọc và của các khối con, xếp theo trục khối (từ phải sang
+  trái với `vertical-rl`); container flex và grid bố trí theo trục logic (`flex-direction: row` chạy từ
+  trên xuống dưới); `float: left` / `right` nghĩa là đầu / cuối dòng (trên / dưới). Thuộc tính logic
+  (`marginBlockStart`, `paddingInlineStart`, `inlineSize`, `borderBlockEnd`, ...) được ánh xạ theo
+  chế độ viết.
+- **Luồng trực giao** (CSS Writing Modes 4 §7): một hộp dọc trong trang ngang (tiêu đề dọc cạnh văn bản
+  ngang) rộng bằng các dòng của nó và cao bằng nội dung, tối đa bằng chiều cao xác định của phần tử cha,
+  nếu không thì bằng chiều cao viewport; hộp ngang nằm trong hộp dọc lấy chiều rộng theo cách tương tự từ
+  chiều rộng viewport. `writing-mode` đặt trên `<body>` áp dụng cho cả tài liệu (phần tử gốc nhận nó, như
+  trình duyệt), nên `<body style="writing-mode:vertical-rl">` bắt đầu ở góc trên bên phải.
+- **PDF**: các dòng xoay là văn bản theo thứ tự nội dung. Ký tự đứng được vẽ bằng đường viền glyph, phía
+  trên có một bản sao vô hình của văn bản dòng theo hướng của dòng, để sao chép và trích xuất văn bản đi
+  theo dòng: `pdftotext` đọc trang `vertical-rl` theo từng cột từ phải sang; với `vertical-lr`, chế độ
+  đọc theo bố cục của nó cũng liệt kê các cột từ phải sang (`pdftotext -raw` giữ thứ tự logic ở cả hai
+  chế độ).
+
+So với Chrome (`npm run test:writing-mode`: Noto Sans TC, ảnh chụp Chrome ở device scale 1). Hình chữ nhật
+của các phần tử trong các fixture khối, luồng trực giao và thuộc tính logic trùng với Chrome; "khác biệt"
+là tỉ lệ điểm ảnh có độ sáng lệch hơn 48 sau khi làm mờ 3 x 3 (bỏ qua khử răng cưa), phần lớn do vị trí
+glyph dưới mức điểm ảnh:
+
+| Fixture | Điểm ảnh khác biệt |
+|:--|--:|
+| `vertical-rl`, CJK + Latin + chữ số, padding, nền | 0.47 % |
+| `vertical-rl` trên `<body>` (một trang văn bản) | 2.29 % |
+| `vertical-lr`, viền | 0.05 % |
+| `text-orientation: upright` / `sideways` | 0.05 % / 0.00 % |
+| tiêu đề dọc trong trang ngang | 0.19 % |
+| span: màu, nền, gạch chân, cỡ chữ lớn hơn | 2.47 % |
+| `text-align` theo từng đoạn | 0.00 % |
+| `text-combine-upright` (`12`, `2024`, `!?`) | 1.16 % (xem phần giới hạn) |
+| tiếng Trung với dấu câu toàn độ rộng | 3.01 % (Chrome thu gọn `。（`) |
+| hộp ngang trong trang dọc | 0.90 % |
+| khối con, thuộc tính logic, flex | 0.69 %, 0.38 %, 0.27 % |
+
+Giới hạn:
+
+- Một luồng dọc chứa bảng, hộp định vị absolute / fixed, `sideways-lr`, hoặc cả `vertical-rl` lẫn
+  `vertical-lr` sẽ được bố trí theo chiều ngang (các thuộc tính logic của nó vẫn giữ ánh xạ dọc).
+- Chưa hỗ trợ `textCombineUpright: "digits <n>"`, và khối kết hợp được nén bằng cách co giãn thay vì dùng các
+  dạng nửa / một phần ba / một phần tư độ rộng của font (`hwid`, `twid`, `qwid`) mà Chrome thử trước; Chrome
+  cũng đặt khối lệch sang phải tâm dòng vài điểm ảnh.
+- `text-spacing-trim` của Chrome (dấu câu toàn độ rộng liền nhau như `。（` được đặt nửa độ rộng) không
+  được áp dụng, kể cả với văn bản ngang.
+- Các đoạn chạy khác font hoặc cỡ chữ trên cùng một dòng căn theo đường cơ sở alphabetic, không phải
+  đường trung tâm mà Chrome dùng cho chữ dọc (lệch vài điểm ảnh với font dự phòng hoặc span lớn hơn).
+- `underline` luôn ở bên trái; Chrome vẽ nó bên phải với `lang="ja"` / `"ko"`.
+- Luồng dọc không được chia qua nhiều trang PDF; `text-shadow` trên ký tự đứng không được vẽ trong đầu ra
+  PDF, và `background-clip: text` không theo chữ dọc.
+- Padding và margin dạng phần trăm của hộp trực giao được tính theo trục inline của chính nó.
+- Đường cơ sở của inline-block dọc trong dòng ngang là cạnh dưới của margin box.
+
 ## Chữ hai chiều và hệ chữ phức tạp
 
 Profile `full` chạy thuật toán hai chiều của Unicode (UAX #9) và các bộ shaping phức tạp cho tiếng Ả Rập,
@@ -486,13 +572,13 @@ dàn từ trái sang phải. CJK và các hệ chữ không cần sắp xếp l�
 | Emoji màu | không | font bitmap (CBDT / sbix) | có (kèm font màu) |
 
 `direction: rtl` cũng lật ngược hàng flex, cột grid và bảng (xem [Style](./styles.md#right-to-left)). Các
-hạn chế đã biết (cũng có trong [Hỗ trợ CSS](./css-support.md#các-hạn-chế-đã-biết)): `writing-mode` (chữ dọc)
-chưa được hỗ trợ, và khoảng trắng treo của chữ RTL với `white-space: pre-wrap` chưa được xử lý.
+hạn chế đã biết (cũng có trong [Hỗ trợ CSS](./css-support.md#các-hạn-chế-đã-biết)): khoảng trắng treo của
+chữ RTL với `white-space: pre-wrap` chưa được xử lý. Chữ dọc: xem [Chữ dọc](#chữ-dọc).
 
 ## Thuộc tính không có tác dụng trong 0.1.0
 
 Được parse và chấp nhận nhưng không có hiệu ứng nhìn thấy: `textAlignLast`, `hyphens` (trừ dấu gạch nối
-mềm trong văn bản), `lineBreak`, `writingMode`, `fontSynthesisWeight` / `fontSynthesisStyle` và phần weight /
+mềm trong văn bản), `lineBreak`, `fontSynthesisWeight` / `fontSynthesisStyle` và phần weight /
 style của `fontSynthesis` (đậm và nghiêng luôn được tự tạo), và `paintOrder` trên chữ (bị bỏ qua; ảnh SVG thì có tôn trọng). Danh sách đầy đủ các thuộc tính được hỗ trợ
 nằm ở [Hỗ trợ CSS](./css-support.md#văn-bản).
 

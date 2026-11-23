@@ -85,6 +85,46 @@ probe("pagination.table.rowspan", "tables: a cell that spans rows across a page 
     ["rowspan over 12 rows (more than a page)", table(`<tr><td rowspan="12">S1<br>S2<br>S3<br>S4<br>S5<br>S6<br>S7<br>S8<br>S9<br>S10<br>S11<br>S12</td><td>a01</td></tr>` + Array.from({ length: 11 }, (_, i) => `<tr><td>a${pad(i + 2)}</td></tr>`).join("")), SMALL],
   ], G);
 });
+// Tables with their default border spacing (or 10px) on 300 x 220 pages, 12px/16px rows with `padding: 1px 2px`
+// (18px rows): the spacing at a break, rows that start or continue a cell spanning rows, rows grown by a definite
+// table height. Checked against Playwright Chromium printed to PDF as well (2026-11-23): Chrome agrees with takumi
+// in every case here but the last, where takumi draws the content after the table over its repeated header.
+const SP_CSS = `body{font:12px/16px Inter} table{width:200px;font:12px/16px Inter} td,th{padding:1px 2px;text-align:left;font-weight:400}`;
+const spTable = ({ n = 20, span = -1, head = false, height = "", css = "", body2 = false } = {}) => {
+  const row = (i, word = "Item") => span >= 0 && i === span ? `<tr><td rowspan="3">${word} ${pad(i + 1)}</td><td>${(i + 1) * 3}</td></tr>`
+    : span >= 0 && (i === span + 1 || i === span + 2) ? `<tr><td>${(i + 1) * 3}</td></tr>` : `<tr><td>${word} ${pad(i + 1)}</td><td>${(i + 1) * 3}</td></tr>`;
+  const body = Array.from({ length: n }, (_, i) => row(i)).join("");
+  const hd = head ? "<thead><tr><th>Name</th><th>Qty</th></tr></thead>" : "";
+  const second = body2 ? `<tbody>${Array.from({ length: n }, (_, i) => row(i, "Next")).join("")}</tbody>` : "";
+  return doc(`<table style="${height ? `height:${height};` : ""}${css}">${hd}<tbody>${body}</tbody>${second}</table><div>After</div>`, SP_CSS);
+};
+probe("pagination.table.spacing-breaks", "tables: border spacing at a break, cells spanning rows over it, rows grown by a definite table height", async (t) => {
+  const sp10 = "border-spacing:0 10px";
+  await cmpAll(t, [
+    // the spacing before the first row of a continuation is truncated (it was kept without a thead)
+    ["no thead: the rows of the next page start at its top", spTable({ n: 30 }), ST_PAGE],
+    ["no thead, 10px spacing", spTable({ n: 20, css: sp10 }), ST_PAGE],
+    ["no thead, a second row group continues", spTable({ n: 6, css: sp10, body2: true }), ST_PAGE],
+    ["the spacing after the last row is cut where the rows end at the page end (and a block-end border follows)", spTable({ n: 20, span: 8, css: "border-bottom:1px solid #000" }), ST_PAGE],
+    ["the spacing after the last row is cut where the rows end at the page end", spTable({ n: 20, span: 8 }), ST_PAGE],
+    // a cell spanning rows from above the break: its row resumes first, the spacing after it stays
+    ["rowspan over the break, 10px spacing", spTable({ n: 20, span: 5, css: sp10 }), ST_PAGE],
+    ["rowspan starting the next page, 10px spacing", spTable({ n: 20, span: 7, css: sp10 }), ST_PAGE],
+    ["rowspan over the break with a repeated thead", spTable({ n: 20, span: 7, head: true }), ST_PAGE],
+    ["rowspan over the break with a repeated thead, 10px spacing", spTable({ n: 20, span: 5, head: true, css: sp10 }), ST_PAGE],
+    // the rows a definite table height grew: a row whose cells all span rows from it or above splits as a
+    // row of several cells does; a row whose content and padding do not fit moves on whole
+    ["definite height: a row of one cell beside a rowspan splits", spTable({ n: 8, span: 3, height: "700px" }), ST_PAGE],
+    ["definite height: the row of the first rowspan cell splits", spTable({ n: 8, span: 0, height: "700px", css: sp10 }), ST_PAGE],
+    ["definite height: a row whose content does not fit moves on whole", spTable({ n: 8, height: "700px", css: sp10 }), ST_PAGE],
+    ["definite height: the spacing at the break, the table keeps its height", spTable({ n: 3, height: "900px", css: sp10 }), ST_PAGE],
+    ["definite height: a row cut in its free space resumes below the repeated thead", spTable({ n: 3, height: "900px", head: true }), ST_PAGE],
+    ["definite height with a repeated thead and rowspan, 10px spacing", spTable({ n: 8, span: 4, height: "700px", head: true, css: sp10 }), ST_PAGE],
+    // (Chrome: the last table box takes what is left of the height below its repeated thead, the block after it
+    // follows; takumi places the block at the top of that last page, over the repeated thead)
+    ["definite height: what follows comes after the last table fragment (Chrome)", spTable({ n: 3, height: "600px", head: true }), ST_PAGE],
+  ], G);
+});
 probe("pagination.table.caption", "tables: captions", async (t) => {
   await cmpAll(t, [
     ["top caption", table(`<caption style="font:12px/20px Inter;text-align:left">CAP</caption>` + rows(1, 20)), SMALL],
@@ -207,6 +247,37 @@ probe("pagination.flex.row", "flex row containers: items are parallel flows", as
     ["row-reverse", doc(lines(1, 5) + fx("flex-direction:row-reverse", col(6, 13, "flex:1") + `<div style="flex:1">` + lines(1, 3, () => "", "S") + `</div>`)), SMALL],
     ["margin of an item overflows the page", doc(lines(1, 7) + fx("", `<div class="l" style="margin-bottom:60px">A</div>`) + lines(8, 9)), SMALL],
     ["inline-flex is monolithic", doc(lines(1, 6) + `<div style="display:inline-flex">` + col(7, 11) + `</div>`), SMALL],
+  ], G);
+});
+
+// A table stretched to its row flex line (align-items: stretch) and broken over pages: on the page where the
+// line ends, Blink's flex fragmentation grows the line by what the table reaches past it (to the table's end
+// there, or to the page end when the table goes on), lays it out again at the grown size and the table shares
+// it among its body rows in proportion to their minimum block sizes; only the rows of that page and later
+// ones take it (Chrome agrees, Playwright Chromium printed to PDF). The other items keep their content and
+// reach the grown line's end; the container ends with the table.
+const ST_CSS = `table{width:200px;font:12px/16px Inter} td,th{padding:1px 2px;text-align:left;font-weight:400}`;
+const stRows = (n, f = () => "") => Array.from({ length: n }, (_, i) => `<tr><td>Item ${pad(i + 1)}${f(i)}</td><td>${(i + 1) * 3}</td></tr>`).join("");
+const stHead = "<thead><tr><th>Name</th><th>Qty</th></tr></thead>";
+const stTable = (body, head = stHead, attrs = "") => `<table ${attrs}>${head}<tbody>${body}</tbody></table>`;
+const stFlex = (style, inner, beside = "<div>Beside</div>") => doc(fx(style, inner + beside) + `<div class="l">After</div>`, ST_CSS);
+const ST_PAGE = { size: { width: 300, height: 220 }, margin: 10, tagged: false };
+const stSpan = (at, n) => Array.from({ length: n }, (_, i) => i === at ? `<tr><td rowspan="3">Item ${pad(i + 1)}<br>span</td><td>${(i + 1) * 3}</td></tr>`
+  : (i === at + 1 || i === at + 2) ? `<tr><td>${(i + 1) * 3}</td></tr>` : `<tr><td>Item ${pad(i + 1)}</td><td>${(i + 1) * 3}</td></tr>`).join("");
+probe("pagination.flex.stretched-table", "flex rows: a stretched table broken over pages takes the grown line in its last fragment", async (t) => {
+  const bg = `<div style="background:#f99;width:40px">Beside</div>`;
+  await cmpAll(t, [
+    ["stretch, three pages", stFlex("", stTable(stRows(30))), ST_PAGE],
+    ["align-items:start keeps the row height", stFlex("align-items:start", stTable(stRows(30))), ST_PAGE],
+    ["stretch, two pages", stFlex("", stTable(stRows(16))), ST_PAGE],
+    ["stretch, rows of two heights share in proportion", stFlex("", stTable(stRows(30, (i) => (i === 26 || i === 28 ? "<br>x" : "")))), ST_PAGE],
+    ["stretch beyond the content (a taller item)", stFlex("", stTable(stRows(30)), `<div style="height:760px">Beside</div>`), ST_PAGE],
+    ["stretch, a rowspan in the last fragment", stFlex("", stTable(stSpan(27, 30))), ST_PAGE],
+    ["stretch, a tall repeated header: the line ends a page before the table", stFlex("", stTable(stRows(18), "<thead><tr><th>Name<br>a<br>b<br>c</th><th>Qty</th></tr></thead>")), ST_PAGE],
+    ["stretch, a repeated footer", stFlex("", stTable(stRows(30), stHead + "<tfoot><tr><td>Total</td><td>0</td></tr></tfoot>")), ST_PAGE],
+    ["stretch, backgrounds: the sibling reaches the line, the container the table", stFlex("background:#99f", stTable(stRows(30), stHead, `style="background:#9f9"`), bg), ST_PAGE, { paint: true }],
+    ["column flex is not stretched in the block axis", stFlex("flex-direction:column", stTable(stRows(30))), ST_PAGE],
+    ["a definite container height", stFlex("height:900px", stTable(stRows(30))), ST_PAGE],
   ], G);
 });
 

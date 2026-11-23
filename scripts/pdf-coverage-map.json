@@ -2014,7 +2014,7 @@
       "adapters": [
         "node scripts/pdf-audit/run.mjs --strict upstream.content_beside_a_table_does_not_replay_with_its_header"
       ],
-      "reason": "The asserted facet (the sidebar paints once) equals the oracle. The probe also found an open geometry difference on the last page (row height of a fragmented flex-item table), listed in scripts/pdf-audit/exceptions.json."
+      "reason": "The asserted facet (the sidebar paints once) equals the oracle, and so does the text of every page: the rows of the table's last fragment take the flex line's growth there (Blink's row_cross_size_updates; pagination.flex.stretched-table covers the variants)."
     },
     {
       "id": "takumi-pdf/tests/pdf_fixtures.rs:1035:a_tagged_rowspan_stays_in_its_row_group",

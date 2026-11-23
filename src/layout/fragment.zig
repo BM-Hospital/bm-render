@@ -121,6 +121,21 @@ pub const RowMinimum = struct { node: u32, height: f32, top: ?f32 = null };
 /// border-box width `w` of its first fragment (takumi: the container's box takes the page's width,
 /// its items keep the sizes and offsets the flex / grid algorithm gave them).
 pub const FrozenWidth = struct { node: u32, w: f32 };
+/// A table stretched to its row flex line (`align-self: stretch`) whose fragments grew past the
+/// line's end. Blink's flex fragmentation grows the line by what the item reaches past it, in the
+/// fragment where the line ends (`row_cross_size_updates`: to the item's end when the item ends
+/// there, else to the fragmentainer's end), and lays the stretched items out again at the grown
+/// size; the table shares that larger block size among its rows (`DistributeTableBlockSizeToSections`,
+/// proportionally to their minimum block sizes), and only the rows of that fragment and later ones
+/// show it: the earlier fragments are done. Rows from table row `segs[i].row` (table.zig row order)
+/// take the block sizes they get when the table box is `segs[i].size` tall; `segs[0]` is the size
+/// the table was first laid out at. `line`: where the line ends, from the table's border-box
+/// block start; `next_page`: the first page not looked at yet; `h0`: the table's border-box block
+/// size in that first layout, which the other items of the line stretch to as before (the line
+/// grows in the fragment where it ends, after they were laid out: their content stays, their boxes
+/// reach its grown end; flex.zig, `applyBand`).
+pub const TableStretch = struct { node: u32, line: f32, next_page: u32, h0: f32, segs: []StretchSeg };
+pub const StretchSeg = struct { row: u32, size: f32 };
 
 pub const Page = struct { top: f32, height: f32 };
 /// Lines `first_line..` of `node` (up to the next entry of the same node) are painted `dy` lower.
@@ -262,6 +277,9 @@ pub const PagedState = struct {
     cut_glyph: u32 = 0,
     cuts: []const ParagraphCut = &.{},
     row_minimums: []const RowMinimum = &.{},
+    /// Tables stretched in a row flex line that pagination made reach past the line's end (filled
+    /// by src/render.zig `Frame.stretchRowFlexTables`, read by table.zig).
+    table_stretches: []TableStretch = &.{},
     /// Flex / grid containers whose items lay out at another width than the container's own
     /// (src/pdf/paged.zig, tree.zig).
     frozen_widths: []const FrozenWidth = &.{},
@@ -457,6 +475,9 @@ fn Engine(comptime T: type) type {
         any_names: bool = false,
         shifts: std.ArrayList(LineShift) = .empty,
         reps: std.ArrayList(RepeatRaw) = .empty,
+        /// per `PagedState.table_stretches` entry: how much taller than in its first layout the
+        /// table is before the breaks (`stretchExcess`)
+        stretch_excess: []f32 = &.{},
         fixed: std.ArrayList(u32) = .empty,
         pushes: std.ArrayList(u32) = .empty,
         stamp: u32 = 0,
@@ -488,6 +509,7 @@ fn Engine(comptime T: type) type {
             e.pushes.deinit(e.a);
             e.a.free(e.st);
             e.a.free(e.slot);
+            e.a.free(e.stretch_excess);
         }
 
         inline fn lay(e: *Self, n: u32) *tr.Layout {
@@ -1119,6 +1141,32 @@ fn Engine(comptime T: type) type {
             }
             return info;
         }
+        /// The block border spacing between the rows and row groups of the table `n` or of the table
+        /// of the row group `n` (0 when the borders collapse).
+        fn rowSpacing(e: *Self, n: u32) f32 {
+            const t = if (e.kindOf(n) == .table) n else e.t.nodes.items[n].parent;
+            if (t == no_node or e.kindOf(t) != .table) return 0;
+            const s = e.style(t);
+            return if (s.border_collapse) 0 else @max(s.border_spacing[1], 0);
+        }
+        /// A cell of a row before item `i` of the row group sequence `sq` (border-box block start
+        /// `top`) spans rows down past `y`.
+        fn spanCrosses(e: *Self, sq: *const Seq, i: u32, top: f32, y: f32) bool {
+            const ns = e.t.nodes.items;
+            var p: u32 = 0;
+            while (p < i) : (p += 1) {
+                const r = sq.items[p].node;
+                const rt = e.itemTop(sq, p, top);
+                var c = ns[r].first_child;
+                while (c != no_node) : (c = ns[c].next_sibling) {
+                    const cs = ns[c].style;
+                    if (cs.display != .table_cell or cs.row_span <= 1 or cs.position.isOut()) continue;
+                    if (rt + e.lay(c).y + e.lay(c).h > y + eps) return true;
+                }
+            }
+            return false;
+        }
+
         /// The page window of a table's rows: past its repeated header, short of its repeated footer.
         fn tablePg(e: *Self, n: u32, info: *const TableInfo, pg: Pg) Pg {
             var out = pg;
@@ -1253,7 +1301,14 @@ fn Engine(comptime T: type) type {
                 var rb: R = undefined;
                 var cb: Breaks = .{};
                 if (single) {
+                    // (a row whose only cell of its own is a middle / bottom aligned one, the others
+                    // spanning rows from it or from a row above: that cell aligns in its fragment as in
+                    // a row of several cells, `probeBand`)
+                    const ra = if (k == .row) e.cellRealign(it0.node, band_top, bpg.end) else 0;
+                    if (k == .row) e.st[it0.node].realign = ra;
+                    if (ra != 0) e.shiftKids(it0.node, ra);
                     rb = try e.probe(it0.node, band_top, bpg, requires);
+                    if (ra != 0) e.shiftKids(it0.node, -ra);
                     cb = e.style(it0.node).breaks;
                     rb.mend = rb.end + @max(e.lay(it0.node).margin.bottom, 0);
                 } else rb = try e.probeBand(sq_i, i, j, top, band_top, bpg, requires);
@@ -1339,6 +1394,16 @@ fn Engine(comptime T: type) type {
                     bottom -= sl.trim;
                 }
             }
+            if (tables_on and k == .table and info.hdr_block == 0 and info.ftr_block == 0 and bottom > pg.end + eps and last_end > ninf) {
+                // the border spacing after the last row group, like a margin, stops at the page end: a
+                // table whose rows end there ends there too (its block-end padding and border, if
+                // any, start the next page); Chrome, takumi
+                const ce = bottom - inset_b;
+                if (last_end <= pg.end + eps and ce > pg.end + eps) {
+                    sl.trim = @min(ce - @max(last_end, pg.end), info.spacing);
+                    bottom -= sl.trim;
+                }
+            }
             // (a table whose footer was placed fits the page, not the rows' window short of the footer)
             // (a table with a repeated header lays its last table box out again with
             // `should_prevent_break_before_block_end_decorations`: once its rows fit, its block-end
@@ -1361,7 +1426,13 @@ fn Engine(comptime T: type) type {
             // the box itself reaches past the page end (Blink's FinishFragmentation): in the free space
             // below its content that is a perfect break; inside its block-end padding / border it goes
             // back to an earlier breakpoint, or is a last resort
-            if (bottom > flow_end + inset_b + eps) return try e.setBreak(n, .span, 0, false, .perfect, false, bottom0, pg.end);
+            // (a table cell taller than its content, a row grown by a definite table height: the break
+            // is in its free space only once its content and block-end padding / border fit the page,
+            // else it is a last resort and its row rather moves on whole; Blink's FinishFragmentation,
+            // Chrome, takumi)
+            const free_break = e.style(n).display != .table_cell or flow_end + inset_b <= pg.end + eps;
+            if (bottom > flow_end + inset_b + eps and free_break) return try e.setBreak(n, .span, 0, false, .perfect, false, bottom0, pg.end);
+            if (bottom > flow_end + inset_b + eps) return try e.setBreak(n, .span, 0, false, .last_resort, false, bottom0, pg.end);
             // content that overflows the page unbroken (monolithic) and nothing after it: the box ends
             // here (takumi's `is_at_block_end` with monolithic overflow), its container goes on
             if (k == .block and inset_b <= eps and n != e.t.root) return .{ .end = bottom, .first = first_bb orelse .auto, .last = prev_after };
@@ -1676,7 +1747,17 @@ fn Engine(comptime T: type) type {
                     stt.started = true;
                     stt.spanned = true;
                     if (stt.seq != no_node) _ = e.prevReach(&e.seqs.items[stt.seq], @intCast(e.seqs.items[stt.seq].items.len), top, true);
-                    if (sl.arg == 0) return 0;
+                    if (sl.arg == 0) {
+                        // (what is left of the box goes on where the next page's content resumes, below
+                        // a repeated table header (and the spacing after it): Blink lays out its
+                        // remaining block size there; takumi, Chrome. A table row grown by a definite
+                        // table height, cut in the free space of its cells.)
+                        const l = e.lay(n);
+                        const g = pg.next - pg.end;
+                        if (!(g > eps) or !(top + l.h > pg.end + eps)) return 0;
+                        l.h += g;
+                        return g;
+                    }
                     // the block-end padding and border start the next page
                     const l = e.lay(n);
                     // (above the content's end when that overflows the page: the box ends shorter)
@@ -1741,7 +1822,8 @@ fn Engine(comptime T: type) type {
             var d: f32 = 0;
             if (sl.kind == .before) {
                 const sq = &e.seqs.items[sq_i];
-                const reach = e.prevReach(sq, i, top, true);
+                const reach0 = e.prevReach(sq, i, top, false);
+                var reach = e.prevReach(sq, i, top, true);
                 const band_top = e.bandTop(sq, i, j, top);
                 // content resumes at the page start, below what an earlier page left overflowing; the
                 // margins (and row gap) adjoining an unforced break are truncated, any other distance
@@ -1751,6 +1833,14 @@ fn Engine(comptime T: type) type {
                 var p = i;
                 while (p > 0 and !sq.items[p - 1].flow) p -= 1;
                 if (p > 0) gap = @max(gap, e.lay(sq.items[p - 1].node).margin.bottom);
+                // (a table before the break that reached past the page end with no more than its
+                // block-end border spacing (cut there), or with the block-end decorations of its last
+                // table box (they overflow the page): what follows starts the next page, as after a
+                // box that ends there; Chrome, takumi)
+                if (tables_on and p > 0 and e.kindOf(sq.items[p - 1].node) == .table and reach0 > pg_in.end + eps) {
+                    reach = @min(reach, pg_in.end);
+                    gap = @max(gap, band_top - reach);
+                }
                 if (k == .bands) gap += @max(tr.resolveLp(e.style(n).gap[1], 0), 0);
                 // (a column flex container never pulls an item up: Blink's flex fragmentation moves an
                 // item down to the page start only when it began before it, so an item that the gap
@@ -1766,6 +1856,11 @@ fn Engine(comptime T: type) type {
                         gap = std.math.clamp(reach + mb - next, 0, mb);
                     }
                 }
+                // (the border spacing between table rows / row groups is truncated there too: the rows
+                // of a table's continuation start at its block start, below a repeated header and its
+                // spacing; Blink TableNG, takumi; Chrome checked)
+                const spacing = if (tables_on and (k == .group or k == .table)) e.rowSpacing(n) else 0;
+                gap = @max(gap, spacing);
                 var target = @max(@max(next, reach), band_top - gap);
                 // (content that overflows the page and is left behind: what follows starts the next page)
                 const stays = k == .block and e.overflowStays(sq, i, top, pg_in.end);
@@ -1777,6 +1872,9 @@ fn Engine(comptime T: type) type {
                     if (k == .bands and i > 0 and e.style(n).display == .flex) fgap = @max(tr.resolveLp(e.style(n).gap[1], 0), 0);
                     target = (if (stays) next else @max(next, reach)) + @max(e.lay(sq.items[i].node).margin.top, 0) + fgap;
                 }
+                // (a cell spanning rows from above the break goes on: Blink resumes its row first, an
+                // empty fragment at the page start, and the spacing after it stays; Chrome, takumi)
+                if (k == .group and spacing > 0 and e.spanCrosses(sq, i, top, band_top)) target = @max(next, reach) + spacing;
                 d = target - band_top;
                 try e.lazyShift(sq_i, i, d);
                 if (sl.forced and !sl.trunc and k == .block and sq.items[i].flow and i + 1 < sq.items.len and sq.items[i + 1].flow) {
@@ -1800,7 +1898,18 @@ fn Engine(comptime T: type) type {
                 if (j == i + 1) {
                     const sq = &e.seqs.items[sq_i];
                     const c = sq.items[i].node;
-                    d = try e.apply(c, e.itemTop(sq, i, top), pg);
+                    if (k == .row and e.st[c].realign != 0) {
+                        e.shiftKids(c, e.st[c].realign);
+                        e.st[c].realign = 0;
+                    }
+                    // (a row broken inside below a cell spanning rows from above it: its continuation
+                    // follows that row's empty fragment and the spacing after it, as above)
+                    var cpg = pg;
+                    if (tables_on and k == .group) {
+                        const spacing = e.rowSpacing(n);
+                        if (spacing > 0 and e.spanCrosses(sq, i, top, pg.end)) cpg.next += spacing;
+                    }
+                    d = try e.apply(c, e.itemTop(sq, i, top), cpg);
                     // (a column flex container counts the block decorations a broken
                     // `box-decoration-break: clone` item clones as none of the item's content: the items
                     // after it move by its growth less them; takumi / Blink flex fragmentation
@@ -1821,13 +1930,19 @@ fn Engine(comptime T: type) type {
 
         noinline fn applyBand(e: *Self, sq_i: u32, i: u32, j: u32, top: f32, pg: Pg) Error!f32 {
             var old_bottom: f32 = ninf;
+            // (the end of the line the stretched items reach: without what the rows a page break
+            // grew in a stretched table add, `TableStretch`)
+            var old_line: f32 = ninf;
             var k = i;
             while (k < j) : (k += 1) {
                 const sq = &e.seqs.items[sq_i];
                 if (!sq.items[k].flow) continue;
-                old_bottom = @max(old_bottom, e.itemTop(sq, k, top) + e.lay(sq.items[k].node).h);
+                const c = sq.items[k].node;
+                old_bottom = @max(old_bottom, e.itemTop(sq, k, top) + e.lay(c).h);
+                old_line = @max(old_line, e.itemTop(sq, k, top) + e.lay(c).h - e.stretchExcess(c));
             }
             var new_bottom: f32 = ninf;
+            var new_line: f32 = ninf;
             k = i;
             while (k < j) : (k += 1) {
                 var sq = &e.seqs.items[sq_i];
@@ -1839,7 +1954,8 @@ fn Engine(comptime T: type) type {
                     e.shiftKids(c, cst.realign);
                     cst.realign = 0;
                 }
-                cst.full = ct + e.lay(c).h >= old_bottom - eps;
+                const excess = e.stretchExcess(c);
+                cst.full = ct + e.lay(c).h - excess >= old_line - eps;
                 if (!cst.done) {
                     const cs = e.slot[c];
                     if (cs.stamp == e.stamp and cs.brk and !cs.par) {
@@ -1857,6 +1973,7 @@ fn Engine(comptime T: type) type {
                 }
                 sq = &e.seqs.items[sq_i];
                 new_bottom = @max(new_bottom, e.itemTop(sq, k, top) + e.lay(c).h);
+                new_line = @max(new_line, e.itemTop(sq, k, top) + e.lay(c).h - excess);
             }
             // (the band shrinks too: an item whose block-start margin a break truncated ends higher, and
             // when no other item reaches the old end the band ends with it; takumi / Blink flex rows
@@ -1874,10 +1991,17 @@ fn Engine(comptime T: type) type {
                     // (a grid item spanning more than one row keeps the block size the grid gave
                     // it: takumi / Blink grow only the rows a break moves content down in)
                     if (comptime @TypeOf(cl.grid_row_span) != void) if (cl.grid_row_span > 1) continue;
-                    cl.h = @max(cl.h, new_bottom - e.itemTop(sq, k, top));
+                    cl.h = @max(cl.h, new_line - e.itemTop(sq, k, top));
                 }
             }
             return g;
+        }
+
+        /// How much taller than in its first layout a table stretched in a row flex line is, the
+        /// rows a page break grew on a later page (`TableStretch`); 0 for any other box.
+        fn stretchExcess(e: *Self, n: u32) f32 {
+            for (e.t.paged.table_stretches, e.stretch_excess) |ts, x| if (ts.node == n and ts.segs.len > 1) return x;
+            return 0;
         }
 
         fn grow(e: *Self, n: u32, sq_i: u32, d: f32) f32 {
@@ -1886,7 +2010,14 @@ fn Engine(comptime T: type) type {
             const sq = &e.seqs.items[sq_i];
             l.content_h += d;
             var g: f32 = 0;
-            if (!e.heightDefinite(n)) {
+            // (a table of a definite height whose rows a break moved up, its border spacing cut at a
+            // page start, keeps that height: its last fragment takes what is left of it; Chrome, takumi)
+            const keeps = tables_on and d < 0 and e.kindOf(n) == .table and switch (e.style(n).size[1]) {
+                .px => true,
+                .calc => |c| c.percent == 0,
+                else => false,
+            };
+            if (!e.heightDefinite(n) and !keeps) {
                 if (sq.slack > 0) {
                     if (d <= sq.slack) {
                         sq.slack -= d;
@@ -2011,6 +2142,9 @@ fn Engine(comptime T: type) type {
             @memset(e.st, .{});
             e.slot = try e.a.alloc(Slot, ns.len);
             @memset(e.slot, .{});
+            const stretches = e.t.paged.table_stretches;
+            e.stretch_excess = try e.a.alloc(f32, stretches.len);
+            for (stretches, e.stretch_excess) |ts, *x| x.* = if (ts.node < ns.len) @max(e.lay(ts.node).h - ts.h0, 0) else 0;
             for (ns) |*nd| {
                 if (nd.style.breaks.page != 0) e.any_names = true;
             }

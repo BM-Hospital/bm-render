@@ -360,7 +360,7 @@ fn containsVar(s: []const u8) bool {
 /// Applies the CSS-wide keyword `k` to `p` (logical properties map through the direction).
 fn applyWide(cx: *props.Cx, st: *const State, p: Prop, k: CssWide) void {
     var buf: [4]Prop = undefined;
-    for (props.physicalProps(p, cx.s.direction == .rtl, &buf)) |q| {
+    for (props.physicalPropsOf(p, cx.s, &buf)) |q| {
         const use_parent = switch (k) {
             .inherit => true,
             .initial => false,
@@ -411,7 +411,7 @@ fn applyParsed(cx: *props.Cx, st: *const State, it: Item, p: Prop, l: *tokenizer
     // lenient: a failed declaration must leave no partial writes behind
     var saved: ComputedStyle = undefined;
     var buf: [4]Prop = undefined;
-    const phys = props.physicalProps(p, cx.s.direction == .rtl, &buf);
+    const phys = props.physicalPropsOf(p, cx.s, &buf);
     for (phys) |q| props.copyProp(q, &saved, cx.s);
     props.apply(cx, p, l) catch |e| {
         if (e == error.OutOfMemory) return e;

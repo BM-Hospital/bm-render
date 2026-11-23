@@ -804,6 +804,109 @@ test "paged: a long table repeats its header group on every continuation page" {
     try T.expect(pm.data[at * 4 + 3] == 0);
 }
 
+/// A table of `rows` body rows (ids `r1`..; rows `tall` hold two lines) beside a short item (`b`) in a
+/// flex row container (`c`) styled `flex_style`, a block (`after`) below.
+fn stretchSrc(a: std.mem.Allocator, flex_style: []const u8, rows: u32, tall: []const u32) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(a, "<html><body style=\"margin: 0\"><div id=\"c\" style=\"display: flex; font-size: 12px; {s}\"><table id=\"t\" style=\"width: 280px\"><thead><tr><th>Name</th><th>Qty</th></tr></thead><tbody>", .{flex_style});
+    for (1..rows + 1) |i| {
+        const two = std.mem.indexOfScalar(u32, tall, @intCast(i)) != null;
+        try buf.print(a, "<tr id=\"r{d}\"><td>Item {d}{s}</td><td>{d}</td></tr>", .{ i, i, if (two) "<br>x" else "", i * 3 });
+    }
+    try buf.appendSlice(a, "</tbody></table><div id=\"b\">Beside</div></div><div id=\"after\">After</div></body></html>");
+    return buf.items;
+}
+
+/// Laid out once at `width` px for the raster / SVG output: not paged.
+fn openFlat(src: []const u8, width: u32) !*Doc {
+    const r = try newRenderer();
+    errdefer r.destroy();
+    r.beginCall();
+    const a = r.arena.allocator();
+    const d = try a.create(Doc);
+    d.r = r;
+    d.f = .{ .r = r, .a = a, .opts = .{ .width = width }, .tree = rt.LTree.init(a), .ctx = undefined };
+    try d.f.prepare(.html, src);
+    d.pages = undefined;
+    return d;
+}
+
+fn rowH(d: *Doc, i: u32) !f32 {
+    var buf: [8]u8 = undefined;
+    return d.f.tree.layout((try nodeOfId(d, try std.fmt.bufPrint(&buf, "r{d}", .{i}))).lid).h;
+}
+
+test "paged: a table stretched in a flex row gives its last fragment's rows the line's growth (Blink / Chrome / takumi)" {
+    if (!enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const rows: u32 = 30;
+    const tall = [_]u32{ 27, 29 };
+    // 400 x 300 pages, 24px margins (upstream.content_beside_a_table_does_not_replay_with_its_header):
+    // the table breaks over three pages; its pushed rows and repeated headers make it end past the
+    // line it was stretched to. The flex line grows there by that much, the table stretched to it
+    // shares the larger block size among its body rows in proportion to their minimum block sizes
+    // (Blink's DistributeTableBlockSizeToSections), and the rows of its last fragment show it.
+    const st = try open(.html, try stretchSrc(a, "", rows, &tall), 400, 300, 24);
+    defer st.deinit();
+    const start = try open(.html, try stretchSrc(a, "align-items: start", rows, &tall), 400, 300, 24);
+    defer start.deinit();
+    const flat = try openFlat(try stretchSrc(a, "", rows, &tall), 352);
+    defer flat.deinit();
+    try T.expectEqual(@as(usize, 3), st.count());
+    try T.expectEqual(@as(usize, 3), start.count());
+    const last_page: u32 = 2;
+    const t_st = (try nodeOfId(st, "t")).lid;
+    const t_top = absTop(&st.f, t_st);
+    // unpaged, the rows keep their minimum block sizes: the table is as tall as the line
+    const b0 = flat.f.tree.layout((try nodeOfId(flat, "t")).lid).h;
+    var min_sum: f32 = 0;
+    var growth: f32 = 0;
+    var last_min: f32 = 0;
+    var i: u32 = 1;
+    while (i <= rows) : (i += 1) {
+        const h0 = try rowH(flat, i);
+        try T.expectApproxEqAbs(h0, try rowH(start, i), 0.001);
+        min_sum += h0;
+        const lid = (try nodeOfId(st, try std.fmt.allocPrint(a, "r{d}", .{i}))).lid;
+        const on_last = st.pages.pageAt(absTop(&st.f, lid) + 0.01) == last_page;
+        const h = try rowH(st, i);
+        if (!on_last) {
+            // the rows of the earlier fragments keep their block sizes
+            try T.expectApproxEqAbs(h0, h, 0.001);
+        } else {
+            try T.expect(h > h0 + 0.5);
+            growth += h - h0;
+            last_min += h0;
+        }
+    }
+    try T.expectApproxEqAbs(b0, flat.f.tree.layout((try nodeOfId(flat, "c")).lid).h, 0.001);
+    // in proportion: the two-line rows grow by twice as much (and a bit) as the one-line rows
+    // (row 30, the last, also takes what the 1/64 px rounding of the shares leaves)
+    const g_one = try rowH(st, 28) - try rowH(flat, 28);
+    const g_two = try rowH(st, 29) - try rowH(flat, 29);
+    try T.expectApproxEqAbs((try rowH(flat, 29)) / (try rowH(flat, 28)), g_two / g_one, 0.02);
+    // the line grew by what the table reached past it, X = its end before the rows grew less the
+    // line's end; every body row took its share of X
+    const t_end = t_top + st.f.tree.layout(t_st).h;
+    const x = (t_end - growth) - (t_top + b0);
+    try T.expect(x > 1);
+    try T.expectApproxEqAbs(x * last_min / min_sum, growth, @as(f32, @floatFromInt(rows)) / 64);
+    // the other item reaches the grown line's end, the container and what follows the table's
+    const b = (try nodeOfId(st, "b")).lid;
+    try T.expectApproxEqAbs(t_end - growth, absTop(&st.f, b) + st.f.tree.layout(b).h, 0.02);
+    const c = (try nodeOfId(st, "c")).lid;
+    try T.expectApproxEqAbs(t_end, absTop(&st.f, c) + st.f.tree.layout(c).h, 0.02);
+    try T.expectApproxEqAbs(t_end, absTop(&st.f, (try nodeOfId(st, "after")).lid), 0.02);
+
+    // a column flex container does not stretch the table in the block axis: nothing grows
+    const col = try open(.html, try stretchSrc(a, "flex-direction: column", rows, &tall), 400, 300, 24);
+    defer col.deinit();
+    i = 1;
+    while (i <= rows) : (i += 1) try T.expectApproxEqAbs(try rowH(flat, i), try rowH(col, i), 0.001);
+}
+
 test "paged: a flex row shrinks with an item whose truncated margin moved it up (align-items: flex-start)" {
     if (!enabled) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(T.allocator);
@@ -971,4 +1074,149 @@ test "paged: takumi-pdf HTML fixtures at A4" {
     _ = try checkLines(d);
     std.debug.print("takumi-pdf fixture invoice.html, invoice margins (footer band {d:.2} px, bottom margin {d:.2}): {d} pages (takumi: 2)\n", .{ band_h, bottom, d.count() });
     try T.expectEqual(@as(usize, 2), d.count());
+}
+
+/// A table (`t`, width 200px, 12px/16px text, cells `padding: 1px 2px`, the default 2px border
+/// spacing) of `rows` body rows `r1`.. (first cells `c1`..), styled `table_style`; with `head`, a
+/// header group (`h`). `span_at` (> 0): the first cell of that row spans three rows (the two rows
+/// after it have one cell). A block (`after`) follows the table.
+fn fragTableSrc(a: std.mem.Allocator, table_style: []const u8, rows: u32, span_at: u32, head: bool) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.print(a, "<html><body style=\"margin: 0; font: 12px/16px sans-serif\"><style>td, th {{ padding: 1px 2px; text-align: left; font-weight: 400 }}</style><table id=\"t\" style=\"width: 200px; font: 12px/16px sans-serif; {s}\">", .{table_style});
+    if (head) try buf.appendSlice(a, "<thead id=\"h\"><tr><th>Name</th><th>Qty</th></tr></thead>");
+    try buf.appendSlice(a, "<tbody>");
+    for (1..rows + 1) |i| {
+        if (span_at > 0 and i == span_at) {
+            try buf.print(a, "<tr id=\"r{d}\"><td id=\"c{d}\" rowspan=\"3\">Item {d}</td><td>{d}</td></tr>", .{ i, i, i, i * 3 });
+        } else if (span_at > 0 and i > span_at and i <= span_at + 2) {
+            try buf.print(a, "<tr id=\"r{d}\"><td id=\"c{d}\">{d}</td></tr>", .{ i, i, i * 3 });
+        } else try buf.print(a, "<tr id=\"r{d}\"><td id=\"c{d}\">Item {d}</td><td>{d}</td></tr>", .{ i, i, i, i * 3 });
+    }
+    try buf.appendSlice(a, "</tbody></table><div id=\"after\">After</div></body></html>");
+    return buf.items;
+}
+
+/// Block start of the element `id` in its page's area (stitched space less the page's top).
+fn topOnPage(d: *Doc, id: []const u8) !struct { page: u32, y: f32 } {
+    const lid = (try nodeOfId(d, id)).lid;
+    const y = absTop(&d.f, lid);
+    const p = d.pages.pageAt(y + 0.01);
+    return .{ .page = p, .y = y - d.pages.pages[p].top };
+}
+
+fn expectAt(d: *Doc, id: []const u8, page: u32, y: f32) !void {
+    const p = try topOnPage(d, id);
+    if (p.page != page or @abs(p.y - y) > 0.05) {
+        std.debug.print("{s}: page {d} y {d:.2}, expected page {d} y {d:.2}\n", .{ id, p.page, p.y, page, y });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "paged tables: the border spacing at a break is truncated like a margin (Chrome, takumi)" {
+    if (!enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 300 x 220 pages, 10px margins: a 200px page area. 18px rows, 2px spacing: rows 1-10 fill page 1
+    // (the spacing after row 10 is past its end). Row 11 starts page 2 at its top, not 2px lower
+    // (was: kept without a repeated header), and so on; the spacing after row 30 ends page 3 exactly.
+    {
+        const d = try open(.html, try fragTableSrc(a, "", 30, 0, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r10", 0, 182);
+        try expectAt(d, "r11", 1, 0);
+        try expectAt(d, "r21", 2, 0);
+        try expectAt(d, "after", 3, 0);
+    }
+    // 10px spacing: row 8 would start 6px into page 2 (the spacing before it straddles the page end)
+    {
+        const d = try open(.html, try fragTableSrc(a, "border-spacing: 0 10px", 20, 0, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r7", 0, 178);
+        try expectAt(d, "r8", 1, 0);
+    }
+    // the spacing after the last row, where the rows end at the page end, is cut there: the table ends
+    // with them and the block after it starts the next page (rows 9-11 share a cell: row 11 keeps its
+    // spacing, see below); a block-end border starts the next page, the spacing is still cut
+    {
+        const d = try open(.html, try fragTableSrc(a, "", 20, 9, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r20", 1, 182);
+        try expectAt(d, "after", 2, 0);
+        const b = try open(.html, try fragTableSrc(a, "border-bottom: 1px solid #000", 20, 9, false), 300, 220, 10);
+        defer b.deinit();
+        try expectAt(b, "after", 2, 1);
+    }
+    // a definite table height: the rows after the cut spacing end higher, the table keeps its height
+    {
+        const d = try open(.html, try fragTableSrc(a, "height: 900px; border-spacing: 0 10px", 3, 0, false), 300, 220, 10);
+        defer d.deinit();
+        // rows of (900 - 40) / 3 px: row 3 would start 3.33px into page 4
+        try expectAt(d, "r3", 3, 0);
+        try expectAt(d, "after", 4, 100);
+    }
+}
+
+test "paged tables: a cell spanning rows over a break resumes its row first, the spacing after it stays (Chrome, takumi)" {
+    if (!enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 10px spacing, 28px pitch: rows 1-7 on page 1, row 8 below the page end. A cell of row 6 spanning
+    // rows 6-8 goes on: Blink resumes row 6 (an empty fragment at the page start) and row 8 follows it
+    // after the spacing, at 10px (was: at its unbroken offset, 6px)
+    {
+        const d = try open(.html, try fragTableSrc(a, "border-spacing: 0 10px", 20, 6, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r8", 1, 10);
+        try expectAt(d, "r9", 1, 38);
+    }
+    // a cell spanning rows from row 8, the first row of page 2: nothing from above goes on
+    {
+        const d = try open(.html, try fragTableSrc(a, "border-spacing: 0 10px", 20, 8, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r8", 1, 0);
+    }
+    // with a repeated header (18px): row 10 follows the header, its spacing, the resumed row 8 and the
+    // spacing after that one (was: right below the header and its spacing, 20px)
+    {
+        const d = try open(.html, try fragTableSrc(a, "", 20, 8, true), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r10", 1, 22);
+    }
+    // a definite height (rows of 85.25px): row 5, whose only cell of its own sits beside the cell of
+    // row 4 spanning rows 4-6, splits at the end of page 2 as a row of several cells does, its cell
+    // aligned at its top in its fragment (was: moved to page 3 whole, the middle-aligned line cut by
+    // the page end); row 6 follows the resumed row 4, the spacing, the rest of row 5 and the spacing
+    {
+        const d = try open(.html, try fragTableSrc(a, "height: 700px", 8, 4, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r5", 1, 151);
+        try expectAt(d, "r6", 2, 40.25);
+    }
+}
+
+test "paged tables: rows grown by a definite table height break like Chrome and takumi" {
+    if (!enabled) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // rows of (700 - 90) / 8 = 76.25px with 10px spacing: row 3 starts 17.5px above the end of page 1;
+    // its line fits there, but not its block-end padding: a break in its free space is a last resort
+    // (Blink's FinishFragmentation), the row moves to page 2 whole (was: split at the page end)
+    {
+        const d = try open(.html, try fragTableSrc(a, "height: 700px; border-spacing: 0 10px", 8, 0, false), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r2", 0, 96.25);
+        try expectAt(d, "r3", 1, 0);
+    }
+    // with a repeated header (18px): rows of (600 - 18 - 10) / 3 = 190.67px, cut in the free space of
+    // their cells. The rest of row 1 (12.67px) resumes on page 2 below the header and its spacing,
+    // row 2 after it (was: row 2 at its unbroken offset, 14.67px, under the header)
+    {
+        const d = try open(.html, try fragTableSrc(a, "height: 600px", 3, 0, true), 300, 220, 10);
+        defer d.deinit();
+        try expectAt(d, "r1", 0, 22);
+        try expectAt(d, "r2", 1, 34.67);
+    }
 }
