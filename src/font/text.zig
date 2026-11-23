@@ -33,6 +33,8 @@ const FontCollection = coll.FontCollection;
 pub const TextStyle = struct {
     unicode_bidi: BidiMode = .normal,
     rtl: bool = false,
+    /// `hyphens: none`: a soft hyphen in the run is no break opportunity.
+    no_hyphens: bool = false,
     /// Family names in priority order (ASCII case-insensitive). Unknown / empty lists fall back to
     /// every registered family in registration order.
     families: []const []const u8 = &.{},
@@ -771,6 +773,9 @@ pub const Paragraph = struct {
     multi_run: bool = false,
     /// Paragraph direction is right-to-left.
     rtl: bool = false,
+    /// `unicode-bidi: plaintext`: the direction of each bidi paragraph, when one differs from
+    /// `rtl` (a line's alignment, reordering and ellipsis side follow its paragraph's).
+    plain_paras: []PlainPara = &.{},
     /// Some glyph has a non-zero bidi level (lines need visual reordering).
     has_bidi: bool = false,
     /// Some run allows soft wraps.
@@ -905,12 +910,18 @@ pub const Paragraph = struct {
                 try markBreaksFull(tmp, chars[0..n_chars], opts);
             } else markBreaks(chars[0..n_chars], opts);
             if (info.any_nowrap or info.any_obj) fixBreaks(chars[0..n_chars]);
+            // `hyphens: none` (CSS Text 3 §5.4): not even a soft hyphen breaks a word
+            if (n_chars > 1) for (chars[1..n_chars], chars[0 .. n_chars - 1]) |*c, prev| {
+                if (c.brk and prev.cp == 0xad and prev.run < runs.len and runs[prev.run].style.no_hyphens) c.brk = false;
+            };
         }
+        var plain_paras: std.ArrayList(PlainPara) = .empty;
+        errdefer plain_paras.deinit(alloc);
         if (complex) {
             var css_bidi = if (opts.strut) |s| s.unicode_bidi != .normal else false;
             for (runs) |r| css_bidi = css_bidi or r.style.unicode_bidi != .normal;
             for (opts.boxes) |box| css_bidi = css_bidi or box.style.unicode_bidi != .normal;
-            if (css_bidi) try resolveCssBidi(tmp, chars[0..n_chars], runs, opts) else try resolveBidi(tmp, chars[0..n_chars], rtl_base);
+            if (css_bidi) try resolveCssBidi(tmp, chars[0..n_chars], runs, opts, &plain_paras, alloc) else try resolveBidi(tmp, chars[0..n_chars], rtl_base);
         }
 
         var local_cache = shp.Cache.init(tmp);
@@ -978,6 +989,11 @@ pub const Paragraph = struct {
         p.metrics = try b.metrics.toOwnedSlice(alloc);
         errdefer alloc.free(p.metrics);
         p.objs = try b.objs.toOwnedSlice(alloc);
+        errdefer alloc.free(p.objs);
+        // (one paragraph whose direction is the block's: nothing per line to look up)
+        if (plain_paras.items.len > 1 or (plain_paras.items.len == 1 and plain_paras.items[0].rtl != rtl_base)) {
+            p.plain_paras = try plain_paras.toOwnedSlice(alloc);
+        } else plain_paras.deinit(alloc);
         p.has_clone = b.cx and b.has_clone;
         p.has_rtl_box = b.cx and b.has_rtl_box;
         p.has_pct_edges = b.cx and b.has_pct;
@@ -995,7 +1011,20 @@ pub const Paragraph = struct {
         self.alloc.free(self.objs);
         self.alloc.free(self.boxes);
         self.alloc.free(self.run_box);
+        self.alloc.free(self.plain_paras);
         self.* = undefined;
+    }
+
+    /// The base direction of the line starting at glyph `start` (`plain_paras`).
+    fn lineRtl(self: *const Paragraph, start: u32) bool {
+        if (self.plain_paras.len == 0) return self.rtl;
+        const cluster = if (start < self.glyphs.len) self.glyphs[start].cluster else if (self.glyphs.len > 0) self.glyphs[self.glyphs.len - 1].cluster else 0;
+        var rtl = self.rtl;
+        for (self.plain_paras) |pp| {
+            if (pp.cluster > cluster) break;
+            rtl = pp.rtl;
+        }
+        return rtl;
     }
 
     fn wraps(self: *const Paragraph) bool {
@@ -2625,7 +2654,6 @@ pub const Paragraph = struct {
         }
 
         var container: f32 = if (m.avail) |a| a else size.width;
-        const base_level: u8 = @intFromBool(self.rtl);
         var it: LineIter = .{ .p = self, .mode = m, .cx = cx_ };
         var top: f32 = 0;
         var li_index: usize = 0;
@@ -2653,6 +2681,10 @@ pub const Paragraph = struct {
                 if (m.avail != null) container = li.band_w;
                 max_w = @max(max_w, li.width);
             } else if (li_index >= size.line_count) break;
+            // the line's base direction: its bidi paragraph's under `unicode-bidi: plaintext`
+            // (takumi / Blink `ComputeBaseDirection`), else the block's
+            const line_rtl = self.lineRtl(li.start);
+            const base_level: u8 = @intFromBool(line_rtl);
             // Blink aligns on the LayoutUnit grid: free space = available - snapped line width
             const free_raw = floor64(container) - ceil64(li.content_w);
             const free = @max(free_raw, 0);
@@ -2671,15 +2703,15 @@ pub const Paragraph = struct {
                 .left => 0,
                 .right => free,
                 .center => floor64(free * 0.5),
-                .start => if (self.rtl) free else 0,
-                .end => if (self.rtl) 0 else free,
-                .justify => if (self.rtl and extra == 0) free else 0,
+                .start => if (line_rtl) free else 0,
+                .end => if (line_rtl) 0 else free,
+                .justify => if (line_rtl and extra == 0) free else 0,
             };
             // an overflowing line keeps its start edge: in a right-to-left paragraph it sticks
             // out on the left
-            if (free_raw < 0) x = if (self.rtl) free_raw else 0;
+            if (free_raw < 0) x = if (line_rtl) free_raw else 0;
             // (the indent is at the inline start of the line box: on the right in a right-to-left paragraph)
-            if (!self.rtl) x += li.indent;
+            if (!line_rtl) x += li.indent;
             if (flow) x += li.band_x;
             const line_x = x;
             const baseline = top + li.ascent;
@@ -2751,10 +2783,15 @@ pub const Paragraph = struct {
             // in a right-to-left paragraph the ellipsis sits at the left (end) edge
             var mk0: u32 = 0;
             var mk1: u32 = 0;
-            if (li.ellipsis and self.rtl) {
+            var rtl_marker_seg: ?usize = null;
+            if (li.ellipsis and line_rtl) {
                 mk0 = @intCast(out.items.len);
+                // (its brush is the last kept logical item's, as on the right of an LTR line)
                 var user = self.ell.user;
-                for (self.glyphs[li.start..li.end]) |g| {
+                var k = li.end;
+                while (k > li.start) {
+                    k -= 1;
+                    const g = self.glyphs[k];
                     if (g.flags & ShapedGlyph.SPECIAL == 0 and g.metric < self.metrics.len) {
                         user = self.metrics[g.metric].user;
                         break;
@@ -2762,6 +2799,7 @@ pub const Paragraph = struct {
                 }
                 x = self.putEllipsis(out, x, baseline, ell_cluster, li.ell_clamp, user);
                 mk1 = @intCast(out.items.len);
+                rtl_marker_seg = segs.items.len;
                 if (cplx) try self.pushSeg(segs, alloc, &.{}, no_stop, g_start, out.items.len, line_x, x, baseline, lines.items.len);
             }
             var prev_item: u32 = 0xffff_ffff;
@@ -2885,7 +2923,9 @@ pub const Paragraph = struct {
                     if (g.flags & ShapedGlyph.WORD_SPACE != 0) x += extra;
                 }
                 if (hyphen_here and g.level & 1 == 0) {
-                    out.appendAssumeCapacity(.{ .face = mt.face, .gid = mt.hyphen_gid, .x = x - g.kern, .y = baseline + dy, .size = mt.size, .user = mt.user, .cluster = g.cluster, .bidi_level = g.level, .generated = mt.hyphen_cp });
+                    // (item_origin: Blink places the hyphen after the item's snapped inline size)
+                    const hx = if (item_origin) ip.org + ceil64(@floatCast(ip.loc - g.kern)) else x - g.kern;
+                    out.appendAssumeCapacity(.{ .face = mt.face, .gid = mt.hyphen_gid, .x = hx, .y = baseline + dy, .size = mt.size, .user = mt.user, .cluster = g.cluster, .bidi_level = g.level, .generated = mt.hyphen_cp });
                     if (item_origin) {
                         x = ip.add(mt.hyphen_adv - g.kern);
                     } else x += mt.hyphen_adv - g.kern;
@@ -2921,7 +2961,13 @@ pub const Paragraph = struct {
                     f.line = @intCast(lines.items.len);
                 }
             }
-            if (li.ellipsis and !self.rtl) {
+            // (PDF builds) a right-to-left line's marker is visually first but its last logical
+            // item (takumi `LineTruncator`): its segment follows the line's other segments, so
+            // the content stream / extracted text has it after the content it stands in for
+            if (comptime item_origin_build) if (rtl_marker_seg) |k| if (cplx and k + 1 < segs.items.len and segs.items[k].g0 == mk0 and segs.items[k].g1 == mk1) {
+                std.mem.rotate(Segment, segs.items[k..], 1);
+            };
+            if (li.ellipsis and !line_rtl) {
                 const e0 = out.items.len;
                 // The marker is a new logical item: its origin follows the preceding item's
                 // snapped inline size, and its brush belongs to that item (font stays strut).
@@ -2943,7 +2989,7 @@ pub const Paragraph = struct {
                 .glyph_end = @intCast(out.items.len),
                 .ascent = li.ascent,
                 .descent = li.descent,
-                .rtl = self.rtl,
+                .rtl = line_rtl,
                 .marker0 = if (item_origin_build) mk0 else {},
                 .marker1 = if (item_origin_build) mk1 else {},
                 .start = if (item_origin_build) li.start else {},
@@ -3343,7 +3389,11 @@ fn resolveBidi(alloc: std.mem.Allocator, chars: []Char, rtl_base: bool) !void {
 
 /// CSS bidi contexts are virtual UAX #9 controls: never glyphs, never source clusters.
 /// Preserve the inline ancestry across runs, so an override also applies inside nested spans.
-fn resolveCssBidi(alloc: std.mem.Allocator, chars: []Char, runs: []const Run, opts: ParagraphOptions) !void {
+/// `unicode-bidi: plaintext` on the block: the base direction each bidi paragraph (forced-break
+/// separated) takes from its first strong character, by first cluster.
+const PlainPara = struct { cluster: u32, rtl: bool };
+
+fn resolveCssBidi(alloc: std.mem.Allocator, chars: []Char, runs: []const Run, opts: ParagraphOptions, plain: ?*std.ArrayList(PlainPara), plain_alloc: std.mem.Allocator) !void {
     const Scope = struct { key: u32, mode: BidiMode, rtl: bool };
     const Control = struct {
         fn open(a: std.mem.Allocator, out: *std.ArrayList(u21), scope: Scope) !void {
@@ -3422,19 +3472,22 @@ fn resolveCssBidi(alloc: std.mem.Allocator, chars: []Char, runs: []const Run, op
             try Control.close(alloc, &cps, active[n_active]);
         }
         var base: u8 = @intFromBool(opts.direction == .rtl);
-        if (opts.strut != null and opts.strut.?.unicode_bidi == .plaintext) for (chars[start..end]) |ch| {
-            switch (uni.bidiClass(ch.cp)) {
-                .l => {
-                    base = 0;
-                    break;
-                },
-                .r, .al => {
-                    base = 1;
-                    break;
-                },
-                else => {},
+        if (opts.strut != null and opts.strut.?.unicode_bidi == .plaintext) {
+            // UAX #9 P2 / P3: the first strong character, else left-to-right (takumi
+            // `BidiParagraph::new(text, None)`), whatever `direction` says.
+            base = 0;
+            for (chars[start..end]) |ch| {
+                switch (uni.bidiClass(ch.cp)) {
+                    .l => break,
+                    .r, .al => {
+                        base = 1;
+                        break;
+                    },
+                    else => {},
+                }
             }
-        };
+            if (plain) |list| if (start < chars.len) try list.append(plain_alloc, .{ .cluster = chars[start].cluster, .rtl = base == 1 });
+        }
         const levels = try alloc.alloc(u8, cps.items.len);
         defer alloc.free(levels);
         try bidi.resolve(alloc, cps.items, levels, base);
@@ -3451,7 +3504,7 @@ test "CSS bidi override contexts cover nested inline runs without source control
         .{ .style = .{ .unicode_bidi = .bidi_override, .rtl = true } },
         .{ .parent = 0, .style = .{ .unicode_bidi = .bidi_override, .rtl = false } },
     };
-    try resolveCssBidi(std.testing.allocator, &chars, &runs, .{ .boxes = &boxes });
+    try resolveCssBidi(std.testing.allocator, &chars, &runs, .{ .boxes = &boxes }, null, std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 1), chars[0].level & 1);
     try std.testing.expectEqual(@as(u8, 0), chars[1].level & 1);
     try std.testing.expectEqual(@as(u8, 1), chars[2].level & 1);

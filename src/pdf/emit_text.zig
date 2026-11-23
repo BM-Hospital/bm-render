@@ -234,6 +234,7 @@ fn glyphPass(e: *Emitter, n: *const Node, tl: *const font.TextLayout, x: f32, y:
         while (j < run.g1 and j < stop and tl.glyphs[j].size == g0.size) j += 1;
         const fc = e.f.r.fonts.face(g0.face);
         const colored = coloredFace(e, g0.face);
+        const syn = if (in_marker) n.cs else rcs;
         const tr: TextRun = .{
             .node = n,
             .style = rcs,
@@ -249,8 +250,10 @@ fn glyphPass(e: *Emitter, n: *const Node, tl: *const font.TextLayout, x: f32, y:
             // with it, takumi `background_stroke`; the stroke itself draws nothing, `text_stroke`)
             .stroke = if (sw > 0) .{ .width = sw, .color = dev.filtered(e.filter, scol) } else null,
             .stroke_first = rcs.paint_order == .stroke,
-            .synthetic_bold = if (!colored and rcs.font_synthesis.weight and rcs.font_weight >= 600 and fc.weight < 600) ptext.emboldenWidth(g0.size) else 0,
-            .synthetic_italic = !colored and rcs.font_synthesis.style and rcs.font_style != .normal and !fc.italic,
+            // (the marker is shaped with the block's font, takumi `LineTruncator`: its paint
+            // comes from the last item, its synthesis from the block style it was shaped for)
+            .synthetic_bold = if (!colored and syn.font_synthesis.weight and syn.font_weight >= 600 and fc.weight < 600) ptext.emboldenWidth(g0.size) else 0,
+            .synthetic_italic = !colored and syn.font_synthesis.style and syn.font_style != .normal and !fc.italic,
             .colored = colored,
             .shadow = if (o.shadow) |sh| .{ .dx = sh.dx, .dy = sh.dy, .blur = sh.blur, .color = dev.filtered(e.filter, sh.color) } else null,
             .owned = o.owned,

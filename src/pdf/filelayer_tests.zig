@@ -446,3 +446,69 @@ test "SVG page cascade: ancestor selectors and importance reach inline descendan
     try expectHas(doc, "0 0 1 rg");
     try testing.expect(!has(doc, "1 0 0 rg"));
 }
+
+// ------------------------------------------------------------------------------------------------
+// Text tails checked against the pinned takumi-pdf oracle (scripts/pdf-audit/text-tails.probe.mjs):
+// form-control sizing, `unicode-bidi: plaintext`, RTL overflow markers and soft hyphens.
+
+const naskh = @embedFile("../font/testdata/NotoNaskhArabic-Regular.ttf");
+
+test "text controls: field width from the head bounding box, border-box search fields, centred editor" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    // takumi: avg 7 * 20 + (round(head xMax - xMin) - avg) = 220 (+ 2px border, 1px 2px padding);
+    // the search field adds its border and padding to the same content width (box-sizing: border-box)
+    const doc = try t.render("<div><input value=\"x\" style=\"font:14px Inter\"><input type=\"search\" value=\"y\" style=\"font:14px Inter\"></div>", "{\"tagged\":false}");
+    try expectHas(doc, "0 0 226 23 re");
+    try expectHas(doc, "226 0 226 23 re");
+    // a 50px field centres its 17px editor at 16.5px (LayoutUnit half of the free space), not 16
+    const tall = try t.render("<div><input value=\"Tall\" style=\"font:14px Inter;height:50px\"></div>", "{\"tagged\":false}");
+    try expectHas(tall, "1 0 0 -1 4 33.5 Tm");
+}
+
+test "unicode-bidi plaintext: each paragraph aligns by the direction of its first strong character" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    _ = try t.r.registerFont(try testing.allocator.dupe(u8, naskh), "", 0, -1, null);
+    const doc = try t.render("<p style=\"margin:0;font:20px Inter,'Noto Naskh Arabic';width:260px;unicode-bidi:plaintext\">abc<br>\u{645}\u{631}\u{62d}\u{628}\u{627}</p>", "{\"tagged\":false}");
+    try expectHas(doc, "1 0 0 -1 0 19 Tm[("); // the Latin paragraph starts at the left
+    try expectHas(doc, "1 0 0 -1 0 45 Tm[-"); // the Arabic one is start (= right) aligned
+    // no strong character: left-to-right (UAX #9 P3), whatever `direction` says
+    const neutral = try t.render("<p style=\"margin:0;font:20px Inter;width:260px;direction:rtl;unicode-bidi:plaintext\">123 !</p>", "{\"tagged\":false}");
+    try testing.expect(!has(neutral, "/ReversedChars"));
+    try expectHas(neutral, "1 0 0 -1 0 19 Tm[(");
+}
+
+test "text-overflow: an RTL marker follows the content in paint order with the last kept item's brush" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    _ = try t.r.registerFont(try testing.allocator.dupe(u8, naskh), "", 0, -1, null);
+    const doc = try t.render("<p style=\"margin:0;font:20px Inter,'Noto Naskh Arabic';width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl\">" ++
+        "\u{645}\u{631}\u{62d}\u{628}\u{627} <span style=\"color:red\">\u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645} \u{645}\u{631}\u{62d}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}</span> \u{645}\u{631}\u{62d}\u{628}\u{627}</p>", "{\"tagged\":false}");
+    // the marker (Inter's "…", font /f0) is the last text object, painted red like the cut span
+    const last_bt = std.mem.lastIndexOf(u8, doc, "BT ").?;
+    try testing.expect(std.mem.startsWith(u8, doc[last_bt..], "BT 0 Tr/f0 "));
+    try testing.expect(std.mem.endsWith(u8, doc[0..last_bt], "1 0 0 rg\n"));
+    // the marker keeps the block's font synthesis: no emboldening from a bold span it follows
+    const bold = try t.render("<p style=\"margin:0;font:20px Inter;width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis\">A long <span style=\"font-weight:bold;color:red\">line that does not fit</span></p>", "{\"tagged\":false}");
+    try testing.expectEqual(@as(usize, 1), count(bold, " 2 Tr"));
+    try expectHas(bold, "1 0 0 rg\nBT 0 Tr/f0 20 Tf 1 0 0 -1 0 19 Tm[-4957.0312");
+}
+
+test "soft hyphens: hyphens none keeps the word whole, a generated hyphen sits on the LayoutUnit grid" {
+    if (comptime !config.enable_pdf) return;
+    const t = try T.init();
+    defer t.deinit();
+    const none_doc = try t.render("<p style=\"margin:0;font:20px Inter;width:60px;hyphens:none\">extra&shy;ordinary</p>", "{\"tagged\":false}");
+    try testing.expect(!has(none_doc, "<2010>"));
+    try testing.expect(!has(none_doc, "0 43 Tm"));
+    const manual = try t.render("<p style=\"margin:0;font:20px Inter;width:60px\">extra&shy;ordinary</p>", "{\"tagged\":false}");
+    try expectHas(manual, "<2010>");
+    // "cal\u{ad}i" + hyphen: the hyphen starts at ceil64 of the item's width (32.546875px), as in
+    // takumi, so a viewer extracts "cali\u{ad}" before the hyphen
+    const multi = try t.render("<p style=\"margin:0;font:20px Inter;width:50px\">cal&shy;i&shy;fra</p>", "{\"tagged\":false}");
+    try expectHas(multi, "Tm[-1627.3438(");
+}

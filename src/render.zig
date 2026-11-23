@@ -201,8 +201,22 @@ pub const RunIter = struct {
     line: usize = 0,
     seg: usize = 0,
     gi: u32 = 0,
+    /// The line whose start was handled (lines without segments).
+    entered: usize = std.math.maxInt(usize),
+    /// A right-to-left line's overflow marker sits visually first but is the line's last
+    /// logical item (takumi `LineTruncator`): PDF builds yield it after the line's other runs
+    /// (`marker_pending`: the rest of the line is being yielded, the marker comes next).
+    marker_pending: bool = false,
 
     pub const Run = struct { g0: u32, g1: u32, x0: f32, x1: f32, baseline: f32 };
+
+    /// The marker range of line `li` when it starts the line, else an empty range.
+    fn leadingMarker(tl: *const font.TextLayout, li: usize) [2]u32 {
+        const line = tl.lines[li];
+        if (comptime @TypeOf(line.marker0) == void) return .{ 0, 0 };
+        if (line.rtl and line.marker1 > line.marker0 and line.marker0 == line.glyph_start and line.marker1 < line.glyph_end) return .{ line.marker0, line.marker1 };
+        return .{ 0, 0 };
+    }
 
     pub fn next(it: *RunIter) ?Run {
         const tl = it.tl;
@@ -227,9 +241,24 @@ pub const RunIter = struct {
         }
         while (it.line < tl.lines.len) {
             const line = tl.lines[it.line];
-            const end = @min(line.glyph_end, gs.len);
-            if (it.gi < line.glyph_start) it.gi = line.glyph_start;
+            const line_end = @min(line.glyph_end, gs.len);
+            const mk = leadingMarker(tl, it.line);
+            if (it.entered != it.line) {
+                it.entered = it.line;
+                if (it.gi < line.glyph_start) it.gi = line.glyph_start;
+                if (mk[1] > mk[0] and it.gi <= mk[0]) {
+                    it.gi = mk[1];
+                    it.marker_pending = true;
+                }
+            }
+            // (the marker's own pass ends where the content starts)
+            const end = if (!it.marker_pending and mk[1] > mk[0]) mk[1] else line_end;
             if (it.gi >= end) {
+                if (it.marker_pending) {
+                    it.marker_pending = false;
+                    it.gi = mk[0];
+                    continue;
+                }
                 it.line += 1;
                 continue;
             }
@@ -237,7 +266,7 @@ pub const RunIter = struct {
             var ge = g0 + 1;
             while (ge < end and gs[ge].user == gs[g0].user and gs[ge].face == gs[g0].face) ge += 1;
             it.gi = ge;
-            return .{ .g0 = g0, .g1 = ge, .x0 = gs[g0].x, .x1 = if (ge < end) gs[ge].x else @max(gs[g0].x, line.x + line.width), .baseline = line.baseline };
+            return .{ .g0 = g0, .g1 = ge, .x0 = gs[g0].x, .x1 = if (ge < line_end) gs[ge].x else @max(gs[g0].x, line.x + line.width), .baseline = line.baseline };
         }
         return null;
     }
@@ -4452,6 +4481,7 @@ pub fn textStyle(cs: *const CS, user: u32) font.TextStyle {
     var ts: font.TextStyle = .{
         .unicode_bidi = @fromBackingInt(@intCast(@backingInt(cs.unicode_bidi))),
         .rtl = cs.direction == .rtl,
+        .no_hyphens = cs.hyphens == .none,
         .families = cs.font_family,
         .weight = cs.font_weight,
         .italic = cs.font_style != .normal,

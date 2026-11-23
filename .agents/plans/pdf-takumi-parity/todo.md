@@ -150,15 +150,15 @@ Sửa extents và cách chia nền ảnh/gradient của inline box qua nhiều d
 
 ## 08 — Port text của input (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — đối chiếu oracle pinned `ff9a5d4` bằng 37 probe `text.form.input.*` (`scripts/pdf-audit/text-tails.probe.mjs`: draw list, pdftotext, pdf.js text, raster 2x không lệch pixel nào). Trước khi sửa 30/37 probe fail. Đã sửa trong `src/text_control.zig`: (1) độ rộng mặc định lấy `max_char_width` từ bounding box của bảng `head` (làm tròn px) thay vì `hhea.advanceWidthMax`; avg = 0 thì lấy advance của `x` rồi x-height; áp danh sách `kFontFamiliesWithInvalidCharWidth` theo family đầu tiên (field Inter 14px: 217 → 226 px như takumi); (2) host `box-sizing: border-box` (`input[type=search]`) cộng border + padding vào size mặc định (trước 218×17 thay vì 226×23); (3) editor căn giữa bằng nửa free space của content box theo LayoutUnit (1/64, cắt về 0) thay vì `floor`, trừ border/padding khi chiều cao tác giả là border-box; `removes_line_height` theo giá trị tác giả (phần trăm luôn true, calc false). Zig `text controls: field width from the head bounding box, …` fail trước fix. Placeholder: cả hai engine đều không vẽ (pinned `TextControl::value` không đọc placeholder) — probe assert nó không lọt vào text layer. Khác biệt có chủ đích (`text.form.input.display-block-width`): input `display:block`/`flex` giữ width intrinsic theo Blink `LayoutBox::AutoWidthShouldFitContent`, takumi kéo giãn theo container (test upstream `a_text_field_lays_out_as_a_block_container_whatever_its_display`). Khác biệt chỉ ở nhóm lệnh: editor rỗng — takumi ghi một clip rỗng, bm không ghi (không thấy được; `cmp` so draw list chấp nhận).
 
 Đưa value, placeholder và password presentation qua DOM → text layout → PDF.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Input có value, input rỗng có placeholder và password khớp behavior upstream; font/color/clip đúng.
-- [ ] Text extraction được kiểm tra theo policy upstream, kể cả không lộ giá trị gốc của password qua text/ActualText.
-- [ ] Giữ nguyên sizing, disabled/readonly và style preset hiện có.
+- [x] Input có value, input rỗng có placeholder và password khớp behavior upstream; font/color/clip đúng. (37 probe; ngoại lệ block-level width đã ghi.)
+- [x] Text extraction được kiểm tra theo policy upstream, kể cả không lộ giá trị gốc của password qua text/ActualText. (pdftotext + pdf.js, tagged và untagged; assert password/placeholder/number sai không xuất hiện.)
+- [x] Giữ nguyên sizing, disabled/readonly và style preset hiện có. (disabled, readonly, fieldset disabled, size, border/padding, line-height, font lớn, baseline trong dòng.)
 
 **Kiểm tra:** Chuyển case từ takumi/tests/form_control_tests.rs và fixture form controls sang render PDF + text/raster assertions.
 
@@ -168,15 +168,15 @@ Sửa extents và cách chia nền ảnh/gradient của inline box qua nhiều d
 
 ## 09 — Port textarea và select presentation (P0)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — 33 probe `text.form.textarea.*`/`text.form.select.*` khớp oracle pinned (draw list hoặc grouping-only, pdftotext, pdf.js, raster 0 px). Pinned takumi không có select presentation: option được layout như nội dung (mọi option hiện ra, kể cả `hidden`); bm khớp đúng như vậy, text layer trùng nội dung vẽ nên không có text ẩn bị lộ. Textarea: newline CR/CRLF, dòng cuối rỗng, rows/cols, wrap/`wrap=off`, từ dài, tràn rows (clip), khoảng trắng editable/readonly, tab, disabled, style override, inherit, tagged, qua ranh giới trang. Khác biệt có chủ đích (lỗi upstream, không bắt chước): textarea cao hơn trang — takumi không vẽ dòng nào (3 trang trống) hoặc, nếu bắt đầu ở đầu trang, báo vượt 20 000 trang; bm cắt như box monolithic, mỗi dòng đúng một lần (`text.form.textarea.taller-than-page*`). Grouping-only: atomic inline có overflow (textarea) bm ghi clip của host hai lần (một lần rỗng); wrap/tab takumi tách run riêng — raster giống hệt.
 
 Hoàn thiện text nhiều dòng, lựa chọn được chọn và vị trí nội dung form control.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Textarea giữ newline/rows/cols và placeholder; không thiếu dòng hoặc lặp text qua trang.
-- [ ] Select hiển thị đúng selected option và alignment/padding; hidden option không lộ ra text layer trái với oracle.
-- [ ] Có case disabled, style override, wrapping và control nằm ở page boundary.
+- [x] Textarea giữ newline/rows/cols và placeholder; không thiếu dòng hoặc lặp text qua trang.
+- [x] Select hiển thị đúng selected option và alignment/padding; hidden option không lộ ra text layer trái với oracle. (oracle vẽ mọi option; bm giống hệt.)
+- [x] Có case disabled, style override, wrapping và control nằm ở page boundary.
 
 **Kiểm tra:** Test form_control_tests.rs tương ứng; ảnh so sánh và extracted-text cho textarea/select.
 
@@ -186,15 +186,15 @@ Hoàn thiện text nhiều dòng, lựa chọn được chọn và vị trí n�
 
 ## 10 — Port unicode-bidi override (P1)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** done (2026-11-23) — 34 probe `text.bidi-override.*` khớp oracle pinned (draw list, pdftotext = thứ tự logic qua ToUnicode/ActualText, pdf.js = thứ tự hiển thị, raster 0 px): override/isolate-override cho span và block, LTR/RTL, lồng nhau, direction kế thừa, `bdo`, Arabic/emoji/combining/ligature dưới override, fixture `unicode_bidi.html`. Override đã có từ trước; lỗi còn lại là `unicode-bidi: plaintext` (9 probe fail trước fix): mỗi đoạn bidi (tách bởi forced break) lấy hướng từ ký tự strong đầu tiên, không có thì LTR (UAX #9 P3) bất kể `direction`, và dòng dùng hướng đó cho căn lề start/end, overflow, indent, mức nền khi reorder và phía của ellipsis (`Paragraph.plain_paras`, `lineRtl` trong `src/font/text.zig`; như `ComputeBaseDirection` của takumi/Blink). Zig `unicode-bidi plaintext: …` fail trước fix.
 
 Nối unicode_bidi đã parse vào bidi segmentation/shaping và PDF text mapping.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] bidi-override và isolate-override có tác dụng với LTR/RTL và span lồng nhau theo upstream.
-- [ ] Không phá Arabic shaping, emoji/combining clusters hoặc ActualText/ToUnicode.
-- [ ] Test phân biệt visual order, logical extraction và direction inherited.
+- [x] bidi-override và isolate-override có tác dụng với LTR/RTL và span lồng nhau theo upstream.
+- [x] Không phá Arabic shaping, emoji/combining clusters hoặc ActualText/ToUnicode.
+- [x] Test phân biệt visual order, logical extraction và direction inherited.
 
 **Kiểm tra:** Chuyển unicode_bidi fixture; PDF rendering/extraction cùng RTL/Arabic regression.
 
@@ -515,15 +515,15 @@ Chạy cùng case trên wasm/native, đối chiếu rendering/text/file semantic
 
 ## 28 — Sửa ellipsis và RTL presentation (P2)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — tiêu chí đã đạt, còn 3 khác biệt ghi rõ. 21 probe `text.overflow-tail.*` khớp oracle pinned (draw list, pdftotext, pdf.js, raster). Đã sửa (4 probe fail trước fix): (1) dòng RTL: ellipsis được vẽ và trích xuất SAU nội dung (item logic cuối của `LineTruncator`) — segment của marker xếp cuối dòng (`src/font/text.zig`, chỉ PDF build) và `RunIter` trả marker sau phần còn lại của dòng (`src/render.zig`); (2) màu marker RTL lấy theo item logic cuối còn giữ (trước lấy item đầu); (3) marker dùng synthesis của style block (font của strut), không lấy synthetic bold của span cuối (`src/pdf/emit_text.zig`). Màu ellipsis theo span cuối ở dòng LTR đã đúng từ trước; có case clip/padding, line-clamp (webkit và chuẩn), custom string, text bị ẩn không lọt vào text layer. Zig `text-overflow: an RTL marker follows …` fail trước fix. Còn khác (ghi trong `docs/PDF_AUDIT.md`): (a) takumi hạ marker 10 px dưới baseline khi trước nó là span cao hơn — lỗi upstream, bm giữ baseline (`taller-span-baseline`); (b) run RTL trong dòng LTR: takumi cắt theo thứ tự hiển thị (Blink), bm cắt theo thứ tự logic trước khi reorder nên giữ lại chữ khác (`visual-truncation-*`) — chưa sửa vì phải đổi thuật toán truncate; (c) takumi vẽ underline từng run (nội dung, marker), bm một lần — seam lệch 6 px AA (chấp nhận `maxDiff` 60 chỉ cho case này).
 
 Đối chiếu màu ellipsis và thứ tự paint khi text-overflow/line-clamp với span cuối và RTL.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Có case cho màu ellipsis kế thừa từ span theo pinned reference, với clipping và line-clamp.
-- [ ] Visual order và extracted logical text được assert riêng; hidden text không lọt vào PDF layer.
-- [ ] Không thay đổi ordinary bidi/Arabic hoặc width metrics để sửa paint-order.
+- [x] Có case cho màu ellipsis kế thừa từ span theo pinned reference, với clipping và line-clamp.
+- [x] Visual order và extracted logical text được assert riêng; hidden text không lọt vào PDF layer.
+- [x] Không thay đổi ordinary bidi/Arabic hoặc width metrics để sửa paint-order. (probe `ordinary-*`, `text.bidi.*` và golden không đổi.)
 
 **Kiểm tra:** Probes text overflow/RTL và fixture text_ellipsis/text_line_clamp; phân tích source trước nếu golden không phủ.
 
@@ -533,15 +533,15 @@ Chạy cùng case trên wasm/native, đối chiếu rendering/text/file semantic
 
 ## 29 — Rà tabs pre-wrap và soft-hyphen trong PDF text layer (P2)
 
-**Trạng thái:** needs review — có triển khai/checkpoint; chưa đóng toàn bộ tiêu chí nghiệm thu.
+**Trạng thái:** needs review — tiêu chí đã đạt, còn 2 khác biệt ghi rõ. 21 probe `text.whitespace.*` + 3 probe `text.spacing.*` (text-semantics) khớp oracle pinned về pdftotext, pdf.js và raster 0 px, trên wasm và native; 9 case tab/pre-wrap/break-spaces chỉ khác cách chia TJ/text object (takumi tách tab và khoảng trắng giữ lại thành run riêng) nên dùng chế độ `grouping` có lý do ghi trong probe, không so draw list. Đã sửa (5 probe fail trước fix): (1) hyphen sinh ra đặt tại width của item làm tròn lên lưới LayoutUnit (`ceil64`, như takumi) — trước lệch 1/128 px làm pdftotext đọc `cal­i‐­` thay vì `cal­i­‐` và raster lệch 6 px; tolerance riêng của `text.spacing.soft-hyphen` hạ về 0; (2) `hyphens: none` bỏ cơ hội ngắt sau soft hyphen (CSS Text 3; trước đây vẫn ngắt và vẽ hyphen) — `TextStyle.no_hyphens`. Soft hyphen giữ trong trích xuất (`extra­‐`), không lặp ký tự; text bị clip bởi overflow vẫn nằm trong content stream ở cả hai engine (giống oracle). Zig `soft hyphens: hyphens none …` fail trước fix. Còn khác: `tab-size: <length>` (takumi chỉ nhận số space, 30px thành stop cách 22,5 px; bm theo CSS) và hyphen của soft hyphen mở đầu một span lấy màu của chữ trước nó (takumi: màu span) — cần giữ run của soft hyphen trong glyph, chưa làm.
 
 Phân loại run grouping thuần biểu diễn với khác biệt extraction có ý nghĩa; chỉ sửa phần semantic còn lệch.
 
 **Tiêu chí nghiệm thu:**
 
-- [ ] Tabs, pre-wrap spaces và soft-hyphen có extracted-text assertions trên cả hai backend và pinned reference.
-- [ ] Không ép TJ grouping giống byte khi glyph position và text semantics tương đương; ghi ngoại lệ hẹp cho grouping-only.
-- [ ] ToUnicode/ActualText không làm lặp ký tự, mất soft-hyphen cần giữ hoặc lộ text đã clip.
+- [x] Tabs, pre-wrap spaces và soft-hyphen có extracted-text assertions trên cả hai backend và pinned reference.
+- [x] Không ép TJ grouping giống byte khi glyph position và text semantics tương đương; ghi ngoại lệ hẹp cho grouping-only.
+- [x] ToUnicode/ActualText không làm lặp ký tự, mất soft-hyphen cần giữ hoặc lộ text đã clip. (text clip theo overflow vẫn trích xuất được ở cả hai engine, giống oracle.)
 
 **Kiểm tra:** Targeted whitespace/soft-hyphen probes và pdftotext/pdf.js cùng font; chọn source fixture từ coverage map.
 
@@ -607,3 +607,7 @@ Full strict audit (pinned `ff9a5d4`), HEAD `67c0f36`: **1.571 probe, 1.548 pass,
 ## 2026-11-23 continuation đổi width, grid-row fragments, float reflow (task 16–18)
 
 Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, không docker; `bench/out/pdf-oracle`, provenance ghi `source-build-wasm-local-rustc-1.97`). Baseline (HEAD `1f40d98`, wasm): strict audit 1.571 probe, 1.548 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER; PDF Zig 732/732. Sau thay đổi: audit 1.619 probe (+48 mới), 1.596 pass, cùng 23 fail như baseline, giống hệt trên wasm và native; golden không đổi (125/10/1, cùng từng fixture); PDF Zig 741/741 (+9 test mới, mỗi test fail trước fix); `zig build test` 719 pass / 21 skip; `test:pdf` 399/399 trên wasm và native; `test:pdf:chunks` tương đương cả hai backend; `test:pdf:memory` pass (×1,036 / ×1,064). Khám phá ngoài audit (scratch, so text từng trang + vị trí chữ với oracle): 52 case đổi width 24 → 2 lệch, 27 case grid 0 lệch (paint: 1 lệch sub-pixel), 38 case float 8 → 1 lệch. Chi tiết và phần còn lại ở trạng thái task 16, 17, 18.
+
+## 2026-11-23 form-control text, unicode-bidi, ellipsis/RTL, tabs/soft hyphen (task 08–10, 28, 29)
+
+Oracle pinned build lại cục bộ từ `ff9a5d4` (rustc 1.97, wasm-bindgen 0.2.129, provenance `source-build-wasm-local-rustc-1.97`). Lưu ý: chạy audit phải đặt `BM_RENDER_BACKEND=wasm` khi chưa build native trong worktree — nếu không `js/node-pdf.mjs` lấy addon native của gói npm đã publish (bản cũ) và báo 36 fail thay vì 23. Baseline (HEAD `a8a41d4`, wasm): strict audit 1.619 probe, 1.596 pass, 23 fail; golden 125 IDENTICAL / 10 CLOSE / 1 DIFFER. Probe mới `scripts/pdf-audit/text-tails.probe.mjs` (151 probe: `text.form.*`, `text.bidi-override.*`, `text.overflow-tail.*`, `text.whitespace.*`; draw list + pdftotext + pdf.js + raster 2x): 103/151 pass trên wasm baseline, 151/151 sau sửa. Sau thay đổi: audit 1.770 probe, 1.747 pass, cùng 23 fail như baseline, giống hệt trên wasm và native; golden không đổi (125/10/1 trên cả hai backend); PDF Zig 745/745 (+4 test mới trong `src/pdf/filelayer_tests.zig`, mỗi test fail trước fix); `zig build test` 723 pass / 21 skip; `test:pdf` 399/399 trên wasm và native; `test:pdf:chunks` tương đương cả hai backend; `test:pdf:memory` pass (×1,036 / ×1,064). File đổi: `src/text_control.zig`, `src/font/text.zig`, `src/render.zig`, `src/pdf/emit_text.zig`, `src/pdf/filelayer_tests.zig`, `scripts/pdf-audit/text-tails.probe.mjs` (mới), `scripts/pdf-audit/text-semantics.probe.mjs` (tolerance soft hyphen về 0), `docs/PDF_AUDIT.md`. Khác biệt còn lại (đều có probe `differs` và dòng trong `PDF_AUDIT.md`): width của text field block-level/flex (bm theo Blink), textarea cao hơn trang (lỗi upstream), marker sau span cao hơn (lỗi upstream), truncate run RTL trong dòng LTR (chưa sửa), `tab-size: <length>` (takumi không hỗ trợ), màu hyphen của soft hyphen mở đầu span (chưa sửa).
