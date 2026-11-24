@@ -1640,7 +1640,7 @@ const TextContext = struct {
         return std.hash.XxHash64.hash(0, k);
     }
     pub fn eql(_: TextContext, a: []const u8, b: []const u8) bool {
-        return std.mem.eql(u8, a, b);
+        return @import("eql.zig").bytes(a, b);
     }
 };
 

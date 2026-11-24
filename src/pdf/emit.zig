@@ -38,6 +38,8 @@ const psvg = @import("../paint_svg.zig");
 const w = @import("writer.zig");
 const sf = @import("emit_surface.zig");
 const bump = @import("../bump.zig");
+const deflate = @import("../codec/deflate.zig");
+const inflate = @import("../codec/inflate.zig");
 const geom = @import("emit_geom.zig");
 const dev = @import("emit_device.zig");
 const border = @import("emit_border.zig");
@@ -323,6 +325,9 @@ pub const Emitter = struct {
     pending_regions: std.ArrayList(PendingRegions) = .empty,
     /// paint decorations only, no text or image content (`paintUnder`)
     no_content: bool = false,
+    /// the page's bands are drawn again once the page count is known (`Later`): `paintPage`
+    /// records where they are
+    later: ?*Later = null,
 
     pub const InlineMarker = struct { host: u32, node: u32, x: f32, y: f32, depth: u32 };
 
@@ -664,6 +669,12 @@ pub const Emitter = struct {
         // a subtree that paints nothing into this page's window is not walked (a paginated
         // document's pages each walk the frame: without this a page costs the whole document)
         if (e.ext) |ex| if (ex.misses(e, id, y)) return;
+        // (a box this page's walk meets but that has nothing on it: one outside the page's window,
+        // which the first page of a run visits all the same, or one a neighbouring page's pass
+        // meets; the groups it opens are left out when they draw nothing, as whether they were
+        // drawn would depend on what the frame holds: a part of the document or all of it,
+        // Surface.popToDroppingEmpty)
+        const off_page = (e.pass != null and !e.home()) or e.missesWindow(y, y + @max(l.h, 0));
         if (n.kind == .anon_text) return e.paintBox(id, x, y, depth);
         var m_open: ?Affine = null;
         var fragment: ?BoxFragment = null;
@@ -711,7 +722,7 @@ pub const Emitter = struct {
         const saved_tpage = e.tpage;
         const saved_fragment = e.box_fragment;
         defer {
-            e.s.popTo(base);
+            if (off_page) e.s.popToDroppingEmpty(base) else e.s.popTo(base);
             e.tf = saved_tf;
             e.filter = saved_filter;
             e.clips.items.len = saved_clips;
@@ -2990,7 +3001,9 @@ pub fn paintPage(e: *Emitter, page: PageBox, win: Window) Error!void {
         s.drawPath(&e.path);
     }
     const top = if (std.math.isFinite(win.top)) win.top else 0;
+    if (e.later) |l| try l.mark(e, 0);
     try pdf_bands.paint(e, page.header);
+    if (e.later) |l| try l.mark(e, 1);
     try paintFixed(e, page, top, true);
     {
         const d1 = s.depth();
@@ -3054,7 +3067,9 @@ pub fn paintPage(e: *Emitter, page: PageBox, win: Window) Error!void {
         }
     }
     try paintFixed(e, page, top, false);
+    if (e.later) |l| try l.mark(e, 2);
     try pdf_bands.paint(e, page.footer);
+    if (e.later) |l| try l.mark(e, 3);
 }
 
 /// The fragments of the page before that reach this page from the layout of another width
@@ -3210,6 +3225,73 @@ pub const DocOptions = struct {
 /// resources and whether its content nests `q` too deep.
 const PageOut = struct { content: w.Encoded, res: w.Resources, q_over: bool };
 
+/// The header and footer of every page drawn once the page count is known (paged.zig
+/// `writeChunked`: a long document whose bands show the count is laid out once, not counted
+/// first). The pages are drawn with bands of a provisional count in place, so that what a band
+/// adds to its page and to the document comes where the band does; the span of each band is
+/// recorded (`mark`) and the content stream kept, quickly compressed, with provisional glyph codes.
+/// Then, page by page in order (`DocWriter.settleLater`), each band is drawn again with the count
+/// as the page would have drawn it (a fresh surface in the same state: after the same byte, at the
+/// same depth, with the same resources), and must add the same resources and no object; the
+/// fonts number their glyphs again in the order of the document drawn with the count, the bands'
+/// and the content's (`text.Track`), and the page's stream is written with the final codes and
+/// encoded. Anything this cannot reproduce sets `track.failed` (`DocWriter.laterFailed`): the
+/// caller counts the pages first and draws them again.
+pub const Later = struct {
+    /// what lives until every page is settled: the provisional streams, the track
+    mem: bump.Bump,
+    /// one page's settling (rewound per page)
+    scratch: bump.Bump,
+    track: text.Track,
+    pages: std.ArrayList(Page) = .empty,
+    cur: Page = .{},
+    notdef: u32 = 0,
+    uncovered: usize = 0,
+
+    const res_kinds = @typeInfo(@FieldType(w.Resources, "lists")).array.len;
+
+    pub const Page = struct {
+        /// the content stream (provisional glyph codes and bands), zlib-compressed (`.fastest`)
+        z: []const u8 = &.{},
+        len: u32 = 0,
+        /// the header's span [0, 1), the footer's [2, 3)
+        at: [4]u32 = @splat(0),
+        /// the number of resources of each kind the page had before the header, after it and
+        /// before the footer (`w.Resources` lists only grow: the page's own lists cut there)
+        res: [3][res_kinds]u32 = undefined,
+        /// its strings in `track.strs`, its content's first glyphs in `track.log`
+        strs: [2]u32 = @splat(0),
+        log: [2]u32 = @splat(0),
+        height: f32 = 0,
+    };
+
+    /// `paintPage` reached the start of the header (`k` 0), its end (1), the footer's start (2),
+    /// its end (3).
+    fn mark(l: *Later, e: *Emitter, k: usize) Error!void {
+        const s = e.s;
+        const b = s.bd();
+        if (s.builders.items.len != 1 or b.marked != 0 or b.c.operands) l.track.fail("a band inside other content");
+        l.cur.at[k] = @intCast(b.c.bytes().len);
+        if (k < 3) for (b.res.lists, &l.cur.res[k]) |list, *n| {
+            n.* = @intCast(list.items.len);
+        };
+        const fonts = e.fonts;
+        switch (k) {
+            0, 2 => {
+                l.notdef = fonts.notdef_shown;
+                l.uncovered = fonts.uncovered.chars.items.len;
+                l.track.mode = .band;
+            },
+            else => {
+                // (what the provisional band counts is not the document's)
+                fonts.notdef_shown = l.notdef;
+                if (fonts.uncovered.chars.items.len != l.uncovered) l.track.fail("a band draws a character no font has");
+                l.track.mode = if (k == 1) .content else .idle;
+            },
+        }
+    }
+};
+
 /// Writes a document of the frame drawn on `pages` (each with its window) and returns the PDF.
 /// Object order as krilla's: what the pages' content refers to as it is drawn, then the fonts
 /// (`FontRegistry.flush`: after every page is drawn, before the page objects), then the pages.
@@ -3256,11 +3338,15 @@ pub const DocWriter = struct {
     td: @import("tagdoc.zig").TagDoc = undefined,
     /// the first output page of the part of the document being drawn (`beginChunk`)
     chunk_first: usize = 0,
+    /// the document's frame (`init`)
+    frame: *Frame,
+    /// the bands are drawn again once the page count is known (`startLater`)
+    later: ?*Later = null,
 
     /// `f`: the document's frame (tests and viewport pages: the only one).
     pub fn init(a: Allocator, f: *Frame, o: DocOptions) Error!*DocWriter {
         const dw = try a.create(DocWriter);
-        dw.* = .{ .a = a, .r = f.r, .o = o, .fonts = text.FontRegistry.init(a, o.uncovered), .page_mem = bump.Bump.init(f.r.gpa), .zmem = bump.Bump.init(f.r.gpa) };
+        dw.* = .{ .a = a, .r = f.r, .o = o, .fonts = text.FontRegistry.init(a, o.uncovered), .page_mem = bump.Bump.init(f.r.gpa), .zmem = bump.Bump.init(f.r.gpa), .frame = f };
         dw.popts = o.opts orelse &dw.default_opts;
         // [tagging] validators and PDF version (krilla `ConfigurationBuilder`); tests (`o.opts`
         // null) write untagged output
@@ -3285,6 +3371,148 @@ pub const DocWriter = struct {
         if (dw.page_mem_live) dw.page_mem.deinit();
         dw.page_mem_live = false;
         dw.zmem.deinit();
+        dw.freeLater();
+    }
+
+    /// The pages drawn from now on keep their bands' places and wait for them: the bands are
+    /// drawn again once the page count is known (`Later`). Before any page is drawn.
+    pub fn startLater(dw: *DocWriter) Error!void {
+        std.debug.assert(dw.outs.items.len == 0 and dw.fonts.containers.items.len == 0);
+        const l = try dw.a.create(Later);
+        l.* = .{ .mem = bump.Bump.init(dw.r.gpa), .scratch = bump.Bump.init(dw.r.gpa), .track = undefined };
+        l.mem.release_freed = true;
+        l.scratch.release_freed = true;
+        l.track = .{ .a = l.mem.allocator(), .lists = dw.r.gpa };
+        dw.later = l;
+        dw.fonts.track = &l.track;
+    }
+
+    fn freeLater(dw: *DocWriter) void {
+        const l = dw.later orelse return;
+        l.track.deinit();
+        l.pages.deinit(dw.r.gpa);
+        l.mem.deinit();
+        l.scratch.deinit();
+        dw.later = null;
+        dw.fonts.track = null;
+        for (dw.fonts.containers.items) |c| c.track = null;
+    }
+
+    /// Why the pages cannot take their bands later, as a memory checkpoint label (`chunks: count
+    /// first: <why>`); null: they can so far.
+    pub fn laterFailed(dw: *const DocWriter) ?[]const u8 {
+        const l = dw.later orelse return null;
+        return if (l.track.failed) l.track.why else null;
+    }
+
+    /// The page drawn last waits for its bands (`drawPages`): its content stream `content`.
+    fn keepLater(dw: *DocWriter, content: []const u8) Error!void {
+        const l = dw.later.?;
+        var lp = l.cur;
+        if (content.len != lp.at[3]) l.track.fail("a page draws after its footer");
+        defer dw.zmem.reset();
+        const z = deflate.compressEx(dw.zmem.allocator(), content, .{ .level = .fastest, .size_hint = content.len }) catch return error.OutOfMemory;
+        lp.z = try l.mem.allocator().dupe(u8, z);
+        lp.len = @intCast(content.len);
+        lp.strs[1] = @intCast(l.track.strs.items.len);
+        lp.log[1] = @intCast(l.track.log.items.len);
+        try l.pages.append(dw.r.gpa, lp);
+    }
+
+    /// Starts drawing the bands with the page count: then `settleLater` for every output page, in
+    /// order, and `endLater`.
+    pub fn beginLater(dw: *DocWriter) Error!void {
+        try dw.later.?.track.begin(&dw.fonts);
+    }
+
+    /// Draws output page `i`'s header and footer (with the page count) in place of its provisional
+    /// ones, numbers its content's glyphs between them and encodes its content stream. Sets the
+    /// track's `failed` when a band does not add to the page what its provisional one did.
+    pub fn settleLater(dw: *DocWriter, i: usize, header: ?pdf_bands.Draw, footer: ?pdf_bands.Draw) Error!void {
+        const l = dw.later.?;
+        const t = &l.track;
+        if (t.failed) return;
+        const lp = &l.pages.items[i];
+        defer l.scratch.reset();
+        const sa = l.scratch.allocator();
+        const raw = try sa.alloc(u8, lp.len);
+        const got = inflate.zlibDecompressInto(lp.z, raw, .{}) catch return error.OutOfMemory;
+        if (got != raw.len) return error.OutOfMemory;
+        const res = &dw.outs.items[i].res;
+        const head = try dw.drawLater(lp, raw, header, lp.at[0], lp.at[1], res, lp.res[0], lp.res[1]);
+        try t.replay(&dw.fonts, lp.log[0], lp.log[1]);
+        const all: [Later.res_kinds]u32 = blk: {
+            var n: [Later.res_kinds]u32 = undefined;
+            for (res.lists, &n) |list, *x| x.* = @intCast(list.items.len);
+            break :blk n;
+        };
+        const foot = try dw.drawLater(lp, raw, footer, lp.at[2], lp.at[3], res, lp.res[2], all);
+        if (t.failed) return;
+        // the page's content with the final glyph codes, its bands drawn with the count
+        var b = w.Buf.init(sa);
+        const at = lp.at;
+        const segs = [_][2]u32{ .{ 0, at[0] }, .{ at[1], at[2] }, .{ at[3], lp.len } };
+        for (segs, 0..) |sg, k| {
+            if (!try t.rewrite(&b, sa, &dw.fonts, raw, sg[0], sg[1], lp.strs[0], lp.strs[1])) return t.fail("a glyph code without a final glyph");
+            if (k == 0) b.raw(head);
+            if (k == 1) b.raw(foot);
+        }
+        if (b.failed) return error.OutOfMemory;
+        dw.outs.items[i].content = dw.doc.encode(b.list.items, .content);
+    }
+
+    /// A band drawn with the page count as `paintPage` would have drawn it in place of the
+    /// provisional one at [`from`, `to`) of the page's content `raw`: after the same byte, from the
+    /// page's resources `res` as they were before it (`n0` of each kind; it must leave `n1`), at the
+    /// same depth (the page's scale). In `scratch`.
+    fn drawLater(dw: *DocWriter, lp: *const Later.Page, raw: []const u8, band: ?pdf_bands.Draw, from: u32, to: u32, res: *const w.Resources, n0: [Later.res_kinds]u32, n1: [Later.res_kinds]u32) Error![]const u8 {
+        const l = dw.later.?;
+        const t = &l.track;
+        const cx = &dw.cx;
+        dw.page_mem.reset();
+        const pa = dw.page_mem.allocator();
+        cx.page = pa;
+        defer cx.page = null;
+        dw.fonts.forgetPage();
+        var s = sf.Surface.initPage(cx, lp.height * pt_per_px);
+        s.tagging = dw.tagged;
+        for (&s.bd().res.lists, res.lists, n0) |*list, all, n| try list.appendSlice(pa, all.items[0..n]);
+        t.surface = &s;
+        defer t.surface = null;
+        var e = Emitter.init(dw.frame, cx, &s, &dw.fonts);
+        if (dw.tagged) e.tags = &dw.td.collector;
+        if (from > 0) s.bd().c.b.byte(raw[from - 1]);
+        const start = s.bd().c.bytes().len;
+        const objs = dw.doc.objs.items.len;
+        const unc = dw.fonts.uncovered.chars.items.len;
+        {
+            const d0 = s.depth();
+            defer s.popTo(d0);
+            s.pushTransform(Tf.scale(pt_per_px, pt_per_px));
+            try pdf_bands.paint(&e, band);
+        }
+        if (e.fail_msg) |msg| {
+            dw.r.setErr(msg, e.fail_arg);
+            return error.Invalid;
+        }
+        const st = s.finish();
+        const got = st.content[start..];
+        const was = raw[from..to];
+        if (dw.doc.objs.items.len != objs) t.fail("a band writes an object its provisional one does not");
+        if (dw.fonts.uncovered.chars.items.len != unc) t.fail("a band draws a character no font has");
+        // (what follows the band is separated from it by its last byte)
+        if ((got.len == 0) != (was.len == 0) or (got.len > 0 and w.isDelim(got[got.len - 1]) != w.isDelim(was[was.len - 1]))) t.fail("a band ends unlike its provisional one");
+        for (st.res.lists, res.lists, n1) |p, q, n| if (!std.mem.eql(w.Ref, p.items, q.items[0..n])) t.fail("a band adds other resources than its provisional one");
+        return l.scratch.allocator().dupe(u8, got);
+    }
+
+    /// Every page settled. False: the pages cannot take their bands later (`laterFailed`; the
+    /// caller draws them again).
+    pub fn endLater(dw: *DocWriter) Error!bool {
+        const l = dw.later.?;
+        if (l.track.failed or !try l.track.end(&dw.fonts)) return false;
+        dw.freeLater();
+        return true;
     }
 
     /// Starts a part of the document laid out on its own, in frame `f` (and the frames its pages
@@ -3399,9 +3627,20 @@ pub const DocWriter = struct {
                 e.page_index = out_i;
                 e.doc_lang = popts.lang;
             }
+            const later = dw.later;
+            if (later) |l| {
+                e.later = l;
+                l.track.surface = &s;
+                l.track.mode = .idle;
+                l.cur = .{ .height = page.height, .strs = .{ @intCast(l.track.strs.items.len), 0 }, .log = .{ @intCast(l.track.log.items.len), 0 } };
+            }
             @import("../memtrace.zig").mark("emit: page start");
             try paintPage(&e, page, win);
             @import("../memtrace.zig").mark("emit: page painted");
+            if (later) |l| {
+                l.track.surface = null;
+                l.track.mode = .idle;
+            }
             if (e.fail_msg) |msg| {
                 dw.r.setErr(msg, e.fail_arg);
                 // a message longer than the renderer's buffer (an image's data: URI) is kept whole in
@@ -3412,7 +3651,11 @@ pub const DocWriter = struct {
                 return error.Invalid;
             }
             const st = s.finish();
-            dw.outs.appendAssumeCapacity(.{ .content = dw.doc.encode(st.content, .content), .res = try st.res.dupe(a), .q_over = st.limits.q_over });
+            if (later != null) {
+                // (the content waits for its bands and final glyph codes: `settleLater`)
+                try dw.keepLater(st.content);
+                dw.outs.appendAssumeCapacity(.{ .content = .{ .data = &.{} }, .res = try st.res.dupe(a), .q_over = st.limits.q_over });
+            } else dw.outs.appendAssumeCapacity(.{ .content = dw.doc.encode(st.content, .content), .res = try st.res.dupe(a), .q_over = st.limits.q_over });
             dw.sizes.appendAssumeCapacity(.{ page.width, page.height });
             try td.addPage(s.mcid);
             @import("../memtrace.zig").mark("emit: page done");

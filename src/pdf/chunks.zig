@@ -24,7 +24,9 @@
 //! A document with no such forced break (or whose parts links join) may still be cut at any page
 //! boundary (`Flow`, paged.zig `FlowIter`): the same flow and the same conditions, every child of
 //! the flow a block; a part lays out the children of the flow from the one holding its first
-//! page's start, and the page it stops at is chosen as it is laid out. A child may hold a part's
+//! page's start, and the page it stops at is chosen as it is laid out. The next part lays out
+//! again the child it starts in and the one after it, so a part lays out several times as much
+//! when those children are big (paged.zig `partEnd`). A child may hold a part's
 //! start (`Flow.cuttable`) unless a `#fragment` link in it or before it reaches it or a later
 //! child. The start may be inside a table (between its rows), a flex container or a grid (before
 //! a line, a row or an item of a single flow) as well as inside blocks: any start that is one point
