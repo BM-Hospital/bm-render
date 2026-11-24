@@ -165,6 +165,8 @@ pub const Slot = struct {
     dynamic: bool = false,
     /// per node: a frame without page hooks, laid out once and drawn on every page that picks it
     cache: []?*Frame = &.{},
+    /// per node: the frame drawn with a provisional page count (`forPageProvisional`)
+    provisional: []?*Frame = &.{},
 
     pub const none_node: usize = std.math.maxInt(usize);
 
@@ -277,6 +279,25 @@ pub fn forPage(d: *const Doc, s: *Slot, page: usize, pages: usize, page_w: f32, 
         break :blk s.cache[k].?;
     };
     return .{ .frame = frame, .x = 0, .y = y, .w = page_w, .h = s.height };
+}
+
+/// `forPage` for a band drawn with a provisional page count, drawn again once the count is known
+/// (paged.zig `ChunkDraw`): a tree with page counters is laid out once, with the counters of the
+/// first page that draws it, not for every page.
+pub fn forPageProvisional(d: *const Doc, s: *Slot, page: usize, pages: usize, page_w: f32, page_h: f32) Error!?Draw {
+    var got = try forPage(d, s, page, pages, page_w, page_h) orelse return null;
+    const lz = got.lazy orelse return got;
+    // (a page of another width lays its band out at its own width)
+    if (lz.doc != d) return got;
+    const k = s.forPage(page + 1, pages) orelse return got;
+    if (s.provisional.len == 0) {
+        s.provisional = try d.a.alloc(?*Frame, s.nodes.len);
+        @memset(s.provisional, null);
+    }
+    if (s.provisional[k] == null) s.provisional[k] = try layOutBand(d, s.nodes[k], page + 1, pages, null);
+    got.frame = s.provisional[k];
+    got.lazy = null;
+    return got;
 }
 
 test "a band's tree per page: first and last win over odd and even, false draws nothing" {

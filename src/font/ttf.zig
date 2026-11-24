@@ -210,6 +210,9 @@ pub const Font = struct {
     num_glyphs: u16 = 0,
     num_hmetrics: u16 = 0,
     cmap_format: u16 = 0,
+    /// `glyphIndex` of U+0000..U+007F (`init`; text is looked up a character at a time)
+    ascii: [128]u16 = undefined,
+    ascii_ok: bool = false,
     loca_long: bool = false,
     /// GPOS lookups of the `kern` feature (ascending lookup index).
     n_kern: u8 = 0,
@@ -246,6 +249,8 @@ pub const Font = struct {
     pub fn init(data: []const u8, face_index: u32) Error!Font {
         var f: Font = .{ .data = data };
         try f.parse(face_index);
+        for (&f.ascii, 0..) |*g, cp| g.* = f.cmapLookup(@intCast(cp));
+        f.ascii_ok = true;
         return f;
     }
 
@@ -370,6 +375,11 @@ pub const Font = struct {
 
     /// Glyph id for a Unicode codepoint, 0 (.notdef) when unmapped.
     pub fn glyphIndex(f: *const Font, cp: u21) u16 {
+        if (cp < 128 and f.ascii_ok) return f.ascii[cp];
+        return f.cmapLookup(cp);
+    }
+
+    fn cmapLookup(f: *const Font, cp: u21) u16 {
         const t = f.cmap_sub;
         const c: u32 = cp;
         var gid: u32 = 0;

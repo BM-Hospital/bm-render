@@ -120,6 +120,49 @@ const Instances = struct {
     faces: [max_instances]Face = undefined,
 };
 
+/// The last few `matchEx` answers (text layout asks the same request for every paragraph of a
+/// style): the request serialised (`key`), the faces it returned. Answers holding a variable font's
+/// instance are not kept (an instance can be evicted). Emptied whenever the faces change.
+const MatchCache = struct {
+    const entries = 8;
+    const key_cap = 192;
+    const ids_cap = 16;
+    keys: [entries][key_cap]u8 = undefined,
+    /// 0: an empty entry
+    key_len: [entries]u16 = @splat(0),
+    hashes: [entries]u64 = @splat(0),
+    ids: [entries][ids_cap]FaceId = undefined,
+    n: [entries]u8 = @splat(0),
+    next: u8 = 0,
+
+    fn invalidate(c: *MatchCache) void {
+        c.key_len = @splat(0);
+    }
+
+    /// The request (and the room for the answer) as bytes in `buf`; null: too long to keep.
+    fn key(buf: *[key_cap]u8, req: *const MatchRequest, room: usize) ?[]const u8 {
+        var n: usize = 0;
+        const put = struct {
+            fn put(b: *[key_cap]u8, at: *usize, bytes: []const u8) bool {
+                if (at.* + bytes.len > key_cap) return false;
+                @memcpy(b[at.*..][0..bytes.len], bytes);
+                at.* += bytes.len;
+                return true;
+            }
+        }.put;
+        const head = .{ @as(u32, @intCast(@min(room, 0xffff))), req.weight, @intFromBool(req.italic), req.stretch, req.size, @as(u32, @intCast(@min(req.families.len, 0xffff))), @as(u32, @intCast(@min(req.variations.len, 0xffff))) };
+        inline for (head) |v| if (!put(buf, &n, std.mem.asBytes(&v))) return null;
+        for (req.families) |f| {
+            const len: u32 = @intCast(@min(f.len, 0xffff_ffff));
+            if (!put(buf, &n, std.mem.asBytes(&len)) or !put(buf, &n, f)) return null;
+        }
+        for (req.variations) |v| {
+            if (!put(buf, &n, &v.tag) or !put(buf, &n, std.mem.asBytes(&v.value))) return null;
+        }
+        return buf[0..n];
+    }
+};
+
 const width_classes = [_]f32{ 50, 62.5, 75, 87.5, 100, 112.5, 125, 150, 200 };
 
 pub const FontCollection = struct {
@@ -127,6 +170,12 @@ pub const FontCollection = struct {
     /// Instance cache; allocated when the first variable font is registered. Mutated through
     /// the pointer by `match` (which takes a const collection).
     inst: ?*Instances = null,
+    /// `matchEx` answers; allocated with the first face. Mutated through the pointer as `inst`.
+    matches: ?*MatchCache = null,
+
+    fn facesChanged(self: *FontCollection) void {
+        if (self.matches) |m| m.invalidate();
+    }
 
     /// Frees everything. `alloc` must be the allocator used for `register`.
     pub fn deinit(self: *FontCollection, alloc: std.mem.Allocator) void {
@@ -134,6 +183,8 @@ pub const FontCollection = struct {
         self.faces.deinit(alloc);
         if (self.inst) |in| alloc.destroy(in);
         self.inst = null;
+        if (self.matches) |m| alloc.destroy(m);
+        self.matches = null;
     }
 
     /// Registers the faces of a font file and returns the id of the first one: every face
@@ -168,6 +219,7 @@ pub const FontCollection = struct {
     }
 
     fn truncate(self: *FontCollection, alloc: std.mem.Allocator, len: usize) void {
+        self.facesChanged();
         while (self.faces.items.len > len) {
             const f = self.faces.pop().?;
             if (f.active) alloc.free(f.family);
@@ -177,6 +229,12 @@ pub const FontCollection = struct {
 
     fn addFace(self: *FontCollection, alloc: std.mem.Allocator, parsed: Font, index: u32, opts: RegisterOptions) !void {
         if (self.faces.items.len >= instance_base - 1) return error.OutOfMemory;
+        if (self.matches == null) {
+            const m = try alloc.create(MatchCache);
+            m.* = .{};
+            self.matches = m;
+        }
+        self.facesChanged();
         var buf: [128]u8 = undefined;
         const fam = opts.family orelse parsed.familyName(&buf);
         var fc: Face = .{
@@ -247,6 +305,7 @@ pub const FontCollection = struct {
         if (id >= self.faces.items.len) return;
         const f = &self.faces.items[id];
         if (!f.active) return;
+        self.facesChanged();
         if (self.inst) |in| {
             for (in.faces[0..in.len], 0..) |*e, slot| {
                 if (e.base == id) {
@@ -402,6 +461,30 @@ pub const FontCollection = struct {
     /// past 400, because Blink never emboldens such a font synthetically; its `italic` is
     /// true when `ital` / `slnt` produced the slant.
     pub fn matchEx(self: *const FontCollection, req: MatchRequest, out: []FaceId) []FaceId {
+        const m = self.matches orelse return self.matchFaces(req, out);
+        var buf: [MatchCache.key_cap]u8 = undefined;
+        const key = MatchCache.key(&buf, &req, out.len) orelse return self.matchFaces(req, out);
+        const h = std.hash.XxHash64.hash(0, key);
+        for (0..MatchCache.entries) |e| {
+            if (m.key_len[e] != key.len or m.hashes[e] != h or !@import("../eql.zig").bytes(m.keys[e][0..key.len], key)) continue;
+            const n = m.n[e];
+            @memcpy(out[0..n], m.ids[e][0..n]);
+            return out[0..n];
+        }
+        const got = self.matchFaces(req, out);
+        if (got.len > MatchCache.ids_cap) return got;
+        for (got) |id| if (id >= instance_base) return got;
+        const e = m.next;
+        m.next = (m.next + 1) % MatchCache.entries;
+        @memcpy(m.keys[e][0..key.len], key);
+        m.key_len[e] = @intCast(key.len);
+        m.hashes[e] = h;
+        @memcpy(m.ids[e][0..got.len], got);
+        m.n[e] = @intCast(got.len);
+        return got;
+    }
+
+    fn matchFaces(self: *const FontCollection, req: MatchRequest, out: []FaceId) []FaceId {
         var n: usize = 0;
         for (req.families) |fam| {
             if (n >= out.len) break;

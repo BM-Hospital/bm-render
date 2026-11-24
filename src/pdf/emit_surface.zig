@@ -732,6 +732,18 @@ pub const Surface = struct {
     }
 
     pub fn pop(s: *Surface) void {
+        s.popGroup(false);
+    }
+
+    /// Pops pushes until `n` remain, leaving out a group (opacity, mask, isolation) that drew
+    /// nothing: a box the walk of a page meets outside the page's window (emit.zig `paintNode`)
+    /// draws nothing in it, and whether its empty group were drawn would depend on how much of
+    /// the document the page's walk visits (a part's frame or the whole document).
+    pub fn popToDroppingEmpty(s: *Surface, n: usize) void {
+        while (s.pushes.items.len > n) s.popGroup(true);
+    }
+
+    fn popGroup(s: *Surface, drop_empty: bool) void {
         const p = s.pushes.pop() orelse return;
         switch (p) {
             .transform, .blend => s.bd().restoreGs(),
@@ -739,16 +751,19 @@ pub const Surface = struct {
             .opacity => |o| if (o != 1) {
                 var sub = s.builders.pop().?;
                 const st = sub.finishIn(s.cx);
+                if (drop_empty and st.content.len == 0) return;
                 s.bd().drawOpacified(s.cx, o, &st);
             },
             .mask => |m| {
                 var sub = s.builders.pop().?;
                 const st = sub.finishIn(s.cx);
+                if (drop_empty and st.content.len == 0) return;
                 s.bd().drawMasked(s.cx, &m, &st);
             },
             .isolated => {
                 var sub = s.builders.pop().?;
                 const st = sub.finishIn(s.cx);
+                if (drop_empty and st.content.len == 0) return;
                 s.bd().drawIsolated(s.cx, &st);
             },
         }

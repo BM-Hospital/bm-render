@@ -587,3 +587,17 @@ test "pdf text: Type3 ToUnicode CMap (1-byte codes)" {
     const t = try fo.type3Cmap(arena.allocator(), &.{ "\u{1F389}", null, "", "A" });
     try testing.expect(std.mem.indexOf(u8, t, "1 begincodespacerange\n<00> <FF>\nendcodespacerange\n2 beginbfchar\n<00> <D83CDF89>\n<03> <0041>\nendbfchar\n") != null);
 }
+
+test "Track: glyph code strings decode back from the tokens Buf.str writes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const cases = [_][]const u8{ "", "\x00\x05", "\x00(\x00)", "\x00)\x00(", "(\\)\n\r\t\x08\x0c", "\x80\x01", "\xff\xfe\x00\x00", "a(b(c)d)e", "\x00\x1f\x00\x7f" };
+    for (cases) |c| {
+        var b = w.Buf.init(aa);
+        b.str(c);
+        var out: std.ArrayList(u8) = .empty;
+        try testing.expect(try fo.Track.decodeStr(aa, b.list.items, &out));
+        try testing.expectEqualSlices(u8, c, out.items);
+    }
+}

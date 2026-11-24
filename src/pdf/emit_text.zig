@@ -196,8 +196,7 @@ const PassOpts = struct {
 /// Whether the face paints its own colours (colour faces never synthesise bold / oblique).
 fn coloredFace(e: *Emitter, face: font.FaceId) bool {
     if (comptime !pm.enable_color_fonts) return false;
-    const color = @import("../font/color.zig");
-    return color.ColorTables.init(&e.f.r.fonts.face(face).font).hasColor();
+    return text.coloredFace(e.fonts, &e.f.r.fonts.face(face).font);
 }
 
 /// Hands `glyphs[g0..g1]` (one face: a takumi `ShapedRun`) to the seam, split only where the

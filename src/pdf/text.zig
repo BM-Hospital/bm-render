@@ -36,6 +36,7 @@ const Path = geom.Path;
 const Color = style.Color;
 
 pub const FontRegistry = fo.FontRegistry;
+pub const Track = fo.Track;
 pub const FontContainer = fo.FontContainer;
 pub const FontIssues = fo.FontIssues;
 pub const FontId = fo.FontId;
@@ -157,7 +158,10 @@ fn useTextSpanner(fc: *FontContainer, gs: []const Glyph, text: []const u8, color
         const ad = try fc.addGlyph(g.gid, color);
         const t = text[g.start..g.end];
         if (fc.getCodepoints(ad.font, ad.glyph)) |cps| {
-            if (!std.mem.eql(u8, cps, t)) span = true;
+            if (!std.mem.eql(u8, cps, t)) {
+                span = true;
+                fc.noteConflict(g.gid);
+            }
         } else try fc.setCodepoints(ad.font, ad.glyph, t);
     }
     return span;
@@ -190,6 +194,7 @@ const Spanner = struct {
         // it has it already
         _ = prev;
         if (!incompatible and cps == null) try s.fc.setCodepoints(ad.font, ad.glyph, t);
+        if (incompatible) s.fc.noteConflict(g.gid);
         return incompatible;
     }
 
@@ -401,7 +406,11 @@ fn encodeRun(reg: *FontRegistry, cx: *sf.Ctx, b: *sf.Builder, cur_x: *f32, y: f3
     var enc: std.ArrayList(u8) = .empty;
     if (gs.len == 1 and approxZero(gs[0].x * 1.0)) {
         try fc.pdfGlyph(id, gs[0].gid, ctx_color).?.encodeInto(a, &enc);
-        b.c.show(enc.items);
+        const at = b.c.bytes().len;
+        b.c.b.str(enc.items);
+        try wrote(reg, fc, b, at);
+        b.c.operands = true;
+        b.c.op("Tj");
         return;
     }
     const upem = fc.unitsPerEm(id);
@@ -415,7 +424,9 @@ fn encodeRun(reg: *FontRegistry, cx: *sf.Ctx, b: *sf.Builder, cur_x: *f32, y: f3
         adjustment += x_offset;
         if (!approxZero(adjustment)) {
             if (enc.items.len > 0) {
+                const at = b.c.bytes().len;
                 b.c.tjStr(enc.items);
+                try wrote(reg, fc, b, at);
                 enc.clearRetainingCapacity();
             }
             b.c.tjAdjust(-(adjustment / upem * fe.pdf_units_per_em));
@@ -425,8 +436,18 @@ fn encodeRun(reg: *FontRegistry, cx: *sf.Ctx, b: *sf.Builder, cur_x: *f32, y: f3
         if (font_advance) |fa| adjustment += x_advance - fa;
         adjustment -= x_offset;
     }
-    if (enc.items.len > 0) b.c.tjStr(enc.items);
+    if (enc.items.len > 0) {
+        const at = b.c.bytes().len;
+        b.c.tjStr(enc.items);
+        try wrote(reg, fc, b, at);
+    }
     b.c.tjEnd();
+}
+
+/// (`FontRegistry.track`) a string of glyph codes written at `at` of `b`'s content.
+fn wrote(reg: *FontRegistry, fc: *const FontContainer, b: *const sf.Builder, at: usize) !void {
+    const t = reg.track orelse return;
+    try t.wrote(fc, b, at, b.c.bytes().len);
 }
 
 // ===================================================================== krilla surface.rs
@@ -556,7 +577,7 @@ pub fn paintGlyphRun(reg: *FontRegistry, s: *sf.Surface, run_in: Run, origin_in:
     var sil: std.ArrayList(type3.Silhouette) = .empty;
     var opaque_sil: Path = .empty;
     var bitmaps: std.ArrayList(Glyph) = .empty;
-    const colored = coloredFace(font);
+    const colored = coloredFace(reg, font);
     if (shadow != null and colored) {
         var kept: std.ArrayList(Glyph) = .empty;
         for (run.glyphs) |g| {
@@ -1085,9 +1106,14 @@ fn buildRun(reg: *FontRegistry, a: Allocator, f: *rt.Frame, para: ?*const font_m
     return .{ .font = .{ .font = font, .face_index = face.index, .variant = variant }, .glyphs = glyphs, .text = text, .size = size };
 }
 
-fn coloredFace(font: *const ttf.Font) bool {
+/// Whether the face has colour glyph tables (the last face asked about is remembered: a page asks
+/// for every text run).
+pub fn coloredFace(reg: *FontRegistry, font: *const ttf.Font) bool {
     if (comptime !enable_color_fonts) return false;
-    return color_mod.ColorTables.init(font).hasColor();
+    if (reg.color_face) |k| if (k[0] == font.data.ptr and k[1] == font.head.ptr) return reg.color_has;
+    reg.color_has = color_mod.ColorTables.init(font).hasColor();
+    reg.color_face = .{ font.data.ptr, font.head.ptr };
+    return reg.color_has;
 }
 
 fn drawSubRun(reg: *FontRegistry, s: *sf.Surface, f: *rt.Frame, n: *const rt.Node, gs: []const font_mod.PositionedGlyph, baseline: f32, origin: [2]f32, text: []const u8, pass: Pass, o: FrameRunOptions) !void {
@@ -1097,7 +1123,7 @@ fn drawSubRun(reg: *FontRegistry, s: *sf.Surface, f: *rt.Frame, n: *const rt.Nod
     if (rcs.visibility != .visible) return;
     const run = (try buildRun(reg, s.cx.work(), f, n.para, gs, text)) orelse return;
     const face = f.r.fonts.face(g0.face);
-    const colored_face = coloredFace(&face.font);
+    const colored_face = coloredFace(reg, &face.font);
     const fill_col = if (rcs.webkit_text_fill_color) |c| rcs.resolveColor(c) else rcs.color;
     const p: RunPaint = .{
         .color = fill_col,
