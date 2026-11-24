@@ -1528,17 +1528,34 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
     geo.names = names;
     const blank = o.uncovered_text == .blank;
 
-    // A band that depends on the page count (its counters, or a rule for the last page) needs the
-    // count first: the parts are laid out once to count their pages. A counter band is measured
-    // again until its height settles, as `layOutRules` does.
+    // A band that depends on the page count (its counters, or a rule for the last page) is drawn
+    // once the count is known: the parts are laid out and drawn once, with bands of a provisional
+    // count in place, which are drawn again with the count (`emit.Later`). When that cannot give
+    // the document drawn with the count (`emit.DocWriter.laterFailed`), or the count changes a
+    // counter band's height and the page areas follow it, the parts are laid out once to count
+    // their pages first, the band measured again until its height settles, as `layOutRules` does.
     const dynamic = (if (header) |s| s.dynamic else false) or (if (footer) |s| s.dynamic else false);
     const varies = (if (header) |s| s.varies else false) or (if (footer) |s| s.varies else false);
+    var follows = rules.first.margin.followBands() or rules.left.margin.followBands() or rules.right.margin.followBands();
+    for (rules.named) |e| follows = follows or e.first.margin.followBands() or e.left.margin.followBands() or e.right.margin.followBands();
+    // (the bands of a single page are laid out when it is drawn, from this copy)
+    const band_doc = try a.create(bands.Doc);
+    band_doc.* = cx.doc;
+    var cd: ChunkDraw = .{ .r = r, .a = a, .doc = doc, .cut = cut, .geo = &geo, .rules = rules, .follows = follows, .header = &header, .footer = &footer, .band_doc = band_doc, .o = o, .background = background, .policy = policy, .blank = blank, .budget = budget };
     var n: usize = 0;
     if (dynamic or varies) {
+        switch (try cd.draw(null)) {
+            .file => |bytes| return bytes,
+            .refuse => return null,
+            .count_first => {},
+        }
+        // (the bands and the page areas as before the parts were drawn)
+        if (header) |*s| try bands.measure(&cx.doc, s, 1);
+        if (footer) |*s| try bands.measure(&cx.doc, s, 1);
+        geo = try Geo.resolve(r, a, rules, heights(header), heights(footer));
+        geo.names = names;
         n = try countCut(r, a, doc, cut, &geo, blank, budget) orelse return null;
         if (dynamic) {
-            var follows = rules.first.margin.followBands() or rules.left.margin.followBands() or rules.right.margin.followBands();
-            for (rules.named) |e| follows = follows or e.first.margin.followBands() or e.left.margin.followBands() or e.right.margin.followBands();
             var k: usize = 0;
             while (k < band_passes) : (k += 1) {
                 const before = .{ heights(header), heights(footer) };
@@ -1554,67 +1571,151 @@ pub fn writeChunked(r: *rt.Renderer, a: Allocator, o_in: opt.PdfOptions, css: ?j
             }
         }
     }
-
-    const dw = try emit.DocWriter.init(a, doc, policy);
-    defer dw.deinit();
-    // (the bands of a single page are laid out when it is drawn, from this copy)
-    const band_doc = try a.create(bands.Doc);
-    band_doc.* = cx.doc;
-    var pd: PartDraw = .{ .a = a, .dw = dw, .sel = opt.PageSelection.init(o.page_ranges), .geo = &geo, .header = &header, .footer = &footer, .band_doc = band_doc, .n = n, .background = background };
-    switch (cut) {
-        .forced => |plan| {
-            var i: usize = 0;
-            var seam: ?Seam = null;
-            for (0..plan.parts.len) |k| {
-                memtrace.mark("part: start");
-                const mem = try newMem(r);
-                defer freeMem(r, mem);
-                const pa = mem.allocator();
-                const lp = try layPart(pa, doc, plan, k, &geo, seam, blank) orelse return null;
-                if (seam) |sm| if (sm.page + lp.s != i) return refuse([]const u8, "pages moved at a seam");
-                if (k + 1 < plan.parts.len) seam = seamAfter(lp, plan, k, i) orelse return null;
-                memtrace.mark("part: laid out");
-                if (!try pd.draw(pa, lp.f, lp.s, lp.e, i, k == 0, k + 1 == plan.parts.len)) return null;
-                i += lp.e - lp.s;
-                const pt = plan.parts[k];
-                if (!chunks.ownsCollected(doc, plan.parent, pt, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refuse([]const u8, "an anchor or heading outside its part");
-                if (!try dw.endChunk(pa, .{ .parent = lp.flow, .lo = pt.own_lo, .hi = pt.own_hi })) return refuse([]const u8, "structure crosses a seam");
-                memtrace.mark("part: drawn");
-            }
-        },
-        .flowing => |fl| {
-            var it: FlowIter = .{ .r = r, .keep = a, .doc = doc, .fl = fl, .geo = &geo, .blank = blank, .budget = budget };
-            defer it.deinit();
-            var moved: std.ArrayList(HandOn) = .empty;
-            var k: usize = 0;
-            while (!it.done) : (k += 1) {
-                memtrace.mark("part: start");
-                const p = try it.next() orelse return null;
-                memtrace.mark("part: laid out");
-                const pa = it.mem.?.allocator();
-                const last_part = p.cut == null;
-                if (!try pd.draw(pa, p.f, p.s, p.e, p.first, k == 0, last_part)) return null;
-                // (the anchors and headings it collected: of the children of the flow from its
-                // first one to the one the next part starts in, which both lay out)
-                const own: chunks.Part = .{ .lo = fl.kids[p.kid0], .hi = 0, .own_lo = fl.kids[p.kid0], .own_hi = if (p.cut) |c| fl.kids[c] + 1 else std.math.maxInt(u32) };
-                if (!chunks.ownsCollected(doc, fl.parent, own, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refuse([]const u8, "an anchor or heading outside its part");
-                // (the structure recorded for the child the next part starts in, and those after
-                // it, goes to the next part, and with it the elements destinations name)
-                if (!takeOn(&dw.links, p.f, moved.items, dw.links.chunk)) return refuse([]const u8, "a destination has no box");
-                if (p.cut) |c| try handOn(a, &dw.links, p.f, fl, c, dw.links.chunk, &moved);
-                const hi = if (p.cut) |c| fl.kids[c] else std.math.maxInt(u32);
-                if (!try dw.endChunk(pa, .{ .parent = p.flow, .lo = fl.kids[p.kid0], .hi = hi })) return refuse([]const u8, "structure crosses a seam");
-                memtrace.mark("part: drawn");
-            }
-        },
-    }
-    var diag: opt.Diag = .{};
-    pd.sel.finish(&diag) catch {
-        r.setErr(diag.message(), "");
-        return error.Invalid;
+    return switch (try cd.draw(n)) {
+        .file => |bytes| bytes,
+        .refuse => null,
+        .count_first => unreachable,
     };
-    return try dw.finish();
 }
+
+/// Draws a document laid out a part at a time (`writeChunked`, its cut and geometry known).
+const ChunkDraw = struct {
+    r: *rt.Renderer,
+    a: Allocator,
+    doc: *Frame,
+    cut: chunks.Cut,
+    geo: *Geo,
+    rules: page_rules.Pages,
+    /// the page areas follow the bands' heights
+    follows: bool,
+    header: *?bands.Slot,
+    footer: *?bands.Slot,
+    band_doc: *bands.Doc,
+    o: opt.PdfOptions,
+    background: ?style.Color,
+    policy: emit.DocOptions,
+    blank: bool,
+    budget: u32,
+
+    const Drawn = union(enum) {
+        file: []const u8,
+        /// the parts cannot be drawn apart (laid out whole)
+        refuse,
+        /// the bands cannot be drawn once the page count is known: count the pages first
+        count_first,
+    };
+
+    /// The provisional page count the bands are drawn with before the count is known (any count
+    /// gives the same file; three digits as `measureBand`).
+    const provisional_count = 999;
+
+    /// The file, its bands drawn for a document of `n` pages, or (`n` null) drawn once the parts
+    /// are and the count is known (`emit.Later`).
+    fn draw(cd: *ChunkDraw, n: ?usize) Error!Drawn {
+        const r = cd.r;
+        const a = cd.a;
+        const doc = cd.doc;
+        const geo = cd.geo;
+        const blank = cd.blank;
+        const dw = try emit.DocWriter.init(a, doc, cd.policy);
+        defer dw.deinit();
+        if (n == null) try dw.startLater();
+        var later: std.ArrayList(PartDraw.Later) = .empty;
+        var pd: PartDraw = .{ .a = a, .dw = dw, .sel = opt.PageSelection.init(cd.o.page_ranges), .geo = geo, .header = cd.header, .footer = cd.footer, .band_doc = cd.band_doc, .n = n orelse provisional_count, .later = if (n == null) &later else null, .background = cd.background };
+        var pages: usize = 0;
+        switch (cd.cut) {
+            .forced => |plan| {
+                var i: usize = 0;
+                var seam: ?Seam = null;
+                for (0..plan.parts.len) |k| {
+                    memtrace.mark("part: start");
+                    const mem = try newMem(r);
+                    defer freeMem(r, mem);
+                    const pa = mem.allocator();
+                    const lp = try layPart(pa, doc, plan, k, geo, seam, blank) orelse return .refuse;
+                    if (seam) |sm| if (sm.page + lp.s != i) return refused("pages moved at a seam");
+                    if (k + 1 < plan.parts.len) seam = seamAfter(lp, plan, k, i) orelse return .refuse;
+                    memtrace.mark("part: laid out");
+                    if (!try pd.draw(pa, lp.f, lp.s, lp.e, i, k == 0, k + 1 == plan.parts.len)) return .refuse;
+                    i += lp.e - lp.s;
+                    const pt = plan.parts[k];
+                    if (!chunks.ownsCollected(doc, plan.parent, pt, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refused("an anchor or heading outside its part");
+                    if (!try dw.endChunk(pa, .{ .parent = lp.flow, .lo = pt.own_lo, .hi = pt.own_hi })) return refused("structure crosses a seam");
+                    memtrace.mark("part: drawn");
+                    if (dw.laterFailed() != null) return countFirst(dw);
+                }
+                pages = i;
+            },
+            .flowing => |fl| {
+                var it: FlowIter = .{ .r = r, .keep = a, .doc = doc, .fl = fl, .geo = geo, .blank = blank, .budget = cd.budget };
+                defer it.deinit();
+                var moved: std.ArrayList(HandOn) = .empty;
+                var k: usize = 0;
+                while (!it.done) : (k += 1) {
+                    memtrace.mark("part: start");
+                    const p = try it.next() orelse return .refuse;
+                    memtrace.mark("part: laid out");
+                    const pa = it.mem.?.allocator();
+                    const last_part = p.cut == null;
+                    if (!try pd.draw(pa, p.f, p.s, p.e, p.first, k == 0, last_part)) return .refuse;
+                    // (the anchors and headings it collected: of the children of the flow from its
+                    // first one to the one the next part starts in, which both lay out)
+                    const own: chunks.Part = .{ .lo = fl.kids[p.kid0], .hi = 0, .own_lo = fl.kids[p.kid0], .own_hi = if (p.cut) |c| fl.kids[c] + 1 else std.math.maxInt(u32) };
+                    if (!chunks.ownsCollected(doc, fl.parent, own, dw.links.anchors, dw.links.headings.items, dw.links.chunk)) return refused("an anchor or heading outside its part");
+                    // (the structure recorded for the child the next part starts in, and those after
+                    // it, goes to the next part, and with it the elements destinations name)
+                    if (!takeOn(&dw.links, p.f, moved.items, dw.links.chunk)) return refused("a destination has no box");
+                    if (p.cut) |c| try handOn(a, &dw.links, p.f, fl, c, dw.links.chunk, &moved);
+                    const hi = if (p.cut) |c| fl.kids[c] else std.math.maxInt(u32);
+                    if (!try dw.endChunk(pa, .{ .parent = p.flow, .lo = fl.kids[p.kid0], .hi = hi })) return refused("structure crosses a seam");
+                    memtrace.mark("part: drawn");
+                    if (dw.laterFailed() != null) return countFirst(dw);
+                }
+                pages = it.page;
+            },
+        }
+        if (n == null) {
+            // the page count is known: a counter band measured with it (as `writeChunked` does after
+            // counting), unless the page areas follow a height that changed; then the bands
+            const dynamic = (if (cd.header.*) |s| s.dynamic else false) or (if (cd.footer.*) |s| s.dynamic else false);
+            if (dynamic) {
+                const before = .{ heights(cd.header.*), heights(cd.footer.*) };
+                if (cd.header.*) |*s| try bands.measure(cd.band_doc, s, pages);
+                if (cd.footer.*) |*s| try bands.measure(cd.band_doc, s, pages);
+                if (!(same(before[0], heights(cd.header.*)) and same(before[1], heights(cd.footer.*)))) {
+                    const geo2 = try Geo.resolve(r, a, cd.rules, heights(cd.header.*), heights(cd.footer.*));
+                    if (!geo.sameMargins(&geo2) and cd.follows) {
+                        memtrace.mark("chunks: count first: the page areas follow the bands");
+                        return .count_first;
+                    }
+                }
+            }
+            try dw.beginLater();
+            for (later.items, 0..) |lt, i| {
+                const hd = if (cd.header.*) |*hs| try bands.forPage(cd.band_doc, hs, lt.page, pages, lt.w, lt.h) else null;
+                const ft = if (cd.footer.*) |*fs| try bands.forPage(cd.band_doc, fs, lt.page, pages, lt.w, lt.h) else null;
+                try dw.settleLater(i, hd, ft);
+            }
+            if (!try dw.endLater()) return countFirst(dw);
+        }
+        var diag: opt.Diag = .{};
+        pd.sel.finish(&diag) catch {
+            r.setErr(diag.message(), "");
+            return error.Invalid;
+        };
+        return .{ .file = try dw.finish() };
+    }
+
+    fn refused(comptime why: []const u8) Drawn {
+        memtrace.mark("chunks: whole: " ++ why);
+        return .refuse;
+    }
+
+    fn countFirst(dw: *const emit.DocWriter) Drawn {
+        if (memtrace.hook) |h| h(dw.laterFailed() orelse "chunks: count first");
+        return .count_first;
+    }
+};
 
 /// The page count of `doc`'s document laid out a part at a time. Null: it cannot be.
 fn countCut(r: *rt.Renderer, a: Allocator, doc: *const Frame, cut: chunks.Cut, geo: *const Geo, blank: bool, budget: u32) Error!?usize {
@@ -1633,9 +1734,15 @@ const PartDraw = struct {
     header: *?bands.Slot,
     footer: *?bands.Slot,
     band_doc: *bands.Doc,
-    /// the document's page count (0: no band needs it)
+    /// the document's page count (0: no band needs it; provisional with `later`)
     n: usize,
+    /// the pages whose bands are drawn again once the page count is known (`emit.Later`)
+    later: ?*std.ArrayList(Later) = null,
     background: ?style.Color,
+
+    /// An output page drawn with a provisional page count: page `page` of the document, `w` x `h`
+    /// CSS px.
+    const Later = struct { page: usize, w: f32, h: f32 };
 
     fn win(p: layout.fragment.Page) emit.Window {
         return .{ .top = p.top, .bottom = p.top + p.height, .lines_top = p.top, .lines_bottom = p.top + p.height };
@@ -1671,8 +1778,10 @@ const PartDraw = struct {
             // (the frame's own pages around the part's take part as neighbouring passes)
             if (local == s and s > 0) box.prev_win = win(paged.pages[s - 1]);
             if (local + 1 == e and e < paged.pages.len) box.next_win = win(paged.pages[e]);
-            if (pd.header.*) |*hs| box.header = try bands.forPage(pd.band_doc, hs, gi, pd.n, pp.width, pp.height);
-            if (pd.footer.*) |*fs| box.footer = try bands.forPage(pd.band_doc, fs, gi, pd.n, pp.width, pp.height);
+            const forPage = if (pd.later != null) &bands.forPageProvisional else &bands.forPage;
+            if (pd.header.*) |*hs| box.header = try forPage(pd.band_doc, hs, gi, pd.n, pp.width, pp.height);
+            if (pd.footer.*) |*fs| box.footer = try forPage(pd.band_doc, fs, gi, pd.n, pp.width, pp.height);
+            if (pd.later) |l| try l.append(pd.a, .{ .page = gi, .w = pp.width, .h = pp.height });
             try boxes.append(pa, box);
             // takumi `PageSlice::lines`: the first page also owns the lines above it, the last the
             // lines below it

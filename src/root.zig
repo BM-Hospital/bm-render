@@ -15,6 +15,7 @@ test {
     _ = @import("animate.zig");
     _ = paint;
     _ = @import("bump.zig");
+    _ = @import("eql.zig");
     _ = @import("style/style.zig");
     _ = @import("layout/layout.zig");
     _ = @import("font/font.zig");

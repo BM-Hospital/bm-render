@@ -516,7 +516,7 @@ pub fn shapeCached(comptime complex: bool, cache: *Cache, font: *const Font, b: 
     const key = try cache.resultKey(complex, font, b, run);
     const h = std.hash.XxHash64.hash(0x5eed, key); // (Wyhash: emulated 128-bit multiplies on wasm32)
     const base = in[0].cluster;
-    if (cache.results.get(h)) |r| if (std.mem.eql(u8, r.key, key)) {
+    if (cache.results.get(h)) |r| if (@import("../eql.zig").bytes(r.key, key)) {
         b.rtl = run.rtl;
         b.list.clearRetainingCapacity();
         try b.list.ensureTotalCapacity(b.alloc, r.out.len);

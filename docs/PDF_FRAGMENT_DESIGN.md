@@ -120,12 +120,49 @@ There are three lifetimes:
   → `endChunk` (structure tree built per part and copied compactly, `tags.Skip` / `tags.Carry` hand
   records over a seam, anchors/headings resolved to destinations: `handOn` / `takeOn`) → `finish`
   (one allocation for the file). A part whose pages `pageRanges` drops still collects its anchors
-  and headings (`DocWriter.collect`). Bands with page counters: a counting pass over the parts, then
-  the drawing pass. The count cannot wait for the drawing: the page count's digits in the first
-  page's header are among the first glyphs drawn, and a font subset numbers its glyphs in the
-  order they are first drawn, so every page's text codes depend on it (drawing the bands into
-  their places afterwards was tried: one layout instead of two, but other glyph codes than the
-  document laid out whole). The counting pass costs one layout of the document (§7: long tables).
+  and headings (`DocWriter.collect`).
+- **Bands that show the page count** (a `pageNumber` / `totalPages` counter, a rule for the last
+  page) are drawn once the count is known, in one layout of the parts (`paged.ChunkDraw`,
+  `emit.Later`, `text.Track`). The difficulty is the font subsets: a CID font numbers its glyphs in
+  the order they are first drawn, and the count's digits in the first page's band are among the
+  first, so every later glyph code depends on the count. So:
+  1. Every page is drawn with its bands for a provisional count (999; a tree with counters is laid
+     out once for all pages, `bands.forPageProvisional`) in place: what a band adds to its page and
+     to the document (resource names and their order, a font's first use, objects it writes) comes
+     where the band does. `paintPage` marks the bands' spans (`Later.mark`: the page's root
+     content stream, between operators, no marked content open) and their resources before and
+     after; the content stream is kept compressed (`.fastest`) instead of encoded. `Track` records,
+     per page, the glyphs its content draws first (`log`) and where it writes glyph code strings
+     (`strs`); the provisional bands' glyphs are only noted.
+  2. With the count known (and a counter band measured with it, as after a counting pass), the
+     fonts start a second numbering (`Track.begin`), and page by page, in order
+     (`DocWriter.settleLater`): its header is drawn again with the count on a fresh surface in the
+     page's state at that point (after the same byte, at the page's scale, from the resources before
+     it), its content's first glyphs are added in their order (`Track.replay`), its footer drawn
+     likewise; the content's code strings are rewritten with the final codes (`Track.rewrite`) and
+     the page's stream, bands spliced in, encoded. The fonts' code order is then the one of the
+     document drawn with the count, glyph for glyph, so the file is byte-identical to the one the
+     counting pass gives.
+  3. What this cannot reproduce makes the caller count the pages first and draw again (memory
+     checkpoint `chunks: count first: <why>`, after the first part that shows it): a Type3
+     (colour) glyph or text in a stream of its own (an opacity group, a pattern: their codes are
+     in objects already written); a band that adds other resources than its provisional one, writes
+     an object (an image laid out per page), ends differently (its last byte decides the next
+     operator's separator) or draws a character no font has; a glyph of a band drawn with different
+     texts (its `/ActualText` spans would depend on the order); a counter band whose height changes
+     with the count when the page areas follow the bands.
+  The extra memory is the compressed streams, the band resources per page and the glyph records
+  (about the size of the encoded streams, which the document keeps anyway); the extra time is a
+  fast compression and decompression per page and the bands laid out and drawn twice.
+- **Groups that draw nothing on a page.** A page's walk meets boxes that have nothing on it: the
+  first page of a run of pages visits the whole frame (it collects the document-wide anchors and
+  headings), and a neighbouring page's pass meets the boxes reaching into it. A box opening a
+  group there (opacity, mask, isolation) used to leave an empty transparency-group XObject on the
+  page, so a part's frame (fewer boxes) and the whole document gave different draw lists
+  (`flow-bands-opacity-text`, `bands-opacity-text`: an `<h2>` with `opacity`, already at
+  `9deac8f`). Such a box (outside the page's window, or met by another page's pass) now leaves its
+  group out when it drew nothing (`emit.paintNode`, `Surface.popToDroppingEmpty`); a box on the
+  page keeps its group even when empty, as takumi / krilla write it.
 
 ### When a page may be emitted, and when it must be held
 
@@ -154,8 +191,9 @@ The interfaces later tasks build on, and which must not be bypassed by local coo
 `fragment.Options` (`page_height_fn`, `start`, `start_top`, `origin`, `root_shift`, `extent_fn`),
 `fragment.Pages` / `Start` / `ResumePoint` / `ParagraphCut` / `FrozenWidth` / `Extend` /
 `BoxFragment`, `emit.BoxFragment`, `chunks.Plan` / `Part` / `Flow` / `Cut`, `paged.NodeKey` /
-`Resume` / `FlowIter`, `emit.DocWriter`, `tags.Carry` / `tags.Skip`, and the memtrace checkpoints
-(`count: page`, `emit: page done`, `part: drawn`, `chunks: whole: <why>`).
+`Resume` / `FlowIter`, `emit.DocWriter` / `Later`, `text.Track`, `tags.Carry` / `tags.Skip`, and
+the memtrace checkpoints (`count: page`, `emit: page done`, `part: drawn`, `chunks: whole: <why>`,
+`chunks: count first: <why>`).
 
 ## 7. Measurements
 
@@ -204,6 +242,23 @@ again at the seams. The stress documents (cut at forced breaks) and documents of
 70.84 MiB (as before), live after page 50 / 200 = 46.36 / 51.57 MiB; 50 tables 4.37 ms/page,
 peak 24.98 MiB, 5 parts.
 
+Since the bands showing the page count are drawn once it is known (2026-11-24, no counting pass;
+with word-wise cache-key comparison, a font-match cache, an ASCII glyph table and a colour-face
+memo in shaping), wasm, median of 5, old and new runs interleaved on the same (loaded) container:
+
+| Document | chunked before | chunked after | whole before | whole after |
+|:--|--:|--:|--:|--:|
+| 10 tables | 98.6 ms, 19.3 MiB | 94.3 ms, 19.4 MiB | 80.2 ms, 19.3 MiB | 76.3 ms, 19.4 MiB |
+| 50 tables | 550.7 ms, 38.9 MiB | 389.1 ms, 38.4 MiB | 375.7 ms, 61.1 MiB | 359.8 ms, 58.5 MiB |
+| 100 tables | 1152.7 ms, 53.2 MiB | 781.7 ms, 52.4 MiB | 759.8 ms, 113.0 MiB | 713.8 ms, 113.1 MiB |
+| stress 100 pages | 387.6 ms, 30.1 MiB | 289.4 ms, 33.6 MiB | | |
+| stress 500 pages | 1967.2 ms, 68.3 MiB | 1375.8 ms, 66.2 MiB | | |
+
+(60-row tables on the stress page, its `Page n of N` footer; files byte-identical before and
+after.) The 21 documents of `pdf-docs` 107.0 → 104.9 ms and the 245 image cases 759.7 → 744.9 ms
+(png) are within noise. A chunked long-table document now costs about 1.1 times its whole layout
+(the seams laid out again), at under half its memory.
+
 ## 8. Open items
 
 - Cutting where a page starts with parallel flows (a table row, flex line or grid row broken
@@ -211,8 +266,12 @@ peak 24.98 MiB, 5 parts.
   again per part (rows of an auto-layout table depend on every row's content).
 - Pages with forward links are joined instead of drawn early; page / target counters in the content
   and fixed boxes lay out the whole document.
+- Bands showing the page count still need a counting pass (`chunks: count first`) when the document
+  draws Type3 (colour) glyphs or text inside an opacity group / pattern (their codes are in
+  objects written while drawing; renumbering them would mean holding those objects too), or when a
+  band holds an image (laid out per page, each page's band writes its own image object).
 - Streaming adapters of `streaming_tests.rs` compare output equivalence and part emission
-  (`npm run test:pdf:chunks`, 75 cases); takumi's layout-pass counts and "laid at first page"
+  (`npm run test:pdf:chunks`, 80 cases); takumi's layout-pass counts and "laid at first page"
   instrumentation have no bm counterpart. The case-by-case status is in
   `scripts/pdf-coverage-map.json`.
 - `window_scenes.rs` fixtures at small page sizes paginate differently from takumi (open

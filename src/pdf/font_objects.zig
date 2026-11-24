@@ -151,6 +151,10 @@ pub const FontContainer = struct {
     route: std.HashMapUnmanaged(u16, bool, GidContext, std.hash_map.default_max_load_percentage) = .empty,
     /// (gid, colour) -> Type3 font index + code
     t3_cache: std.AutoHashMapUnmanaged(u64, Added) = .empty,
+    /// its index in the registry, and the registry's `Track` while the bands that show the page
+    /// count are drawn once it is known (paged.zig `writeChunked`)
+    index: u32 = 0,
+    track: ?*Track = null,
 
     fn init(a: Allocator, font: *const ttf.Font, face_index: u32) !FontContainer {
         var c: FontContainer = .{
@@ -193,16 +197,18 @@ pub const FontContainer = struct {
 
     /// krilla `FontContainer::add_glyph`.
     pub fn addGlyph(c: *FontContainer, gid: u16, color: [3]u8) !Added {
-        if (c.route.get(gid)) |is_cid| {
-            if (is_cid) return .{ .font = .cid, .glyph = .{ .cid = c.cid.getCid(gid).? } };
-            if (c.t3_cache.get(colorKey(.{ .gid = gid, .color = color }))) |e| return e;
-        }
-        const is_cid = c.route.get(gid) orelse c.shouldOutline(gid);
-        try c.route.put(c.a, gid, is_cid);
+        const known = c.route.get(gid);
+        const is_cid = known orelse c.shouldOutline(gid);
+        if (c.track) |t| try t.note(c, gid, is_cid);
         if (is_cid) {
+            if (known == null) try c.route.put(c.a, gid, true);
+            // (a glyph routed before keeps its CID; `Track.settle` may have replaced the CID font
+            // since: it is added again)
             const cid = try c.cid.addGlyph(gid);
             return .{ .font = .cid, .glyph = .{ .cid = cid } };
         }
+        if (known != null) if (c.t3_cache.get(colorKey(.{ .gid = gid, .color = color }))) |e| return e;
+        try c.route.put(c.a, gid, false);
         const cg: ColoredGlyph = .{ .gid = gid, .color = color };
         // Type3FontMapper::add_glyph: an existing font covering it, else the last one, else a new one
         for (c.t3.items, 0..) |*t, i| {
@@ -237,6 +243,14 @@ pub const FontContainer = struct {
             .cid => if (c.cid.getCid(gid)) |x| .{ .cid = x } else null,
             .t3 => |i| if (c.t3.items[i].find(.{ .gid = gid, .color = color })) |x| .{ .t3 = x } else null,
         };
+    }
+
+    /// Glyph `gid` is drawn with a text other than the one its code maps to (a `/Span` with
+    /// `/ActualText` follows): `Track` tells such glyphs apart.
+    pub fn noteConflict(c: *FontContainer, gid: u16) void {
+        const t = c.track orelse return;
+        const f = &t.fonts.items[c.index];
+        if (gid < f.conflict.bit_length) f.conflict.set(gid);
     }
 
     pub fn getCodepoints(c: *const FontContainer, id: FontId, g: PdfGlyph) ?[]const u8 {
@@ -357,6 +371,231 @@ pub const Uncovered = struct {
     }
 };
 
+/// What drawing the bands that show the page count once it is known needs from the fonts
+/// (paged.zig `writeChunked`, emit.zig `DocWriter.Later`). The pages are drawn with the bands of
+/// a provisional page count in place, so that what a band adds to its page (resources, a font's
+/// first use, the objects it writes) comes where the band does; but a CID font numbers its glyphs
+/// in the order they are first drawn, and the count's digits in the first page's band are among
+/// the first. So the content's glyph codes are provisional: `Track` records the glyphs each
+/// page's content draws first (`log`) and where it writes their codes (`strs`), and the fonts are
+/// numbered again in the order of the document drawn with the count: page by page, its bands
+/// drawn again (`Mode.final`) and its content's glyphs replayed between them (`replay`). What
+/// this cannot reproduce (Type3 glyphs, text in a stream other than the page's, a band glyph drawn
+/// with different texts) sets `failed`: the caller counts the pages first instead.
+pub const Track = struct {
+    a: Allocator,
+    /// the lists growing with the pages (`log`, `strs`): an allocator that frees what they leave
+    /// as they grow (a bump allocator would keep every old buffer)
+    lists: Allocator,
+    mode: Mode = .idle,
+    failed: bool = false,
+    /// why `failed`: a memory checkpoint label (`chunks: count first: ..`)
+    why: []const u8 = "",
+    /// per container (`FontContainer.index`)
+    fonts: std.ArrayList(Font) = .empty,
+    /// the content's glyphs in the order they are first drawn (each once)
+    log: std.ArrayList(Use) = .empty,
+    /// the strings of glyph codes the content wrote (their spans in the page's content stream)
+    strs: std.ArrayList(Str) = .empty,
+    /// the surface of the page being drawn (its root builder holds the page's content stream)
+    surface: ?*const sf.Surface = null,
+
+    pub const Mode = enum {
+        /// no text may be drawn (between pages)
+        idle,
+        /// a page's content
+        content,
+        /// a band drawn with the provisional page count (replaced later)
+        band,
+        /// a band drawn with the page count (`DocWriter.settleLater`)
+        final,
+    };
+    pub const Use = struct { font: u32, gid: u16 };
+    /// A string of 2-byte glyph codes (`w.Buf.str`) of font `font` at [`start`, `end`) of its
+    /// page's content stream.
+    pub const Str = struct { start: u32, end: u32, font: u32 };
+    const Font = struct {
+        /// glyphs the content drew (in `log`)
+        seen: std.DynamicBitSetUnmanaged,
+        /// glyphs a band drew (provisional or final)
+        band: std.DynamicBitSetUnmanaged,
+        /// glyphs drawn with another text than their code maps to (`noteConflict`)
+        conflict: std.DynamicBitSetUnmanaged,
+        /// the CID font of the provisional numbering (`begin`)
+        prov: ?fe.CidFont = null,
+    };
+
+    pub fn deinit(t: *Track) void {
+        t.log.deinit(t.lists);
+        t.strs.deinit(t.lists);
+    }
+
+    pub fn fail(t: *Track, comptime why: []const u8) void {
+        if (!t.failed) t.why = "chunks: count first: " ++ why;
+        t.failed = true;
+    }
+
+    fn addFont(t: *Track, c: *const FontContainer) !void {
+        const n = c.font.num_glyphs;
+        try t.fonts.append(t.a, .{
+            .seen = try .initEmpty(t.a, n),
+            .band = try .initEmpty(t.a, n),
+            .conflict = try .initEmpty(t.a, n),
+        });
+    }
+
+    fn note(t: *Track, c: *const FontContainer, gid: u16, is_cid: bool) !void {
+        if (!is_cid) return t.fail("a Type3 glyph");
+        const f = &t.fonts.items[c.index];
+        if (gid >= f.seen.bit_length) return t.fail("a glyph outside its font");
+        switch (t.mode) {
+            .idle => t.fail("text outside a page's content"),
+            .content => if (!f.seen.isSet(gid)) {
+                f.seen.set(gid);
+                try t.log.append(t.lists, .{ .font = c.index, .gid = gid });
+            },
+            .band, .final => f.band.set(gid),
+        }
+    }
+
+    /// A string of glyph codes of font `c` written into builder `b`'s content at [`start`,
+    /// `stop`).
+    pub fn wrote(t: *Track, c: *const FontContainer, b: *const sf.Builder, start: usize, stop: usize) !void {
+        const s = t.surface orelse return t.fail("text outside a page");
+        if (b != &s.builders.items[0]) return t.fail("text in a stream of its own");
+        if (t.mode != .content) return;
+        try t.strs.append(t.lists, .{ .start = @intCast(start), .end = @intCast(stop), .font = c.index });
+    }
+
+    /// The pages are drawn: the fonts start a numbering of their own (in the order `replay` and the
+    /// bands drawn with `Mode.final` add glyphs).
+    pub fn begin(t: *Track, reg: *FontRegistry) !void {
+        for (reg.containers.items, t.fonts.items) |c, *f| {
+            f.prov = c.cid;
+            c.cid = try fe.CidFont.init(c.a, &c.font, c.face_index);
+        }
+        t.mode = .final;
+    }
+
+    /// Adds the glyphs the content of a page drew first (`log[lo..hi]`) to the final numbering,
+    /// each with the text it was first drawn with.
+    pub fn replay(t: *Track, reg: *FontRegistry, lo: usize, hi: usize) Allocator.Error!void {
+        for (t.log.items[lo..hi]) |u| {
+            const c = reg.containers.items[u.font];
+            const prov = &t.fonts.items[u.font].prov.?;
+            const cid = c.cid.addGlyph(u.gid) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.OverflowError => return t.fail("too many glyphs"),
+            };
+            const text = prov.getCodepoints(prov.getCid(u.gid).?) orelse continue;
+            if (c.cid.getCodepoints(cid)) |had| {
+                if (!std.mem.eql(u8, had, text)) t.fail("a glyph's text depends on the page count");
+            } else try c.cid.setCodepoints(cid, text);
+        }
+    }
+
+    /// Every page replayed: whether the final numbering holds what the provisional one did (the
+    /// same texts, no band glyph drawn with different texts, no font only the provisional bands
+    /// used).
+    pub fn end(t: *Track, reg: *FontRegistry) !bool {
+        for (reg.containers.items, t.fonts.items) |c, *f| {
+            if (f.band.count() > 0) {
+                var both = try f.band.clone(t.a);
+                both.setIntersection(f.conflict);
+                if (both.count() > 0) t.fail("a band glyph drawn with different texts");
+            }
+            const prov = &f.prov.?;
+            if (c.cid.isEmpty() != prov.isEmpty()) t.fail("a font only the provisional bands use");
+            for (prov.remapper.order.items, 0..) |gid, pc| {
+                const pt = prov.getCodepoints(@intCast(pc));
+                const ft = if (c.cid.getCid(gid)) |x| c.cid.getCodepoints(x) else null;
+                if (pt != null and ft != null and !std.mem.eql(u8, pt.?, ft.?)) t.fail("a glyph's text depends on the page count");
+            }
+        }
+        return !t.failed;
+    }
+
+    /// Writes `raw[from..to]` of a page's content stream into `out` with the final glyph codes
+    /// in its strings `strs[s0..s1]` (in order; those outside the span are skipped): the glyphs
+    /// the page's content draws are numbered once it is replayed. False: a code has no final
+    /// glyph.
+    pub fn rewrite(t: *Track, out: *w.Buf, scratch: Allocator, reg: *const FontRegistry, raw: []const u8, from: usize, to: usize, s0: usize, s1: usize) !bool {
+        var at = from;
+        var codes: std.ArrayList(u8) = .empty;
+        for (t.strs.items[s0..s1]) |s| {
+            if (s.start < from or s.end > to) continue;
+            out.raw(raw[at..s.start]);
+            codes.clearRetainingCapacity();
+            if (!try decodeStr(scratch, raw[s.start..s.end], &codes) or codes.items.len % 2 != 0) return false;
+            const prov = &t.fonts.items[s.font].prov.?;
+            const final = &reg.containers.items[s.font].cid;
+            const order = prov.remapper.order.items;
+            var k: usize = 0;
+            while (k < codes.items.len) : (k += 2) {
+                const pc = @as(u16, codes.items[k]) << 8 | codes.items[k + 1];
+                if (pc >= order.len) return false;
+                const fc = final.getCid(order[pc]) orelse return false;
+                codes.items[k] = @intCast(fc >> 8);
+                codes.items[k + 1] = @truncate(fc);
+            }
+            out.str(codes.items);
+            at = s.end;
+        }
+        out.raw(raw[at..to]);
+        return true;
+    }
+
+    /// The bytes of a string token `w.Buf.str` wrote (literal or hex). False: not one.
+    pub fn decodeStr(a: Allocator, tok: []const u8, out: *std.ArrayList(u8)) !bool {
+        if (tok.len < 2) return false;
+        if (tok[0] == '<') {
+            if (tok[tok.len - 1] != '>' or tok.len % 2 != 0) return false;
+            var i: usize = 1;
+            while (i < tok.len - 1) : (i += 2) {
+                const hi = std.fmt.charToDigit(tok[i], 16) catch return false;
+                const lo = std.fmt.charToDigit(tok[i + 1], 16) catch return false;
+                try out.append(a, hi << 4 | lo);
+            }
+            return true;
+        }
+        if (tok[0] != '(' or tok[tok.len - 1] != ')') return false;
+        var i: usize = 1;
+        const e = tok.len - 1;
+        while (i < e) {
+            const c = tok[i];
+            if (c != '\\') {
+                try out.append(a, c);
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= e) return false;
+            const d = tok[i + 1];
+            switch (d) {
+                'n' => try out.append(a, '\n'),
+                'r' => try out.append(a, '\r'),
+                't' => try out.append(a, '\t'),
+                'b' => try out.append(a, 0x08),
+                'f' => try out.append(a, 0x0c),
+                '0'...'7' => {
+                    if (i + 3 >= e) return false;
+                    var v: u32 = 0;
+                    for (tok[i + 1 .. i + 4]) |o| {
+                        if (o < '0' or o > '7') return false;
+                        v = v * 8 + (o - '0');
+                    }
+                    if (v > 255) return false;
+                    try out.append(a, @intCast(v));
+                    i += 4;
+                    continue;
+                },
+                else => try out.append(a, d),
+            }
+            i += 2;
+        }
+        return true;
+    }
+};
+
 /// Key of a font instance.
 fn instanceHash(font: *const ttf.Font, face_index: u32, variant: u32) u64 {
     var h = std.hash.Wyhash.init(0x7e47);
@@ -384,6 +623,11 @@ pub const FontRegistry = struct {
     /// (text.zig adapter) the last paragraph text and its white-space-normalised copy
     text_src: []const u8 = "",
     text_clean: []const u8 = "",
+    /// set while the bands showing the page count are drawn once it is known (`Track`)
+    track: ?*Track = null,
+    /// (text.zig `coloredFace`) the last face asked about (its data and `head` table) and the answer
+    color_face: ?[2][*]const u8 = null,
+    color_has: bool = false,
 
     /// Drops the caches keyed by address (`cluster_para`, `text_src`) before a page is drawn: what
     /// a page drew from its working memory is gone, and a new paragraph may take its place.
@@ -421,8 +665,13 @@ pub const FontRegistry = struct {
         const c = try reg.a.create(FontContainer);
         c.* = try FontContainer.init(reg.a, font, face_index);
         c.variant = variant;
+        c.index = @intCast(reg.containers.items.len);
         try reg.containers.append(reg.a, c);
         try reg.keys.append(reg.a, key);
+        if (reg.track) |t| {
+            try t.addFont(c);
+            c.track = t;
+        }
         return c;
     }
 

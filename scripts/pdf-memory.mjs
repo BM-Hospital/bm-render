@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Live memory of a long flowing document (takumi-pdf `memory_tests.rs`): 700 sections with no forced page break,
-// a 320x240 page with 24px margins and a `Page n of N` header, so the document is laid out twice (one pass counts
-// the pages, one draws them). In each pass, the live bytes once page 200 is laid out must stay within 10 % of the
-// live bytes once page 50 is: the memory a long document holds must not grow with the pages behind it.
+// a 320x240 page with 24px margins and a `Page n of N` header, drawn a part at a time in one pass (the header is
+// drawn again once the page count is known, emit.zig `Later`; takumi lays the document out twice, one pass counting
+// the pages). In each pass, the live bytes once page 200 is laid out must stay within 10 % of the live bytes once
+// page 50 is: the memory a long document holds must not grow with the pages behind it.
 //
 // Live bytes are the native addon's allocation counter (memoryTrace checkpoints, src/memtrace.zig), not RSS or the
 // wasm memory size. Each render runs in a child process of its own (a fresh heap).
@@ -68,7 +69,8 @@ if (child) {
   const ms = performance.now() - t0;
   const trace = JSON.parse(addon.memoryTrace(0));
   const peak = addon.memoryPeak(0);
-  // the passes: the counting pass marks each page it lays out ("count: page"), the drawing pass each page drawn
+  // the passes: a counting pass marks each page it lays out ("count: page"), the drawing pass each page drawn (a
+  // band showing the page count is drawn once it is known, without a counting pass, unless "chunks: count first")
   const passes = [];
   for (const label of ["count: page", "emit: page done"]) {
     const live = trace.filter(([l]) => l === label).map(([, b]) => b - base);
@@ -76,7 +78,8 @@ if (child) {
   }
   const parts = trace.filter(([l]) => l === "part: drawn").length;
   const whole = trace.map(([l]) => l).filter((l) => l.startsWith("chunks: whole: ")).map((l) => l.slice(15));
-  console.log(JSON.stringify({ ms, bytes: bytes.length, peak: peak - base, passes, parts, whole }));
+  const countFirst = trace.map(([l]) => l).filter((l) => l.startsWith("chunks: count first")).map((l) => l.slice(13));
+  console.log(JSON.stringify({ ms, bytes: bytes.length, peak: peak - base, passes, parts, whole, countFirst }));
   process.exit(0);
 }
 
@@ -95,9 +98,11 @@ function run(which) {
 }
 let failed = false;
 const s = run("sections");
-console.log(`sections(700): ${s.passes.map((p) => p.pages).join(" / ")} pages, peak ${MiB(s.peak)}, ${s.ms.toFixed(0)} ms, ${(s.bytes / 1024).toFixed(0)} KiB, parts ${s.parts}${s.whole.length ? " (whole: " + s.whole.join("; ") + ")" : ""}`);
-if (s.passes.length < 2) {
-  console.log("  FAIL: expected a counting pass and a drawing pass");
+console.log(`sections(700): ${s.passes.map((p) => p.pages).join(" / ")} pages, peak ${MiB(s.peak)}, ${s.ms.toFixed(0)} ms, ${(s.bytes / 1024).toFixed(0)} KiB, parts ${s.parts}${s.whole.length ? " (whole: " + s.whole.join("; ") + ")" : ""}${s.countFirst.length ? " (" + s.countFirst.join("; ") + ")" : ""}`);
+// (its header shows the page count: drawn once the count is known, one pass; a counting pass first only when that
+// cannot reproduce the file, emit.zig `Later`)
+if (!s.passes.some((p) => p.label === "emit: page done") || s.parts < 2 || s.countFirst.length) {
+  console.log("  FAIL: expected one drawing pass, a part at a time");
   failed = true;
 }
 for (const p of s.passes) {
